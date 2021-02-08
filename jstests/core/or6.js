@@ -1,10 +1,13 @@
 // A few rooted $or cases.
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 var t = db.jstests_orq;
 t.drop();
 
-t.ensureIndex({a: 1, c: 1});
-t.ensureIndex({b: 1, c: 1});
+t.createIndex({a: 1, c: 1});
+t.createIndex({b: 1, c: 1});
 
 t.save({a: 1, c: 9});
 t.save({a: 1, c: 10});

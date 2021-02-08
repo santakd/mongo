@@ -1,59 +1,64 @@
-/*    Copyright 2010 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/time_support.h"
 
-#include <boost/thread/tss.hpp>
 #include <cstdint>
 #include <cstdio>
-#include <string>
 #include <iostream>
+#include <string>
+
+#include <fmt/compile.h>
 
 #include "mongo/base/init.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
-#ifdef _WIN32
-#include <boost/date_time/filetime_functions.hpp>
+#if defined(_WIN32)
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/system_tick_source.h"
 #include "mongo/util/timer.h"
-
-// NOTE(schwerin): MSVC's _snprintf is not a drop-in replacement for C99's snprintf().  In
-// particular, when the target buffer is too small, behaviors differ.  Consult the documentation
-// from MSDN and form the BSD or Linux man pages before using.
-#if _MSC_VER < 1900
-#define snprintf _snprintf
+#include <mmsystem.h>
+#elif defined(__linux__)
+#include <time.h>
+#elif defined(__APPLE__)
+#include <mach/clock.h>
+#include <mach/mach.h>
 #endif
+
+#if !defined(_WIN32)
+#include <sys/time.h>
 #endif
 
 #ifdef __sun
@@ -64,74 +69,34 @@ extern "C" time_t timegm(struct tm* const tmp);
 
 namespace mongo {
 
-namespace {
-template <typename Stream>
-Stream& streamPut(Stream& os, Microseconds us) {
-    return os << us.count() << "\xce\xbcs";
-}
-
-template <typename Stream>
-Stream& streamPut(Stream& os, Milliseconds ms) {
-    return os << ms.count() << "ms";
-}
-
-template <typename Stream>
-Stream& streamPut(Stream& os, Seconds s) {
-    return os << s.count() << 's';
-}
-}  // namespace
-
-std::ostream& operator<<(std::ostream& os, Microseconds us) {
-    return streamPut(os, us);
-}
-
-std::ostream& operator<<(std::ostream& os, Milliseconds ms) {
-    return streamPut(os, ms);
-}
-std::ostream& operator<<(std::ostream& os, Seconds s) {
-    return streamPut(os, s);
-}
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Microseconds us) {
-    return streamPut(os, us);
-}
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Milliseconds ms) {
-    return streamPut(os, ms);
-}
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Seconds s) {
-    return streamPut(os, s);
-}
-
-template StringBuilderImpl<StackAllocator>& operator<<(StringBuilderImpl<StackAllocator>&,
-                                                       Microseconds);
-template StringBuilderImpl<StackAllocator>& operator<<(StringBuilderImpl<StackAllocator>&,
-                                                       Milliseconds);
-template StringBuilderImpl<StackAllocator>& operator<<(StringBuilderImpl<StackAllocator>&, Seconds);
-template StringBuilderImpl<TrivialAllocator>& operator<<(StringBuilderImpl<TrivialAllocator>&,
-                                                         Microseconds);
-template StringBuilderImpl<TrivialAllocator>& operator<<(StringBuilderImpl<TrivialAllocator>&,
-                                                         Milliseconds);
-template StringBuilderImpl<TrivialAllocator>& operator<<(StringBuilderImpl<TrivialAllocator>&,
-                                                         Seconds);
-
-Date_t Date_t::max() {
-    return fromMillisSinceEpoch(std::numeric_limits<long long>::max());
-}
+AtomicWord<long long> Date_t::lastNowVal;
 
 Date_t Date_t::now() {
-    return fromMillisSinceEpoch(curTimeMillis64());
+    decltype(lastNowVal)::WordType curTime = curTimeMillis64();
+    auto oldLastNow = lastNowVal.loadRelaxed();
+
+    // If curTime is different than old last now, unconditionally try to cas it to the new value.
+    // This is an optimization to avoid performing stores for multiple clock reads in the same
+    // millisecond.
+    //
+    // It's important that this is a non-equality (rather than a >), so that we avoid stalling time
+    // if someone moves the system clock backwards.
+    if (curTime != oldLastNow) {
+        // If we fail to comp exchange, it means someone else concurrently called Date_t::now(), in
+        // which case it's likely their time is also recent.  It's important that we don't loop so
+        // that we avoid forcing time backwards if we have multiple callers at a millisecond
+        // boundary.
+        lastNowVal.compareAndSwap(&oldLastNow, curTime);
+    }
+
+    return fromMillisSinceEpoch(curTime);
 }
 
 Date_t::Date_t(stdx::chrono::system_clock::time_point tp)
     : millis(durationCount<Milliseconds>(tp - stdx::chrono::system_clock::from_time_t(0))) {}
 
 stdx::chrono::system_clock::time_point Date_t::toSystemTimePoint() const {
-    return stdx::chrono::system_clock::from_time_t(0) + toDurationSinceEpoch();
+    return stdx::chrono::system_clock::from_time_t(0) + toDurationSinceEpoch().toSystemDuration();
 }
 
 bool Date_t::isFormattable() const {
@@ -148,9 +113,7 @@ bool Date_t::isFormattable() const {
 
 // jsTime_virtual_skew is just for testing. a test command manipulates it.
 long long jsTime_virtual_skew = 0;
-boost::thread_specific_ptr<long long> jsTime_virtual_thread_skew;
-
-using std::string;
+thread_local long long jsTime_virtual_thread_skew = 0;
 
 void time_t_to_Struct(time_t t, struct tm* buf, bool local) {
 #if defined(_WIN32)
@@ -179,49 +142,49 @@ std::string time_t_to_String_short(time_t t) {
     return buf;
 }
 
+constexpr auto kUTCFilenameFormat = "%Y-%m-%dT%H-%M-%S"_sd;
+constexpr auto kUTCFilenameFormatZ = "%Y-%m-%dT%H-%M-%SZ"_sd;
 
-// uses ISO 8601 dates without trailing Z
-// colonsOk should be false when creating filenames
-string terseCurrentTime(bool colonsOk) {
+// Produces a UTC datetime string suitable for use in filenames.
+std::string terseCurrentTimeForFilename(bool appendZed) {
     struct tm t;
-    time_t_to_Struct(time(0), &t);
+    time_t_to_Struct(time(nullptr), &t);
 
-    const char* fmt = (colonsOk ? "%Y-%m-%dT%H:%M:%S" : "%Y-%m-%dT%H-%M-%S");
+    const auto fmt = appendZed ? kUTCFilenameFormatZ : kUTCFilenameFormat;
+    const std::size_t expLen = appendZed ? 20 : 19;
+
     char buf[32];
-    fassert(16226, strftime(buf, sizeof(buf), fmt, &t) == 19);
+    fassert(16226, strftime(buf, sizeof(buf), fmt.rawData(), &t) == expLen);
     return buf;
 }
 
-string terseUTCCurrentTime() {
-    return terseCurrentTime(false) + "Z";
-}
-
-#define MONGO_ISO_DATE_FMT_NO_TZ "%Y-%m-%dT%H:%M:%S"
-
-namespace {
-struct DateStringBuffer {
-    static const int dataCapacity = 64;
-    char data[dataCapacity];
-    int size;
-};
-
-void _dateToISOString(Date_t date, bool local, DateStringBuffer* result) {
+DateStringBuffer& DateStringBuffer::iso8601(Date_t date, bool local) {
     invariant(date.isFormattable());
-    static const int bufSize = DateStringBuffer::dataCapacity;
-    char* const buf = result->data;
+
     struct tm t;
     time_t_to_Struct(date.toTimeT(), &t, local);
-    int pos = strftime(buf, bufSize, MONGO_ISO_DATE_FMT_NO_TZ, &t);
-    dassert(0 < pos);
-    char* cur = buf + pos;
-    int bufRemaining = bufSize - pos;
-    pos = snprintf(cur, bufRemaining, ".%03d", static_cast<int32_t>(date.asInt64() % 1000));
-    dassert(bufRemaining > pos && pos > 0);
-    cur += pos;
-    bufRemaining -= pos;
+
+    char* cur = _data.data();
+    char* end = _data.data() + _data.size();
+
+    {
+        static constexpr char kIsoDateFmtNoTz[] = "%Y-%m-%dT%H:%M:%S";
+        size_t n = strftime(cur, end - cur, kIsoDateFmtNoTz, &t);
+        dassert(n > 0);
+        cur += n;
+    }
+
+    {
+        static const auto& fmt_str_millis = *new auto(fmt::compile<int32_t>(".{:03}"));
+        auto res = fmt::format_to_n(
+            cur, end - cur, fmt_str_millis, static_cast<int32_t>(date.asInt64() % 1000));
+        cur = res.out;
+        dassert(cur < end && res.size > 0);
+    }
+
     if (local) {
-        static const int localTzSubstrLen = 5;
-        dassert(bufRemaining >= localTzSubstrLen + 1);
+        static const size_t localTzSubstrLen = 6;
+        dassert(static_cast<size_t>(end - cur) >= localTzSubstrLen + 1);
 #ifdef _WIN32
         // NOTE(schwerin): The value stored by _get_timezone is the value one adds to local time
         // to get UTC.  This is opposite of the ISO-8601 meaning of the timezone offset.
@@ -236,78 +199,81 @@ void _dateToISOString(Date_t date, bool local, DateStringBuffer* result) {
         const long tzOffsetSeconds = msTimeZone * (tzIsWestOfUTC ? 1 : -1);
         const long tzOffsetHoursPart = tzOffsetSeconds / 3600;
         const long tzOffsetMinutesPart = (tzOffsetSeconds / 60) % 60;
-        snprintf(cur,
-                 localTzSubstrLen + 1,
-                 "%c%02ld%02ld",
-                 tzIsWestOfUTC ? '-' : '+',
-                 tzOffsetHoursPart,
-                 tzOffsetMinutesPart);
+
+        // "+hh:mm"
+        static const auto& fmtStrTime = *new auto(fmt::compile<char, long, long>("{}{:02}:{:02}"));
+        cur = fmt::format_to_n(cur,
+                               localTzSubstrLen + 1,
+                               fmtStrTime,
+                               tzIsWestOfUTC ? '-' : '+',
+                               tzOffsetHoursPart,
+                               tzOffsetMinutesPart)
+                  .out;
 #else
-        strftime(cur, bufRemaining, "%z", &t);
+        // ISO 8601 requires the timezone to be in hh:mm format which strftime can't produce
+        // See https://tools.ietf.org/html/rfc3339#section-5.6
+        strftime(cur, end - cur, "%z:", &t);
+        // cur will be written as +hhmm:, transform to +hh:mm
+        std::rotate(cur + 3, cur + 5, cur + 6);
+        cur += 6;
 #endif
-        cur += localTzSubstrLen;
     } else {
-        dassert(bufRemaining >= 2);
-        *cur = 'Z';
-        ++cur;
+        dassert(cur + 2 <= end);
+        *cur++ = 'Z';
     }
-    result->size = cur - buf;
-    dassert(result->size < DateStringBuffer::dataCapacity);
+
+    dassert(cur <= end);
+    _size = cur - _data.data();
+    return *this;
 }
 
-void _dateToCtimeString(Date_t date, DateStringBuffer* result) {
-    static const size_t ctimeSubstrLen = 19;
-    static const size_t millisSubstrLen = 4;
+DateStringBuffer& DateStringBuffer::ctime(Date_t date) {
+    // "Wed Jun 30 21:49:08 1993\n" // full asctime/ctime format
+    // "Wed Jun 30 21:49:08"        // clip after position 19.
+    // "Wed Jun 30 21:49:08.996"    // append millis
+    //  12345678901234567890123456
     time_t t = date.toTimeT();
 #if defined(_WIN32)
-    ctime_s(result->data, sizeof(result->data), &t);
+    ctime_s(_data.data(), _data.size(), &t);
 #else
-    ctime_r(&t, result->data);
+    ctime_r(&t, _data.data());
 #endif
-    char* milliSecStr = result->data + ctimeSubstrLen;
-    snprintf(
-        milliSecStr, millisSubstrLen + 1, ".%03d", static_cast<int32_t>(date.asInt64() % 1000));
-    result->size = ctimeSubstrLen + millisSubstrLen;
-}
-}  // namespace
 
-std::string dateToISOStringUTC(Date_t date) {
-    DateStringBuffer buf;
-    _dateToISOString(date, false, &buf);
-    return std::string(buf.data, buf.size);
-}
-
-std::string dateToISOStringLocal(Date_t date) {
-    DateStringBuffer buf;
-    _dateToISOString(date, true, &buf);
-    return std::string(buf.data, buf.size);
-}
-
-std::string dateToCtimeString(Date_t date) {
-    DateStringBuffer buf;
-    _dateToCtimeString(date, &buf);
-    return std::string(buf.data, buf.size);
-}
-
-void outputDateAsISOStringUTC(std::ostream& os, Date_t date) {
-    DateStringBuffer buf;
-    _dateToISOString(date, false, &buf);
-    os << StringData(buf.data, buf.size);
-}
-
-void outputDateAsISOStringLocal(std::ostream& os, Date_t date) {
-    DateStringBuffer buf;
-    _dateToISOString(date, true, &buf);
-    os << StringData(buf.data, buf.size);
-}
-
-void outputDateAsCtime(std::ostream& os, Date_t date) {
-    DateStringBuffer buf;
-    _dateToCtimeString(date, &buf);
-    os << StringData(buf.data, buf.size);
+    static constexpr size_t ctimeSubstrLen = 19;
+    static constexpr size_t millisSubstrLen = 4;
+    char* milliSecStr = _data.data() + ctimeSubstrLen;
+    snprintf(milliSecStr,
+             millisSubstrLen + 1,
+             ".%03u",
+             static_cast<unsigned>(date.toMillisSinceEpoch() % 1000));
+    _size = ctimeSubstrLen + millisSubstrLen;
+    return *this;
 }
 
 namespace {
+
+#if defined(_WIN32)
+
+uint64_t fileTimeToMicroseconds(FILETIME const ft) {
+    // Microseconds between 1601-01-01 00:00:00 UTC and 1970-01-01 00:00:00 UTC
+    constexpr uint64_t kEpochDifferenceMicros = 11644473600000000ull;
+
+    // Construct a 64 bit value that is the number of nanoseconds from the
+    // Windows epoch which is 1601-01-01 00:00:00 UTC
+    auto totalMicros = static_cast<uint64_t>(ft.dwHighDateTime) << 32;
+    totalMicros |= static_cast<uint64_t>(ft.dwLowDateTime);
+
+    // FILETIME is 100's of nanoseconds since Windows epoch
+    totalMicros /= 10;
+
+    // Move it from micros since the Windows epoch to micros since the Unix epoch
+    totalMicros -= kEpochDifferenceMicros;
+
+    return totalMicros;
+}
+
+#endif
+
 StringData getNextToken(StringData currentString,
                         StringData terminalChars,
                         size_t startIndex,
@@ -358,17 +324,21 @@ Status parseTimeZoneFromToken(StringData tzStr, int* tzAdjSecs) {
                 return Status(ErrorCodes::BadValue, sb.str());
             }
         } else if (tzStr[0] == '+' || tzStr[0] == '-') {
-            if (tzStr.size() != 5 || !isOnlyDigits(tzStr.substr(1, 4))) {
+            // See https://tools.ietf.org/html/rfc3339#section-5.6
+            bool validLegacyFormat = tzStr.size() == 5 && isOnlyDigits(tzStr.substr(1, 4));
+            bool validISO8601Format = tzStr.size() == 6 && isOnlyDigits(tzStr.substr(1, 2)) &&
+                tzStr[3] == ':' && isOnlyDigits(tzStr.substr(4, 2));
+            if (!validLegacyFormat && !validISO8601Format) {
                 StringBuilder sb;
                 sb << "Time zone adjustment string should be four digits:  " << tzStr;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
 
             // Parse the hours component of the time zone offset.  Note that
-            // parseNumberFromStringWithBase correctly handles the sign bit, so leave that in.
+            // NumberParser correctly handles the sign bit, so leave that in.
             StringData tzHoursStr = tzStr.substr(0, 3);
             int tzAdjHours = 0;
-            Status status = parseNumberFromStringWithBase(tzHoursStr, 10, &tzAdjHours);
+            Status status = NumberParser().base(10)(tzHoursStr, &tzAdjHours);
             if (!status.isOK()) {
                 return status;
             }
@@ -379,9 +349,10 @@ Status parseTimeZoneFromToken(StringData tzStr, int* tzAdjSecs) {
                 return Status(ErrorCodes::BadValue, sb.str());
             }
 
-            StringData tzMinutesStr = tzStr.substr(3, 2);
+            size_t minStart = validISO8601Format ? 4 : 3;
+            StringData tzMinutesStr = tzStr.substr(minStart, 2);
             int tzAdjMinutes = 0;
-            status = parseNumberFromStringWithBase(tzMinutesStr, 10, &tzAdjMinutes);
+            status = NumberParser().base(10)(tzMinutesStr, &tzAdjMinutes);
             if (!status.isOK()) {
                 return status;
             }
@@ -392,7 +363,7 @@ Status parseTimeZoneFromToken(StringData tzStr, int* tzAdjSecs) {
                 return Status(ErrorCodes::BadValue, sb.str());
             }
 
-            // Use the sign that parseNumberFromStringWithBase found to determine if we need to
+            // Use the sign that NumberParser::parse found to determine if we need to
             // flip the sign of our minutes component.  Also, we need to flip the sign of our
             // final result, because the offset passed in by the user represents how far off the
             // time they are giving us is from UTC, which means that we have to go the opposite
@@ -427,7 +398,7 @@ Status parseMillisFromToken(StringData millisStr, int* resultMillis) {
             return Status(ErrorCodes::BadValue, sb.str());
         }
 
-        Status status = parseNumberFromStringWithBase(millisStr, 10, resultMillis);
+        Status status = NumberParser().base(10)(millisStr, resultMillis);
         if (!status.isOK()) {
             return status;
         }
@@ -441,7 +412,7 @@ Status parseMillisFromToken(StringData millisStr, int* resultMillis) {
             millisMagnitude = 100;
         }
 
-        *resultMillis = *resultMillis* millisMagnitude;
+        *resultMillis = *resultMillis * millisMagnitude;
 
         if (*resultMillis < 0 || *resultMillis > 1000) {
             StringBuilder sb;
@@ -469,7 +440,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    Status status = parseNumberFromStringWithBase(yearStr, 10, &resultTm->tm_year);
+    Status status = NumberParser().base(10)(yearStr, &resultTm->tm_year);
     if (!status.isOK()) {
         return status;
     }
@@ -489,7 +460,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(monthStr, 10, &resultTm->tm_mon);
+    status = NumberParser().base(10)(monthStr, &resultTm->tm_mon);
     if (!status.isOK()) {
         return status;
     }
@@ -509,7 +480,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(dayStr, 10, &resultTm->tm_mday);
+    status = NumberParser().base(10)(dayStr, &resultTm->tm_mday);
     if (!status.isOK()) {
         return status;
     }
@@ -527,7 +498,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(hourStr, 10, &resultTm->tm_hour);
+    status = NumberParser().base(10)(hourStr, &resultTm->tm_hour);
     if (!status.isOK()) {
         return status;
     }
@@ -545,7 +516,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(minStr, 10, &resultTm->tm_min);
+    status = NumberParser().base(10)(minStr, &resultTm->tm_min);
     if (!status.isOK()) {
         return status;
     }
@@ -567,7 +538,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(secStr, 10, &resultTm->tm_sec);
+    status = NumberParser().base(10)(secStr, &resultTm->tm_sec);
     if (!status.isOK()) {
         return status;
     }
@@ -738,8 +709,6 @@ StatusWith<Date_t> dateFromISOString(StringData dateString) {
     return Date_t::fromMillisSinceEpoch(static_cast<long long>(resultMillis));
 }
 
-#undef MONGO_ISO_DATE_FMT_NO_TZ
-
 std::string Date_t::toString() const {
     if (isFormattable()) {
         return dateToISOStringLocal(*this);
@@ -755,78 +724,26 @@ time_t Date_t::toTimeT() const {
     return secs;
 }
 
-boost::gregorian::date currentDate() {
-    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
-    return now.date();
-}
-
-// parses time of day in "hh:mm" format assuming 'hh' is 00-23
-bool toPointInTime(const string& str, boost::posix_time::ptime* timeOfDay) {
-    int hh = 0;
-    int mm = 0;
-    if (2 != sscanf(str.c_str(), "%d:%d", &hh, &mm)) {
-        return false;
-    }
-
-    // verify that time is well formed
-    if ((hh / 24) || (mm / 60)) {
-        return false;
-    }
-
-    boost::posix_time::ptime res(currentDate(),
-                                 boost::posix_time::hours(hh) + boost::posix_time::minutes(mm));
-    *timeOfDay = res;
-    return true;
-}
-
-#if defined(_WIN32)
 void sleepsecs(int s) {
-    stdx::this_thread::sleep_for(Seconds(s));
+    stdx::this_thread::sleep_for(Seconds(s).toSystemDuration());
 }
 
 void sleepmillis(long long s) {
-    stdx::this_thread::sleep_for(Milliseconds(s));
+    stdx::this_thread::sleep_for(Milliseconds(s).toSystemDuration());
 }
 void sleepmicros(long long s) {
-    stdx::this_thread::sleep_for(Microseconds(s));
-}
-#else
-void sleepsecs(int s) {
-    struct timespec t;
-    t.tv_sec = s;
-    t.tv_nsec = 0;
-    if (nanosleep(&t, 0)) {
-        std::cout << "nanosleep failed" << std::endl;
-    }
-}
-void sleepmicros(long long s) {
-    if (s <= 0)
-        return;
-    struct timespec t;
-    t.tv_sec = (int)(s / 1000000);
-    t.tv_nsec = 1000 * (s % 1000000);
-    struct timespec out;
-    if (nanosleep(&t, &out)) {
-        std::cout << "nanosleep failed" << std::endl;
-    }
-}
-void sleepmillis(long long s) {
-    sleepmicros(s * 1000);
-}
-#endif
-
-void sleepFor(const Milliseconds& time) {
-    sleepmillis(time.count());
+    stdx::this_thread::sleep_for(Microseconds(s).toSystemDuration());
 }
 
-void Backoff::nextSleepMillis() {
+Milliseconds Backoff::nextSleep() {
     // Get the current time
     unsigned long long currTimeMillis = curTimeMillis64();
 
     int lastSleepMillis = _lastSleepMillis;
 
-    if (_lastErrorTimeMillis == 0 || _lastErrorTimeMillis > currTimeMillis /* VM bugs exist */)
+    if (!_lastErrorTimeMillis || _lastErrorTimeMillis > currTimeMillis /* VM bugs exist */)
         _lastErrorTimeMillis = currTimeMillis;
+
     unsigned long long lastErrorTimeMillis = _lastErrorTimeMillis;
     _lastErrorTimeMillis = currTimeMillis;
 
@@ -834,27 +751,20 @@ void Backoff::nextSleepMillis() {
 
     // Store the last slept time
     _lastSleepMillis = lastSleepMillis;
-    sleepmillis(lastSleepMillis);
+    return Milliseconds(lastSleepMillis);
 }
 
-int Backoff::getNextSleepMillis(int lastSleepMillis,
+int Backoff::getNextSleepMillis(long long lastSleepMillis,
                                 unsigned long long currTimeMillis,
                                 unsigned long long lastErrorTimeMillis) const {
     // Backoff logic
 
     // Get the time since the last error
-    unsigned long long timeSinceLastErrorMillis = currTimeMillis - lastErrorTimeMillis;
+    const long long timeSinceLastErrorMillis = currTimeMillis - lastErrorTimeMillis;
 
-    // Makes the cast below safe
-    verify(_resetAfterMillis >= 0);
-
-    // If we haven't seen another error recently (3x the max wait time), reset our
-    // wait counter.
-    if (timeSinceLastErrorMillis > (unsigned)(_resetAfterMillis))
+    // If we haven't seen another error recently (3x the max wait time), reset our wait counter
+    if (timeSinceLastErrorMillis > _resetAfterMillis)
         lastSleepMillis = 0;
-
-    // Makes the test below sane
-    verify(_maxSleepMillis > 0);
 
     // Wait a power of two millis
     if (lastSleepMillis == 0)
@@ -865,9 +775,6 @@ int Backoff::getNextSleepMillis(int lastSleepMillis,
     return lastSleepMillis;
 }
 
-extern long long jsTime_virtual_skew;
-extern boost::thread_specific_ptr<long long> jsTime_virtual_thread_skew;
-
 // DO NOT TOUCH except for testing
 void jsTimeVirtualSkew(long long skew) {
     jsTime_virtual_skew = skew;
@@ -877,13 +784,11 @@ long long getJSTimeVirtualSkew() {
 }
 
 void jsTimeVirtualThreadSkew(long long skew) {
-    jsTime_virtual_thread_skew.reset(new long long(skew));
+    jsTime_virtual_thread_skew = skew;
 }
+
 long long getJSTimeVirtualThreadSkew() {
-    if (jsTime_virtual_thread_skew.get()) {
-        return *(jsTime_virtual_thread_skew.get());
-    } else
-        return 0;
+    return jsTime_virtual_thread_skew;
 }
 
 /** Date_t is milliseconds since epoch */
@@ -899,113 +804,99 @@ unsigned long long curTimeMillis64() {
         durationCount<Milliseconds>(system_clock::now() - system_clock::from_time_t(0)));
 }
 
-static unsigned long long getFiletime() {
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    return *reinterpret_cast<unsigned long long*>(&ft);
-}
-
-static unsigned long long getPerfCounter() {
-    LARGE_INTEGER li;
-    QueryPerformanceCounter(&li);
-    return li.QuadPart;
-}
-
-static unsigned long long baseFiletime = 0;
-static unsigned long long basePerfCounter = 0;
-static unsigned long long resyncInterval = 0;
-static SimpleMutex _curTimeMicros64ReadMutex;
-static SimpleMutex _curTimeMicros64ResyncMutex;
-
-typedef WINBASEAPI VOID(WINAPI* pGetSystemTimePreciseAsFileTime)(_Out_ LPFILETIME
-                                                                     lpSystemTimeAsFileTime);
-
-static pGetSystemTimePreciseAsFileTime GetSystemTimePreciseAsFileTimeFunc;
-
-MONGO_INITIALIZER(Init32TimeSupport)(InitializerContext*) {
-    HINSTANCE kernelLib = LoadLibraryA("kernel32.dll");
-    if (kernelLib) {
-        GetSystemTimePreciseAsFileTimeFunc = reinterpret_cast<pGetSystemTimePreciseAsFileTime>(
-            GetProcAddress(kernelLib, "GetSystemTimePreciseAsFileTime"));
-    }
-
-    return Status::OK();
-}
-
-static unsigned long long resyncTime() {
-    stdx::lock_guard<SimpleMutex> lkResync(_curTimeMicros64ResyncMutex);
-    unsigned long long ftOld;
-    unsigned long long ftNew;
-    ftOld = ftNew = getFiletime();
-    do {
-        ftNew = getFiletime();
-    } while (ftOld == ftNew);  // wait for filetime to change
-
-    unsigned long long newPerfCounter = getPerfCounter();
-
-    // Make sure that we use consistent values for baseFiletime and basePerfCounter.
-    //
-    stdx::lock_guard<SimpleMutex> lkRead(_curTimeMicros64ReadMutex);
-    baseFiletime = ftNew;
-    basePerfCounter = newPerfCounter;
-    resyncInterval = 60 * SystemTickSource::get()->getTicksPerSecond();
-    return newPerfCounter;
-}
-
 unsigned long long curTimeMicros64() {
     // Windows 8/2012 & later support a <1us time function
-    if (GetSystemTimePreciseAsFileTimeFunc != NULL) {
-        FILETIME time;
-        GetSystemTimePreciseAsFileTimeFunc(&time);
-        return boost::date_time::winapi::file_time_to_microseconds(time);
-    }
-
-    // Get a current value for QueryPerformanceCounter; if it is not time to resync we will
-    // use this value.
-    //
-    unsigned long long perfCounter = getPerfCounter();
-
-    // Periodically resync the timer so that we don't let timer drift accumulate.  Testing
-    // suggests that we drift by about one microsecond per minute, so resynching once per
-    // minute should keep drift to no more than one microsecond.
-    //
-    if ((perfCounter - basePerfCounter) > resyncInterval) {
-        perfCounter = resyncTime();
-    }
-
-    // Make sure that we use consistent values for baseFiletime and basePerfCounter.
-    //
-    stdx::lock_guard<SimpleMutex> lkRead(_curTimeMicros64ReadMutex);
-
-    // Compute the current time in FILETIME format by adding our base FILETIME and an offset
-    // from that time based on QueryPerformanceCounter.  The math is (logically) to compute the
-    // fraction of a second elapsed since 'baseFiletime' by taking the difference in ticks
-    // and dividing by the tick frequency, then scaling this fraction up to units of 100
-    // nanoseconds to match the FILETIME format.  We do the multiplication first to avoid
-    // truncation while using only integer instructions.
-    //
-    unsigned long long computedTime = baseFiletime +
-        ((perfCounter - basePerfCounter) * 10 * 1000 * 1000) /
-            SystemTickSource::get()->getTicksPerSecond();
-
-    // Convert the computed FILETIME into microseconds since the Unix epoch (1/1/1970).
-    //
-    return boost::date_time::winapi::file_time_to_microseconds(computedTime);
+    FILETIME time;
+    GetSystemTimePreciseAsFileTime(&time);
+    return fileTimeToMicroseconds(time);
 }
 
 #else
-#include <sys/time.h>
 unsigned long long curTimeMillis64() {
     timeval tv;
-    gettimeofday(&tv, NULL);
+    gettimeofday(&tv, nullptr);
     return ((unsigned long long)tv.tv_sec) * 1000 + tv.tv_usec / 1000;
 }
 
 unsigned long long curTimeMicros64() {
     timeval tv;
-    gettimeofday(&tv, NULL);
+    gettimeofday(&tv, nullptr);
     return (((unsigned long long)tv.tv_sec) * 1000 * 1000) + tv.tv_usec;
 }
 #endif
+
+#if defined(__APPLE__)
+template <typename T>
+class MachPort {
+public:
+    MachPort(T port) : _port(std::move(port)) {}
+    ~MachPort() {
+        mach_port_deallocate(mach_task_self(), _port);
+    }
+    operator T&() {
+        return _port;
+    }
+
+private:
+    T _port;
+};
+#endif
+
+// Find minimum timer resolution of OS
+Nanoseconds getMinimumTimerResolution() {
+    Nanoseconds minTimerResolution;
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__EMSCRIPTEN__)
+    struct timespec tp;
+    clock_getres(CLOCK_REALTIME, &tp);
+    minTimerResolution = Nanoseconds{tp.tv_nsec};
+#elif defined(_WIN32)
+    // see https://msdn.microsoft.com/en-us/library/windows/desktop/dd743626(v=vs.85).aspx
+    TIMECAPS tc;
+    Milliseconds resMillis;
+    invariant(timeGetDevCaps(&tc, sizeof(tc)) == MMSYSERR_NOERROR);
+    resMillis = Milliseconds{static_cast<int64_t>(tc.wPeriodMin)};
+    minTimerResolution = duration_cast<Nanoseconds>(resMillis);
+#elif defined(__APPLE__)
+    // see "Mac OSX Internals: a Systems Approach" for functions and types
+    kern_return_t kr;
+    MachPort<host_name_port_t> myhost(mach_host_self());
+    MachPort<clock_serv_t> clk_system([&myhost] {
+        host_name_port_t clk;
+        invariant(host_get_clock_service(myhost, SYSTEM_CLOCK, &clk) == 0);
+        return clk;
+    }());
+    natural_t attribute[4];
+    mach_msg_type_number_t count;
+
+    count = sizeof(attribute) / sizeof(natural_t);
+    kr = clock_get_attributes(clk_system, CLOCK_GET_TIME_RES, (clock_attr_t)attribute, &count);
+    invariant(kr == 0);
+
+    minTimerResolution = Nanoseconds{attribute[0]};
+#else
+#error Dont know how to get the minimum timer resolution on this platform
+#endif
+    return minTimerResolution;
+}
+
+std::string dateToISOStringUTC(Date_t date) {
+    return std::string{DateStringBuffer{}.iso8601(date, false)};
+}
+std::string dateToISOStringLocal(Date_t date) {
+    return std::string{DateStringBuffer{}.iso8601(date, true)};
+}
+std::string dateToCtimeString(Date_t date) {
+    return std::string{DateStringBuffer{}.ctime(date)};
+}
+
+void outputDateAsISOStringUTC(std::ostream& os, Date_t date) {
+    os << StringData{DateStringBuffer{}.iso8601(date, false)};
+}
+void outputDateAsISOStringLocal(std::ostream& os, Date_t date) {
+    os << StringData{DateStringBuffer{}.iso8601(date, true)};
+}
+void outputDateAsCtime(std::ostream& os, Date_t date) {
+    os << StringData{DateStringBuffer{}.ctime(date)};
+}
 
 }  // namespace mongo

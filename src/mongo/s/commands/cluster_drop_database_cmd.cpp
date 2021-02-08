@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,96 +27,98 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
-
 #include "mongo/base/status.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/config.h"
+#include "mongo/db/drop_database_gen.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-using std::shared_ptr;
-
 namespace {
 
-class DropDatabaseCmd : public Command {
+class DropDatabaseCmd : public DropDatabaseCmdVersion1Gen<DropDatabaseCmd> {
 public:
-    DropDatabaseCmd() : Command("dropDatabase") {}
-
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
     }
-
-    virtual bool adminOnly() const {
-        return false;
-    }
-
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
-
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::dropDatabase);
-        out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
-    }
-
-    virtual bool run(OperationContext* txn,
-                     const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
-        // Disallow dropping the config database from mongos
-        if (dbname == "config") {
-            return appendCommandStatus(
-                result, Status(ErrorCodes::IllegalOperation, "Cannot drop the config database"));
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        bool supportsWriteConcern() const final {
+            return true;
         }
-
-        BSONElement e = cmdObj.firstElement();
-
-        if (!e.isNumber() || e.number() != 1) {
-            errmsg = "invalid params";
-            return 0;
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
         }
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to drop database '" << request().getDbName()
+                                  << "'",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnNamespace(NamespaceString(request().getDbName()),
+                                                            ActionType::dropDatabase));
+        }
+        Reply typedRun(OperationContext* opCtx) final {
+            auto dbName = request().getDbName();
+            auto nss = NamespaceString(dbName);
 
-        // Refresh the database metadata
-        grid.catalogCache()->invalidate(dbname);
+            uassert(ErrorCodes::IllegalOperation,
+                    "Cannot drop the config database",
+                    dbName != NamespaceString::kConfigDb);
+            uassert(ErrorCodes::IllegalOperation,
+                    "Cannot drop the admin database",
+                    dbName != NamespaceString::kAdminDb);
+            uassert(ErrorCodes::BadValue,
+                    "Must pass 1 as the 'dropDatabase' parameter",
+                    request().getCommandParameter() == 1);
 
-        auto status = grid.catalogCache()->getDatabase(txn, dbname);
-        if (!status.isOK()) {
-            if (status == ErrorCodes::NamespaceNotFound) {
-                result.append("info", "database does not exist");
-                return true;
+            try {
+                const CachedDatabaseInfo dbInfo =
+                    uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
+
+                // Invalidate the database metadata so the next access kicks off a full reload, even
+                // if sending the command to the config server fails due to e.g. a NetworkError.
+                ON_BLOCK_EXIT(
+                    [opCtx, dbName] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName); });
+
+                // Send it to the primary shard
+                ShardsvrDropDatabase dropDatabaseCommand;
+                dropDatabaseCommand.setDbName(dbName);
+
+                auto cmdResponse = executeCommandAgainstDatabasePrimary(
+                    opCtx,
+                    dbName,
+                    dbInfo,
+                    CommandHelpers::appendMajorityWriteConcern(dropDatabaseCommand.toBSON({}),
+                                                               opCtx->getWriteConcern()),
+                    ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                    Shard::RetryPolicy::kIdempotent);
+
+                const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
+                uassertStatusOK(getStatusFromCommandResult(remoteResponse.data));
+
+                DropDatabaseReply reply;
+                reply.setDropped(dbName);
+                return reply;
+            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                // If the namespace isn't found, treat the drop as a success but inform about the
+                // failure.
+                DropDatabaseReply reply;
+                reply.setInfo("database does not exist"_sd);
+                return reply;
             }
-
-            return appendCommandStatus(result, status.getStatus());
         }
-
-        log() << "DROP DATABASE: " << dbname;
-
-        shared_ptr<DBConfig> conf = status.getValue();
-
-        // TODO: Make dropping logic saner and more tolerant of partial drops.  This is
-        // particularly important since a database drop can be aborted by *any* collection
-        // with a distributed namespace lock taken (migrates/splits)
-
-        if (!conf->dropDatabase(txn, errmsg)) {
-            return false;
-        }
-
-        result.append("dropped", dbname);
-        return true;
-    }
-
+    };
 } clusterDropDatabaseCmd;
 
 }  // namespace

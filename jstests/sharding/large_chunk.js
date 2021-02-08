@@ -1,66 +1,73 @@
-// Where we test operations dealing with large chunks
+/**
+ * Where we test operations dealing with large chunks
+ *
+ * This test is labeled resource intensive because its total io_write is 220MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
 (function() {
+'use strict';
 
-// Starts a new sharding environment limiting the chunksize to 1GB (highest value allowed).
-// Note that early splitting will start with a 1/4 of max size currently.  
-var s = new ShardingTest({ name: 'large_chunk',
-                           shards: 2,
-                           verbose: 2,
-                           other: { chunkSize: 1024 } });
+load("jstests/sharding/libs/find_chunks_util.js");
 
-// take the balancer out of the equation
-s.config.settings.update( { _id: "balancer" }, { $set : { stopped: true } } , true );
-s.config.settings.find().forEach(printjson);
-
-db = s.getDB( "test" );
+// Starts a new sharding environment limiting the chunk size to 1GB (highest value allowed).
+// Note that early splitting will start with a 1/4 of max size currently.
+var s = new ShardingTest({name: 'large_chunk', shards: 2, other: {chunkSize: 1024}});
+var db = s.getDB("test");
 
 //
 // Step 1 - Test moving a large chunk
 //
 
 // Turn on sharding on the 'test.foo' collection and generate a large chunk
-s.adminCommand( { enablesharding : "test" } );
-s.ensurePrimaryShard('test', 'shard0001');
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
+s.ensurePrimaryShard('test', s.shard1.shardName);
 
-bigString = ""
-while ( bigString.length < 10000 )
+var bigString = "";
+while (bigString.length < 10000) {
     bigString += "asdasdasdasdadasdasdasdasdasdasdasdasda";
+}
 
-inserted = 0;
-num = 0;
+var inserted = 0;
+var num = 0;
 var bulk = db.foo.initializeUnorderedBulkOp();
-while ( inserted < ( 400 * 1024 * 1024 ) ){
-    bulk.insert({ _id: num++, s: bigString });
+while (inserted < (400 * 1024 * 1024)) {
+    bulk.insert({_id: num++, s: bigString});
     inserted += bigString.length;
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
-s.adminCommand( { shardcollection : "test.foo" , key : { _id : 1 } } );
+assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {_id: 1}}));
 
-assert.eq( 1 , s.config.chunks.count() , "step 1 - need one large chunk" );
+assert.eq(
+    1, findChunksUtil.countChunksForNs(s.config, "test.foo"), "step 1 - need one large chunk");
 
-primary = s.getServer( "test" ).getDB( "test" );
-secondary = s.getOther( primary ).getDB( "test" );
+var primary = s.getPrimaryShard("test").getDB("test");
+var secondary = s.getOther(primary).getDB("test");
 
-// Make sure that we don't move that chunk if it goes past what we consider the maximum chunk size
-print("Checkpoint 1a")
-max = 200 * 1024 * 1024;
+// Make sure that we don't move that chunk if it goes past what we consider the maximum chunk
+// size
+print("Checkpoint 1a");
+var max = 200 * 1024 * 1024;
 assert.throws(function() {
-        s.adminCommand({ movechunk: "test.foo",
-                         find: { _id: 1 },
-                         to: secondary.getMongo().name,
-                         maxChunkSizeBytes: max });
+    s.adminCommand({
+        movechunk: "test.foo",
+        find: {_id: 1},
+        to: secondary.getMongo().name,
+        maxChunkSizeBytes: max
     });
+});
 
 // Move the chunk
 print("checkpoint 1b");
-before = s.config.chunks.find().toArray();
-s.adminCommand( { movechunk : "test.foo" , find : { _id : 1 } , to : secondary.getMongo().name } );
-after = s.config.chunks.find().toArray();
-assert.neq( before[0].shard , after[0].shard , "move chunk did not work" );
+var before = findChunksUtil.findChunksByNs(s.config, 'test.foo').toArray();
+assert.commandWorked(
+    s.s0.adminCommand({movechunk: "test.foo", find: {_id: 1}, to: secondary.getMongo().name}));
 
-s.config.changelog.find().forEach( printjson )
+var after = findChunksUtil.findChunksByNs(s.config, 'test.foo').toArray();
+assert.neq(before[0].shard, after[0].shard, "move chunk did not work");
+
+s.config.changelog.find().forEach(printjson);
 
 s.stop();
-
 })();

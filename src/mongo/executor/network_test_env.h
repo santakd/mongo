@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,33 +29,52 @@
 
 #pragma once
 
+#include <functional>
 #include <tuple>
 #include <type_traits>
 #include <vector>
 
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
-
-class BSONObj;
-class CatalogManagerReplicaSet;
-class DistLockManagerMock;
-class ShardRegistry;
-template <typename T>
-class StatusWith;
-
 namespace executor {
 
 /**
- * A network infrastructure for testing.
+ * A network infrastructure for testing that provides helpers (onCommand*, onFind*) to extract
+ * pending requests from the NetworkInterface in this NetworkTestEnv and set a response for it.
+ * Note that these helpers are synchronous and the code that is being tested that uses the
+ * TaskExecutor will typically be also synchronously waiting for the response from the network.
+ * Therefore, the test will not make progress if it is ran on a single thread. To get around this,
+ * the launchAsync helper can be used to create a new thread that will be used to initiate the
+ * network call.
+ *
+ * Example usage:
+ *
+ * auto future = netTestEnv.launchAsync([](){
+ *     return methodWithNetCallToTest();
+ * });
+ *
+ *
+ * netTestEnv.OnCommandFunction([](const RemoteCommandRequest& request){
+ *     // check contents of request
+ *     return BSON("ok" << 1); // return desired response
+ * });
+ *
+ * // Add as many onCommand/onFind calls to match the number of network calls by the
+ * // methodWithNetCallToTest in the order they are going to be called.
+ *
+ * checkResult(future.timed_get(...));
  */
 class NetworkTestEnv {
 public:
+    // Common timeout for tests to use for any work scheduled through launchAsync to complete.
+    static constexpr Minutes kDefaultLaunchAsyncFutureTimeout{5};
+
     /**
      * Wraps a std::future but will cancel any pending network operations in its destructor if
      * the future wasn't successfully waited on in the main test thread.
@@ -69,14 +89,7 @@ public:
                         executor::NetworkInterfaceMock* network)
             : _future(std::move(future)), _executor(executor), _network(network) {}
 
-#if defined(_MSC_VER) && _MSC_VER < 1900  // MVSC++ <= 2013 can't generate default move operations
-        FutureHandle(FutureHandle&& other)
-            : _future(std::move(other._future)),
-              _executor(other._executor),
-              _network(other._network) {}
-#else
         FutureHandle(FutureHandle&& other) = default;
-#endif
 
         FutureHandle& operator=(FutureHandle&& other) {
             // Assigning to initialized FutureHandle is banned because of the work required prior to
@@ -106,6 +119,15 @@ public:
             return _future.get();
         }
 
+        template <class Period>
+        T timed_get(const Duration<Period>& timeout_duration) {
+            return timed_get(timeout_duration.toSystemDuration());
+        }
+
+        T default_timed_get() {
+            return timed_get(kDefaultLaunchAsyncFutureTimeout);
+        }
+
     private:
         stdx::future<T> _future;
         executor::TaskExecutor* _executor;
@@ -121,26 +143,26 @@ public:
      * Must be defined in the header because of its use of templates.
      */
     template <typename Lambda>
-    FutureHandle<typename std::result_of<Lambda()>::type> launchAsync(Lambda&& func) const {
+    FutureHandle<typename std::invoke_result<Lambda>::type> launchAsync(Lambda&& func) const {
         auto future = async(stdx::launch::async, std::forward<Lambda>(func));
-        return NetworkTestEnv::FutureHandle<typename std::result_of<Lambda()>::type>{
+        return NetworkTestEnv::FutureHandle<typename std::invoke_result<Lambda>::type>{
             std::move(future), _executor, _mockNetwork};
     }
 
-    using OnCommandFunction = stdx::function<StatusWith<BSONObj>(const RemoteCommandRequest&)>;
+    using OnCommandFunction = std::function<StatusWith<BSONObj>(const RemoteCommandRequest&)>;
     using OnCommandWithMetadataFunction =
-        stdx::function<StatusWith<RemoteCommandResponse>(const RemoteCommandRequest&)>;
+        std::function<RemoteCommandResponse(const RemoteCommandRequest&)>;
 
     using OnFindCommandFunction =
-        stdx::function<StatusWith<std::vector<BSONObj>>(const RemoteCommandRequest&)>;
+        std::function<StatusWith<std::vector<BSONObj>>(const RemoteCommandRequest&)>;
     // Function that accepts a find request and returns a tuple of resulting documents and response
     // metadata.
     using OnFindCommandWithMetadataFunction =
-        stdx::function<StatusWith<std::tuple<std::vector<BSONObj>, BSONObj>>(
+        std::function<StatusWith<std::tuple<std::vector<BSONObj>, BSONObj>>(
             const RemoteCommandRequest&)>;
 
     /**
-     * Create a new environment based on the given network.
+     * Create a new test environment based on an existing executor and network.
      */
     NetworkTestEnv(TaskExecutor* executor, NetworkInterfaceMock* network);
 
@@ -150,6 +172,7 @@ public:
      * single request + response or find tests.
      */
     void onCommand(OnCommandFunction func);
+    void onCommands(std::vector<OnCommandFunction> funcs);
     void onCommandWithMetadata(OnCommandWithMetadataFunction func);
     void onFindCommand(OnFindCommandFunction func);
     void onFindWithMetadataCommand(OnFindCommandWithMetadataFunction func);

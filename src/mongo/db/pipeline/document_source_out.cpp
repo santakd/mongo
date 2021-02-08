@@ -1,197 +1,222 @@
 /**
- * Copyright 2011 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_out.h"
+
+#include <fmt/format.h>
+
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/pipeline/document_path_support.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/destructor_guard.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+using namespace fmt::literals;
 
-using boost::intrusive_ptr;
-using std::vector;
+MONGO_FAIL_POINT_DEFINE(hangWhileBuildingDocumentSourceOutBatch);
+MONGO_FAIL_POINT_DEFINE(outWaitAfterTempCollectionCreation);
+REGISTER_DOCUMENT_SOURCE(out,
+                         DocumentSourceOut::LiteParsed::parse,
+                         DocumentSourceOut::createFromBson);
 
 DocumentSourceOut::~DocumentSourceOut() {
     DESTRUCTOR_GUARD(
         // Make sure we drop the temp collection if anything goes wrong. Errors are ignored
         // here because nothing can be done about them. Additionally, if this fails and the
         // collection is left behind, it will be cleaned up next time the server is started.
-        if (_mongod && _tempNs.size()) _mongod->directClient()->dropCollection(_tempNs.ns());)
+        if (_tempNs.size()) {
+            auto cleanupClient =
+                pExpCtx->opCtx->getServiceContext()->makeClient("$out_replace_coll_cleanup");
+            AlternativeClientRegion acr(cleanupClient);
+            // Create a new operation context so that any interrupts on the current operation will
+            // not affect the dropCollection operation below.
+            auto cleanupOpCtx = cc().makeOperationContext();
+
+            DocumentSourceWriteBlock writeBlock(cleanupOpCtx.get());
+
+            pExpCtx->mongoProcessInterface->dropCollection(cleanupOpCtx.get(), _tempNs);
+        });
 }
 
-REGISTER_DOCUMENT_SOURCE(out, DocumentSourceOut::createFromBson);
-
-const char* DocumentSourceOut::getSourceName() const {
-    return "$out";
+NamespaceString DocumentSourceOut::parseNsFromElem(const BSONElement& spec,
+                                                   const StringData& defaultDB) {
+    if (spec.type() == BSONType::String) {
+        return NamespaceString(defaultDB, spec.valueStringData());
+    } else if (spec.type() == BSONType::Object) {
+        auto nsObj = spec.Obj();
+        uassert(16994,
+                str::stream() << "If an object is passed to " << kStageName
+                              << " it must have exactly 2 fields: 'db' and 'coll'",
+                nsObj.nFields() == 2 && nsObj.hasField("coll") && nsObj.hasField("db"));
+        return NamespaceString(nsObj["db"].String(), nsObj["coll"].String());
+    } else {
+        uassert(16990,
+                "{} only supports a string or object argument, but found {}"_format(
+                    kStageName, typeName(spec.type())),
+                spec.type() == BSONType::String);
+    }
+    MONGO_UNREACHABLE;
 }
 
-static AtomicUInt32 aggOutCounter;
-void DocumentSourceOut::prepTempCollection() {
-    verify(_mongod);
-    verify(_tempNs.size() == 0);
+std::unique_ptr<DocumentSourceOut::LiteParsed> DocumentSourceOut::LiteParsed::parse(
+    const NamespaceString& nss, const BSONElement& spec) {
 
-    DBClientBase* conn = _mongod->directClient();
+    NamespaceString targetNss = parseNsFromElem(spec, nss.db());
+    uassert(ErrorCodes::InvalidNamespace,
+            "Invalid {} target namespace, {}"_format(kStageName, targetNss.ns()),
+            targetNss.isValid());
+    return std::make_unique<DocumentSourceOut::LiteParsed>(spec.fieldName(), std::move(targetNss));
+}
 
-    // Fail early by checking before we do any work.
-    uassert(17017,
-            str::stream() << "namespace '" << _outputNs.ns()
-                          << "' is sharded so it can't be used for $out'",
-            !_mongod->isSharded(_outputNs));
+void DocumentSourceOut::initialize() {
+    DocumentSourceWriteBlock writeBlock(pExpCtx->opCtx);
 
-    // cannot $out to capped collection
+    const auto& outputNs = getOutputNs();
+    // We will write all results into a temporary collection, then rename the temporary collection
+    // to be the target collection once we are done.
+    // Note that this temporary collection name is used by MongoMirror and thus should not be
+    // changed without consultation.
+    _tempNs = NamespaceString(str::stream() << outputNs.db() << ".tmp.agg_out." << UUID::gen());
+
+    // Save the original collection options and index specs so we can check they didn't change
+    // during computation.
+    _originalOutOptions =
+        // The uuid field is considered an option, but cannot be passed to createCollection.
+        pExpCtx->mongoProcessInterface->getCollectionOptions(pExpCtx->opCtx, outputNs)
+            .removeField("uuid");
+    _originalIndexes = pExpCtx->mongoProcessInterface->getIndexSpecs(
+        pExpCtx->opCtx, outputNs, false /* includeBuildUUIDs */);
+
+    // Check if it's capped to make sure we have a chance of succeeding before we do all the work.
+    // If the collection becomes capped during processing, the collection options will have changed,
+    // and the $out will fail.
     uassert(17152,
-            str::stream() << "namespace '" << _outputNs.ns()
-                          << "' is capped so it can't be used for $out",
-            !_mongod->isCapped(_outputNs));
+            "namespace '{}' is capped so it can't be used for {}"_format(outputNs.ns(), kStageName),
+            _originalOutOptions["capped"].eoo());
 
-    _tempNs = NamespaceString(StringData(str::stream() << _outputNs.db() << ".tmp.agg_out."
-                                                       << aggOutCounter.addAndFetch(1)));
-
-    // Create output collection, copying options from existing collection if any.
     {
-        const auto infos =
-            conn->getCollectionInfos(_outputNs.db().toString(), BSON("name" << _outputNs.coll()));
-        const auto options = infos.empty() ? BSONObj() : infos.front().getObjectField("options");
-
         BSONObjBuilder cmd;
         cmd << "create" << _tempNs.coll();
         cmd << "temp" << true;
-        cmd.appendElementsUnique(options);
+        cmd.appendElementsUnique(_originalOutOptions);
 
-        BSONObj info;
-        bool ok = conn->runCommand(_outputNs.db().toString(), cmd.done(), info);
-        uassert(16994,
-                str::stream() << "failed to create temporary $out collection '" << _tempNs.ns()
-                              << "': " << info.toString(),
-                ok);
+        pExpCtx->mongoProcessInterface->createCollection(
+            pExpCtx->opCtx, _tempNs.db().toString(), cmd.done());
     }
 
-    // copy indexes on _outputNs to _tempNs
-    const std::list<BSONObj> indexes = conn->getIndexSpecs(_outputNs.ns());
-    for (std::list<BSONObj>::const_iterator it = indexes.begin(); it != indexes.end(); ++it) {
-        MutableDocument index((Document(*it)));
-        index.remove("_id");  // indexes shouldn't have _ids but some existing ones do
-        index["ns"] = Value(_tempNs.ns());
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &outWaitAfterTempCollectionCreation,
+        pExpCtx->opCtx,
+        "outWaitAfterTempCollectionCreation",
+        []() {
+            LOGV2(20901,
+                  "Hanging aggregation due to 'outWaitAfterTempCollectionCreation' failpoint");
+        });
+    if (_originalIndexes.empty()) {
+        return;
+    }
 
-        BSONObj indexBson = index.freeze().toBson();
-        conn->insert(_tempNs.getSystemIndexesCollection(), indexBson);
-        BSONObj err = conn->getLastErrorDetailed();
-        uassert(16995,
-                str::stream() << "copying index for $out failed."
-                              << " index: " << indexBson << " error: " << err,
-                DBClientWithCommands::getLastErrorString(err).empty());
+    // Copy the indexes of the output collection to the temp collection.
+    try {
+        std::vector<BSONObj> tempNsIndexes = {std::begin(_originalIndexes),
+                                              std::end(_originalIndexes)};
+        pExpCtx->mongoProcessInterface->createIndexesOnEmptyCollection(
+            pExpCtx->opCtx, _tempNs, tempNsIndexes);
+    } catch (DBException& ex) {
+        ex.addContext("Copying indexes for $out failed");
+        throw;
     }
 }
 
-void DocumentSourceOut::spill(const vector<BSONObj>& toInsert) {
-    BSONObj err = _mongod->insert(_tempNs, toInsert);
-    uassert(16996,
-            str::stream() << "insert for $out failed: " << err,
-            DBClientWithCommands::getLastErrorString(err).empty());
+void DocumentSourceOut::finalize() {
+    DocumentSourceWriteBlock writeBlock(pExpCtx->opCtx);
+
+    const auto& outputNs = getOutputNs();
+    auto renameCommandObj =
+        BSON("renameCollection" << _tempNs.ns() << "to" << outputNs.ns() << "dropTarget" << true);
+
+    pExpCtx->mongoProcessInterface->renameIfOptionsAndIndexesHaveNotChanged(
+        pExpCtx->opCtx, renameCommandObj, outputNs, _originalOutOptions, _originalIndexes);
+
+    // The rename succeeded, so the temp collection no longer exists.
+    _tempNs = {};
 }
 
-boost::optional<Document> DocumentSourceOut::getNext() {
-    pExpCtx->checkForInterrupt();
+boost::intrusive_ptr<DocumentSource> DocumentSourceOut::create(
+    NamespaceString outputNs, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
 
-    // make sure we only write out once
-    if (_done)
-        return boost::none;
-    _done = true;
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            "{} cannot be used in a transaction"_format(kStageName),
+            !expCtx->inMultiDocumentTransaction);
 
-    verify(_mongod);
-    DBClientBase* conn = _mongod->directClient();
+    uassert(ErrorCodes::InvalidNamespace,
+            "Invalid {} target namespace, {}"_format(kStageName, outputNs.ns()),
+            outputNs.isValid());
 
-    prepTempCollection();
-    verify(_tempNs.size() != 0);
+    uassert(17385,
+            "Can't {} to special collection: {}"_format(kStageName, outputNs.coll()),
+            !outputNs.isSystem());
 
-    vector<BSONObj> bufferedObjects;
-    int bufferedBytes = 0;
-    while (boost::optional<Document> next = pSource->getNext()) {
-        BSONObj toInsert = next->toBson();
-        bufferedBytes += toInsert.objsize();
-        if (!bufferedObjects.empty() && bufferedBytes > BSONObjMaxUserSize) {
-            spill(bufferedObjects);
-            bufferedObjects.clear();
-            bufferedBytes = toInsert.objsize();
-        }
-        bufferedObjects.push_back(toInsert);
-    }
+    uassert(31321,
+            "Can't {} to internal database: {}"_format(kStageName, outputNs.db()),
+            !outputNs.isOnInternalDb());
 
-    if (!bufferedObjects.empty())
-        spill(bufferedObjects);
-
-    // Checking again to make sure we didn't become sharded while running.
-    uassert(17018,
-            str::stream() << "namespace '" << _outputNs.ns()
-                          << "' became sharded so it can't be used for $out'",
-            !_mongod->isSharded(_outputNs));
-
-    BSONObj rename =
-        BSON("renameCollection" << _tempNs.ns() << "to" << _outputNs.ns() << "dropTarget" << true);
-    BSONObj info;
-    bool ok = conn->runCommand("admin", rename, info);
-    uassert(16997, str::stream() << "renameCollection for $out failed: " << info, ok);
-
-    // We don't need to drop the temp collection in our destructor if the rename succeeded.
-    _tempNs = NamespaceString("");
-
-    // This "DocumentSource" doesn't produce output documents. This can change in the future
-    // if we support using $out in "tee" mode.
-    return boost::none;
+    return new DocumentSourceOut(std::move(outputNs), expCtx);
 }
 
-DocumentSourceOut::DocumentSourceOut(const NamespaceString& outputNs,
-                                     const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx),
-      _done(false),
-      _tempNs("")  // filled in by prepTempCollection
-      ,
-      _outputNs(outputNs) {}
-
-intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
-    BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(16990,
-            str::stream() << "$out only supports a string argument, not " << typeName(elem.type()),
-            elem.type() == String);
-
-    NamespaceString outputNs(pExpCtx->ns.db().toString() + '.' + elem.str());
-    uassert(17385, "Can't $out to special collection: " + elem.str(), !outputNs.isSpecial());
-    return new DocumentSourceOut(outputNs, pExpCtx);
+boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
+    BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto targetNS = parseNsFromElem(elem, expCtx->ns.db());
+    return create(targetNS, expCtx);
 }
 
-Value DocumentSourceOut::serialize(bool explain) const {
-    massert(
-        17000, "$out shouldn't have different db than input", _outputNs.db() == pExpCtx->ns.db());
-
-    return Value(DOC(getSourceName() << _outputNs.coll()));
+Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+    return Value(DOC(kStageName << DOC("db" << _outputNs.db() << "coll" << _outputNs.coll())));
 }
 
-DocumentSource::GetDepsReturn DocumentSourceOut::getDependencies(DepsTracker* deps) const {
-    deps->needWholeDocument = true;
-    return EXHAUSTIVE_ALL;
+void DocumentSourceOut::waitWhileFailPointEnabled() {
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangWhileBuildingDocumentSourceOutBatch,
+        pExpCtx->opCtx,
+        "hangWhileBuildingDocumentSourceOutBatch",
+        []() {
+            LOGV2(20902,
+                  "Hanging aggregation due to 'hangWhileBuildingDocumentSourceOutBatch' failpoint");
+        });
 }
-}
+
+}  // namespace mongo

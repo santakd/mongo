@@ -1,42 +1,48 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 #pragma once
 
 #include <cstdint>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+// Returns the current interrupt interval from the setParameter value
+int getScriptingEngineInterruptInterval();
 
 /**
  * DeadlineMonitor
@@ -63,7 +69,8 @@ namespace mongo {
  */
 template <typename _Task>
 class DeadlineMonitor {
-    MONGO_DISALLOW_COPYING(DeadlineMonitor);
+    DeadlineMonitor(const DeadlineMonitor&) = delete;
+    DeadlineMonitor& operator=(const DeadlineMonitor&) = delete;
 
 public:
     DeadlineMonitor() {
@@ -77,7 +84,7 @@ public:
     ~DeadlineMonitor() {
         {
             // ensure the monitor thread has been stopped before destruction
-            stdx::lock_guard<stdx::mutex> lk(_deadlineMutex);
+            stdx::lock_guard<Latch> lk(_deadlineMutex);
             _inShutdown = true;
             _newDeadlineAvailable.notify_one();
         }
@@ -91,11 +98,18 @@ public:
      * @param   task        the task to kill()
      * @param   timeoutMs   number of milliseconds before the deadline expires
      */
-    void startDeadline(_Task* const task, uint64_t timeoutMs) {
-        const auto deadline = Date_t::now() + Milliseconds(timeoutMs);
-        stdx::lock_guard<stdx::mutex> lk(_deadlineMutex);
+    void startDeadline(_Task* const task, int64_t timeoutMs) {
+        Date_t deadline;
+        if (timeoutMs > 0) {
+            deadline = Date_t::now() + Milliseconds(timeoutMs);
+        } else {
+            deadline = Date_t::max();
+        }
+        stdx::lock_guard<Latch> lk(_deadlineMutex);
 
-        _tasks[task] = deadline;
+        if (_tasks.find(task) == _tasks.end()) {
+            _tasks.emplace(task, deadline);
+        }
 
         if (deadline < _nearestDeadlineWallclock) {
             _nearestDeadlineWallclock = deadline;
@@ -109,7 +123,7 @@ public:
      * @return true  if the task was found and erased
      */
     bool stopDeadline(_Task* const task) {
-        stdx::lock_guard<stdx::mutex> lk(_deadlineMutex);
+        stdx::lock_guard<Latch> lk(_deadlineMutex);
         return _tasks.erase(task);
     }
 
@@ -120,15 +134,32 @@ private:
      * _Task::kill() is invoked.
      */
     void deadlineMonitorThread() {
-        stdx::unique_lock<stdx::mutex> lk(_deadlineMutex);
+        setThreadName("DeadlineMonitor");
+        stdx::unique_lock<Latch> lk(_deadlineMutex);
+        Date_t lastInterruptCycle = Date_t::now();
         while (!_inShutdown) {
             // get the next interval to wait
             const Date_t now = Date_t::now();
+            const auto interruptInterval = Milliseconds{getScriptingEngineInterruptInterval()};
+
+            if (now - lastInterruptCycle > interruptInterval) {
+                for (const auto& task : _tasks) {
+                    if (task.first->isKillPending())
+                        task.first->kill();
+                }
+                lastInterruptCycle = now;
+            }
 
             // wait for a task to be added or a deadline to expire
             if (_nearestDeadlineWallclock > now) {
+                MONGO_IDLE_THREAD_BLOCK;
                 if (_nearestDeadlineWallclock == Date_t::max()) {
-                    _newDeadlineAvailable.wait(lk);
+                    if ((interruptInterval.count() > 0) &&
+                        (_nearestDeadlineWallclock - now > interruptInterval)) {
+                        _newDeadlineAvailable.wait_for(lk, interruptInterval.toSystemDuration());
+                    } else {
+                        _newDeadlineAvailable.wait(lk);
+                    }
                 } else {
                     _newDeadlineAvailable.wait_until(lk,
                                                      _nearestDeadlineWallclock.toSystemTimePoint());
@@ -138,7 +169,7 @@ private:
 
             // set the next interval to wait for deadline completion
             _nearestDeadlineWallclock = Date_t::max();
-            typename TaskDeadlineMap::iterator i = _tasks.begin();
+            auto i = _tasks.begin();
             while (i != _tasks.end()) {
                 if (i->second < now) {
                     // deadline expired
@@ -155,9 +186,10 @@ private:
         }
     }
 
-    typedef unordered_map<_Task*, Date_t> TaskDeadlineMap;
-    TaskDeadlineMap _tasks;      // map of running tasks with deadlines
-    stdx::mutex _deadlineMutex;  // protects all non-const members, except _monitorThread
+    using TaskDeadlineMap = stdx::unordered_map<_Task*, Date_t>;
+    TaskDeadlineMap _tasks;  // map of running tasks with deadlines
+    // protects all non-const members, except _monitorThread
+    Mutex _deadlineMutex = MONGO_MAKE_LATCH("DeadlineMonitor::_deadlineMutex");
     stdx::condition_variable _newDeadlineAvailable;    // Signaled for timeout, start and stop
     stdx::thread _monitorThread;                       // the deadline monitor thread
     Date_t _nearestDeadlineWallclock = Date_t::max();  // absolute time of the nearest deadline

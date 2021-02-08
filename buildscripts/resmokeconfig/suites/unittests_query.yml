@@ -1,9 +1,11 @@
+test_kind: cpp_unit_test
+
 selector:
-  cpp_unit_test:
-    root: build/unittests.txt
-    include_files:
-      - build/**/query/*
+  root: build/unittests.txt
+  include_files:
+  - build/**/pipeline/*
+  - build/**/query/*
+  - build/**/exec/*
 
 executor:
-  cpp_unit_test:
-    config: {}
+  config: {}

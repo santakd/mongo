@@ -1,13 +1,12 @@
 # Client objects are leaked in threads that are never terminated
 leak:mongo::Client::Client
 
-# Insanity related to the fact that the static observer
-# prevents deleting mutexes during clean shutdown. If you
-# remove the StaticObserver, remove this too.
-leak:mongo::mutex::mutex
+# DiagnosticListeners and WaitListeners need to be available in detached threads
+leak:mongo::latch_detail::getDiagnosticListenerState
+leak:mongo::latch_detail::installDiagnosticListener
+leak:mongo::Interruptible::installWaitListener
 
-# Thread names leak from threads that are never terminated.
-leak:mongo::setThreadName
-leak:mongo::getThreadName
+# The singleton must live throughout the lifetime of all SSL threads
+leak::mongo::SSLThreadInfo::ThreadIDManager::idManager
 
 leak:glob64

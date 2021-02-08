@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,105 +31,65 @@
 
 #include "mongo/db/exec/idhack.h"
 
-#include "mongo/client/dbclientinterface.h"
+#include <memory>
+
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_access_method.h"
-#include "mongo/db/storage/record_fetcher.h"
-#include "mongo/s/d_state.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* IDHackStage::kStageType = "IDHACK";
 
-IDHackStage::IDHackStage(OperationContext* txn,
-                         const Collection* collection,
+IDHackStage::IDHackStage(ExpressionContext* expCtx,
                          CanonicalQuery* query,
                          WorkingSet* ws,
+                         const CollectionPtr& collection,
                          const IndexDescriptor* descriptor)
-    : PlanStage(kStageType, txn),
-      _collection(collection),
+    : RequiresIndexStage(kStageType, expCtx, collection, descriptor, ws),
       _workingSet(ws),
-      _key(query->getQueryObj()["_id"].wrap()),
-      _done(false),
-      _idBeingPagedIn(WorkingSet::INVALID_ID) {
-    const IndexCatalog* catalog = _collection->getIndexCatalog();
+      _key(query->getQueryObj()["_id"].wrap()) {
     _specificStats.indexName = descriptor->indexName();
-    _accessMethod = catalog->getIndex(descriptor);
-
-    if (NULL != query->getProj()) {
-        _addKeyMetadata = query->getProj()->wantIndexKey();
-    } else {
-        _addKeyMetadata = false;
-    }
+    _addKeyMetadata = query->getQueryRequest().returnKey();
 }
 
-IDHackStage::IDHackStage(OperationContext* txn,
-                         Collection* collection,
+IDHackStage::IDHackStage(ExpressionContext* expCtx,
                          const BSONObj& key,
                          WorkingSet* ws,
+                         const CollectionPtr& collection,
                          const IndexDescriptor* descriptor)
-    : PlanStage(kStageType, txn),
-      _collection(collection),
+    : RequiresIndexStage(kStageType, expCtx, collection, descriptor, ws),
       _workingSet(ws),
-      _key(key),
-      _done(false),
-      _addKeyMetadata(false),
-      _idBeingPagedIn(WorkingSet::INVALID_ID) {
-    const IndexCatalog* catalog = _collection->getIndexCatalog();
+      _key(key) {
     _specificStats.indexName = descriptor->indexName();
-    _accessMethod = catalog->getIndex(descriptor);
 }
 
 IDHackStage::~IDHackStage() {}
 
 bool IDHackStage::isEOF() {
-    if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
-        // We asked the parent for a page-in, but still haven't had a chance to return the
-        // paged in document
-        return false;
-    }
-
     return _done;
 }
 
-PlanStage::StageState IDHackStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState IDHackStage::doWork(WorkingSetID* out) {
     if (_done) {
         return PlanStage::IS_EOF;
-    }
-
-    if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
-        invariant(_recordCursor);
-        WorkingSetID id = _idBeingPagedIn;
-        _idBeingPagedIn = WorkingSet::INVALID_ID;
-
-        invariant(WorkingSetCommon::fetchIfUnfetched(getOpCtx(), _workingSet, id, _recordCursor));
-
-        WorkingSetMember* member = _workingSet->get(id);
-        return advance(id, member, out);
     }
 
     WorkingSetID id = WorkingSet::INVALID_ID;
     try {
         // Look up the key by going directly to the index.
-        RecordId loc = _accessMethod->findSingle(getOpCtx(), _key);
+        RecordId recordId = indexAccessMethod()->findSingle(opCtx(), _key);
 
         // Key not found.
-        if (loc.isNull()) {
+        if (recordId.isNull()) {
             _done = true;
             return PlanStage::IS_EOF;
         }
@@ -139,27 +100,15 @@ PlanStage::StageState IDHackStage::work(WorkingSetID* out) {
         // Create a new WSM for the result document.
         id = _workingSet->allocate();
         WorkingSetMember* member = _workingSet->get(id);
-        member->loc = loc;
-        _workingSet->transitionToLocAndIdx(id);
+        member->recordId = recordId;
+        _workingSet->transitionToRecordIdAndIdx(id);
 
         if (!_recordCursor)
-            _recordCursor = _collection->getCursor(getOpCtx());
+            _recordCursor = collection()->getCursor(opCtx());
 
-        // We may need to request a yield while we fetch the document.
-        if (auto fetcher = _recordCursor->fetcherForId(loc)) {
-            // There's something to fetch. Hand the fetcher off to the WSM, and pass up a
-            // fetch request.
-            _idBeingPagedIn = id;
-            member->setFetcher(fetcher.release());
-            *out = id;
-            _commonStats.needYield++;
-            return NEED_YIELD;
-        }
-
-        // The doc was already in memory, so we go ahead and return it.
-        if (!WorkingSetCommon::fetch(getOpCtx(), _workingSet, id, _recordCursor)) {
-            // _id is immutable so the index would return the only record that could
-            // possibly match the query.
+        // Find the document associated with 'id' in the collection's record store.
+        if (!WorkingSetCommon::fetch(opCtx(), _workingSet, id, _recordCursor, collection()->ns())) {
+            // We didn't find a document with RecordId 'id'.
             _workingSet->free(id);
             _commonStats.isEOF = true;
             _done = true;
@@ -167,14 +116,13 @@ PlanStage::StageState IDHackStage::work(WorkingSetID* out) {
         }
 
         return advance(id, member, out);
-    } catch (const WriteConflictException& wce) {
+    } catch (const WriteConflictException&) {
         // Restart at the beginning on retry.
         _recordCursor.reset();
         if (id != WorkingSet::INVALID_ID)
             _workingSet->free(id);
 
         *out = WorkingSet::INVALID_ID;
-        _commonStats.needYield++;
         return NEED_YIELD;
     }
 }
@@ -185,26 +133,25 @@ PlanStage::StageState IDHackStage::advance(WorkingSetID id,
     invariant(member->hasObj());
 
     if (_addKeyMetadata) {
-        BSONObjBuilder bob;
-        BSONObj ownedKeyObj = member->obj.value()["_id"].wrap().getOwned();
-        bob.appendKeys(_key, ownedKeyObj);
-        member->addComputed(new IndexKeyComputedData(bob.obj()));
+        BSONObj ownedKeyObj = member->doc.value().toBson()["_id"].wrap().getOwned();
+        member->metadata().setIndexKey(IndexKeyEntry::rehydrateKey(_key, ownedKeyObj));
     }
 
     _done = true;
-    ++_commonStats.advanced;
     *out = id;
     return PlanStage::ADVANCED;
 }
 
-void IDHackStage::doSaveState() {
+void IDHackStage::doSaveStateRequiresIndex() {
     if (_recordCursor)
         _recordCursor->saveUnpositioned();
 }
 
-void IDHackStage::doRestoreState() {
-    if (_recordCursor)
-        _recordCursor->restore();
+void IDHackStage::doRestoreStateRequiresIndex() {
+    if (_recordCursor) {
+        auto couldRestore = _recordCursor->restore();
+        uassert(5083800, "IDHackStage could not restore cursor", couldRestore);
+    }
 }
 
 void IDHackStage::doDetachFromOperationContext() {
@@ -214,38 +161,13 @@ void IDHackStage::doDetachFromOperationContext() {
 
 void IDHackStage::doReattachToOperationContext() {
     if (_recordCursor)
-        _recordCursor->reattachToOperationContext(getOpCtx());
-}
-
-void IDHackStage::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    // Since updates can't mutate the '_id' field, we can ignore mutation invalidations.
-    if (INVALIDATION_MUTATION == type) {
-        return;
-    }
-
-    // It's possible that the loc getting invalidated is the one we're about to
-    // fetch. In this case we do a "forced fetch" and put the WSM in owned object state.
-    if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
-        WorkingSetMember* member = _workingSet->get(_idBeingPagedIn);
-        if (member->hasLoc() && (member->loc == dl)) {
-            // Fetch it now and kill the diskloc.
-            WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
-        }
-    }
-}
-
-// static
-bool IDHackStage::supportsQuery(const CanonicalQuery& query) {
-    return !query.getParsed().showRecordId() && query.getParsed().getHint().isEmpty() &&
-        !query.getParsed().getSkip() &&
-        CanonicalQuery::isSimpleIdQuery(query.getParsed().getFilter()) &&
-        !query.getParsed().isTailable();
+        _recordCursor->reattachToOperationContext(opCtx());
 }
 
 unique_ptr<PlanStageStats> IDHackStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_IDHACK);
-    ret->specific = make_unique<IDHackStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_IDHACK);
+    ret->specific = std::make_unique<IDHackStats>(_specificStats);
     return ret;
 }
 

@@ -16,7 +16,6 @@
  * "jstests/libs/ca.pem").
  */
 function SSLTest(serverOpts, clientOpts) {
-
     var canonicalServerOpts = function(userProvidedOpts) {
         var canonical = Object.extend({}, userProvidedOpts || {});
 
@@ -51,14 +50,14 @@ SSLTest.prototype.defaultSSLClientOptions = {
     "ssl": "",
     "sslPEMKeyFile": "jstests/libs/client.pem",
     "sslAllowInvalidCertificates": "",
-    "eval": ";" // prevent the shell from entering interactive mode
+    "eval": ";"  // prevent the shell from entering interactive mode
 };
 
 /**
  * The default shell arguments for a shell without SSL enabled.
  */
 SSLTest.prototype.noSSLClientOptions = {
-    eval: ";" // prevent the shell from entering interactive mode
+    eval: ";"  // prevent the shell from entering interactive mode
 };
 
 /**
@@ -67,17 +66,18 @@ SSLTest.prototype.noSSLClientOptions = {
  * was successfully established.
  */
 SSLTest.prototype.connectWorked = function() {
-    var connectTimeoutMillis = 30000;
+    var connectTimeoutMillis = 3 * 60 * 1000;
 
     var serverArgv = MongoRunner.arrOptions("mongod", this.serverOpts);
     var clientArgv = MongoRunner.arrOptions("mongo", this.clientOpts);
 
     var serverPID = _startMongoProgram.apply(null, serverArgv);
     try {
+        // Don't run the hang analyzer because we don't expect connectWorked() to always succeed.
         assert.soon(function() {
-            return checkProgram(serverPID) &&
-                   (0 === _runMongoProgram.apply(null, clientArgv));
-        }, "connect failed", connectTimeoutMillis);
+            return checkProgram(serverPID).alive &&
+                (0 === _runMongoProgram.apply(null, clientArgv));
+        }, "connect failed", connectTimeoutMillis, undefined, {runHangAnalyzer: false});
     } catch (ex) {
         return false;
     } finally {

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,9 +29,11 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
-#include "mongo/db/ops/update_driver.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/update/update_driver.h"
 
 namespace mongo {
 
@@ -53,16 +56,19 @@ class UpdateRequest;
  * using the UpdateDriver.
  */
 class ParsedUpdate {
-    MONGO_DISALLOW_COPYING(ParsedUpdate);
+    ParsedUpdate(const ParsedUpdate&) = delete;
+    ParsedUpdate& operator=(const ParsedUpdate&) = delete;
 
 public:
     /**
      * Constructs a parsed update.
      *
-     * The object pointed to by "request" must stay in scope for the life of the constructed
-     * ParsedUpdate.
+     * The objects pointed to by "request" and "extensionsCallback" must stay in scope for the life
+     * of the constructed ParsedUpdate.
      */
-    ParsedUpdate(OperationContext* txn, const UpdateRequest* request);
+    ParsedUpdate(OperationContext* opCtx,
+                 const UpdateRequest* request,
+                 const ExtensionsCallback& extensionsCallback);
 
     /**
      * Parses the update request to a canonical query and an update driver. On success, the
@@ -89,14 +95,9 @@ public:
     UpdateDriver* getDriver();
 
     /**
-     * Is this update allowed to yield?
+     * Get the YieldPolicy, adjusted for GodMode.
      */
-    bool canYield() const;
-
-    /**
-     * Is this update supposed to be isolated?
-     */
-    bool isIsolated() const;
+    PlanYieldPolicy::YieldPolicy yieldPolicy() const;
 
     /**
      * As an optimization, we don't create a canonical query for updates with simple _id
@@ -105,9 +106,32 @@ public:
     bool hasParsedQuery() const;
 
     /**
+     * Returns a const pointer to the canonical query. Requires that hasParsedQuery() is true.
+     */
+    const CanonicalQuery* getParsedQuery() const {
+        invariant(_canonicalQuery);
+        return _canonicalQuery.get();
+    }
+
+    /**
      * Releases ownership of the canonical query to the caller.
      */
     std::unique_ptr<CanonicalQuery> releaseParsedQuery();
+
+    /**
+     * Sets this ParsedUpdate's collator.
+     *
+     * This setter can be used to override the collator that was created from the update request
+     * during ParsedUpdate construction.
+     */
+    void setCollator(std::unique_ptr<CollatorInterface> collator);
+
+    /**
+     * Never returns nullptr.
+     */
+    boost::intrusive_ptr<ExpressionContext> expCtx() const {
+        return _expCtx;
+    }
 
 private:
     /**
@@ -118,19 +142,27 @@ private:
     /**
      * Parses the update-descriptor portion of the update request.
      */
-    Status parseUpdate();
+    void parseUpdate();
 
     // Unowned pointer to the transactional context.
-    OperationContext* _txn;
+    OperationContext* _opCtx;
 
     // Unowned pointer to the request object to process.
     const UpdateRequest* const _request;
+
+    // The array filters for the parsed update. Owned here.
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> _arrayFilters;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 
     // Driver for processing updates on matched documents.
     UpdateDriver _driver;
 
     // Parsed query object, or NULL if the query proves to be an id hack query.
     std::unique_ptr<CanonicalQuery> _canonicalQuery;
+
+    // Reference to an extensions callback used when parsing to a canonical query.
+    const ExtensionsCallback& _extensionsCallback;
 };
 
 }  // namespace mongo

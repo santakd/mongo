@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,12 +27,14 @@
  *    it in the license file.
  */
 
+#include <limits>
+#include <map>
 #include <string>
 #include <vector>
-#include <map>
 
 #include "mongo/db/field_parser.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/time_support.h"
 
@@ -44,9 +47,9 @@ using mongo::BSONObjBuilder;
 using mongo::Date_t;
 using mongo::FieldParser;
 using mongo::OID;
+using std::map;
 using std::string;
 using std::vector;
-using std::map;
 
 class ExtractionFixture : public mongo::unittest::Test {
 protected:
@@ -110,11 +113,11 @@ TEST_F(ExtractionFixture, GetBSONArray) {
     BSONField<BSONArray> wrongType(aString.name());
     BSONArray val;
     ASSERT_TRUE(FieldParser::extract(doc, anArray, &val));
-    ASSERT_EQUALS(val, valArray);
+    ASSERT_BSONOBJ_EQ(val, valArray);
     ASSERT_TRUE(FieldParser::extract(doc, notThere, &val));
-    ASSERT_EQUALS(val,
-                  BSON_ARRAY("a"
-                             << "b"));
+    ASSERT_BSONOBJ_EQ(val,
+                      BSON_ARRAY("a"
+                                 << "b"));
     ASSERT_FALSE(FieldParser::extract(doc, wrongType, &val));
 }
 
@@ -123,9 +126,9 @@ TEST_F(ExtractionFixture, GetBSONObj) {
     BSONField<BSONObj> wrongType(aString.name());
     BSONObj val;
     ASSERT_TRUE(FieldParser::extract(doc, anObj, &val));
-    ASSERT_EQUALS(val, valObj);
+    ASSERT_BSONOBJ_EQ(val, valObj);
     ASSERT_TRUE(FieldParser::extract(doc, notThere, &val));
-    ASSERT_EQUALS(val, BSON("b" << 1));
+    ASSERT_BSONOBJ_EQ(val, BSON("b" << 1));
     ASSERT_FALSE(FieldParser::extract(doc, wrongType, &val));
 }
 
@@ -177,31 +180,33 @@ TEST_F(ExtractionFixture, GetLong) {
 TEST_F(ExtractionFixture, IsFound) {
     bool bool_val;
     BSONField<bool> aBoolMissing("aBoolMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, aBool, &bool_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, aBoolMissing, &bool_val, NULL),
+    ASSERT_EQUALS(FieldParser::extract(doc, aBool, &bool_val, nullptr), FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, aBoolMissing, &bool_val, nullptr),
                   FieldParser::FIELD_NONE);
 
     Date_t Date_t_val;
     BSONField<Date_t> aDateMissing("aDateMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, aDate, &Date_t_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, aDateMissing, &Date_t_val, NULL),
+    ASSERT_EQUALS(FieldParser::extract(doc, aDate, &Date_t_val, nullptr), FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, aDateMissing, &Date_t_val, nullptr),
                   FieldParser::FIELD_NONE);
 
     string string_val;
     BSONField<string> aStringMissing("aStringMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, aString, &string_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, aStringMissing, &string_val, NULL),
+    ASSERT_EQUALS(FieldParser::extract(doc, aString, &string_val, nullptr), FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, aStringMissing, &string_val, nullptr),
                   FieldParser::FIELD_NONE);
 
     OID OID_val;
     BSONField<OID> anOIDMissing("anOIDMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, anOID, &OID_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, anOIDMissing, &OID_val, NULL), FieldParser::FIELD_NONE);
+    ASSERT_EQUALS(FieldParser::extract(doc, anOID, &OID_val, nullptr), FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, anOIDMissing, &OID_val, nullptr),
+                  FieldParser::FIELD_NONE);
 
     long long long_long_val;
     BSONField<long long> aLongMissing("aLongMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, aLong, &long_long_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, aLongMissing, &long_long_val, NULL),
+    ASSERT_EQUALS(FieldParser::extract(doc, aLong, &long_long_val, nullptr),
+                  FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, aLongMissing, &long_long_val, nullptr),
                   FieldParser::FIELD_NONE);
 }
 
@@ -210,9 +215,10 @@ TEST(ComplexExtraction, GetStringVector) {
     BSONField<vector<string>> vectorField("testVector");
 
     BSONObjBuilder bob;
-    bob << vectorField() << BSON_ARRAY("a"
-                                       << "b"
-                                       << "c");
+    bob << vectorField()
+        << BSON_ARRAY("a"
+                      << "b"
+                      << "c");
     BSONObj obj = bob.obj();
 
     vector<string> parsedVector;
@@ -235,9 +241,9 @@ TEST(ComplexExtraction, GetObjectVector) {
     vector<BSONObj> parsedVector;
 
     ASSERT(FieldParser::extract(obj, vectorField, &parsedVector));
-    ASSERT_EQUALS(BSON("a" << 1), parsedVector[0]);
-    ASSERT_EQUALS(BSON("b" << 1), parsedVector[1]);
-    ASSERT_EQUALS(BSON("c" << 1), parsedVector[2]);
+    ASSERT_BSONOBJ_EQ(BSON("a" << 1), parsedVector[0]);
+    ASSERT_BSONOBJ_EQ(BSON("b" << 1), parsedVector[1]);
+    ASSERT_BSONOBJ_EQ(BSON("c" << 1), parsedVector[2]);
     ASSERT_EQUALS(parsedVector.size(), static_cast<size_t>(3));
 }
 
@@ -263,9 +269,10 @@ TEST(ComplexExtraction, RoundTripVector) {
     BSONObj obj;
     {
         BSONObjBuilder bob;
-        bob << vectorField() << BSON_ARRAY("a"
-                                           << "b"
-                                           << "c");
+        bob << vectorField()
+            << BSON_ARRAY("a"
+                          << "b"
+                          << "c");
         obj = bob.obj();
     }
 
@@ -292,12 +299,13 @@ TEST(ComplexExtraction, GetStringMap) {
     BSONField<map<string, string>> mapField("testMap");
 
     BSONObjBuilder bob;
-    bob << mapField() << BSON("a"
-                              << "a"
-                              << "b"
-                              << "b"
-                              << "c"
-                              << "c");
+    bob << mapField()
+        << BSON("a"
+                << "a"
+                << "b"
+                << "b"
+                << "c"
+                << "c");
     BSONObj obj = bob.obj();
 
     map<string, string> parsedMap;
@@ -314,24 +322,29 @@ TEST(ComplexExtraction, GetObjectMap) {
     BSONField<map<string, BSONObj>> mapField("testMap");
 
     BSONObjBuilder bob;
-    bob << mapField() << BSON("a" << BSON("a"
-                                          << "a") << "b" << BSON("b"
-                                                                 << "b") << "c" << BSON("c"
-                                                                                        << "c"));
+    bob << mapField()
+        << BSON("a" << BSON("a"
+                            << "a")
+                    << "b"
+                    << BSON("b"
+                            << "b")
+                    << "c"
+                    << BSON("c"
+                            << "c"));
     BSONObj obj = bob.obj();
 
     map<string, BSONObj> parsedMap;
 
     ASSERT(FieldParser::extract(obj, mapField, &parsedMap));
-    ASSERT_EQUALS(BSON("a"
-                       << "a"),
-                  parsedMap["a"]);
-    ASSERT_EQUALS(BSON("b"
-                       << "b"),
-                  parsedMap["b"]);
-    ASSERT_EQUALS(BSON("c"
-                       << "c"),
-                  parsedMap["c"]);
+    ASSERT_BSONOBJ_EQ(BSON("a"
+                           << "a"),
+                      parsedMap["a"]);
+    ASSERT_BSONOBJ_EQ(BSON("b"
+                           << "b"),
+                      parsedMap["b"]);
+    ASSERT_BSONOBJ_EQ(BSON("c"
+                           << "c"),
+                      parsedMap["c"]);
     ASSERT_EQUALS(parsedMap.size(), static_cast<size_t>(3));
 }
 
@@ -340,10 +353,11 @@ TEST(ComplexExtraction, GetBadMap) {
     BSONField<map<string, string>> mapField("testMap");
 
     BSONObjBuilder bob;
-    bob << mapField() << BSON("a"
-                              << "a"
-                              << "b" << 123 << "c"
-                              << "c");
+    bob << mapField()
+        << BSON("a"
+                << "a"
+                << "b" << 123 << "c"
+                << "c");
     BSONObj obj = bob.obj();
 
     map<string, string> parsedMap;
@@ -360,12 +374,13 @@ TEST(ComplexExtraction, RoundTripMap) {
     BSONObj obj;
     {
         BSONObjBuilder bob;
-        bob << mapField() << BSON("a"
-                                  << "a"
-                                  << "b"
-                                  << "b"
-                                  << "c"
-                                  << "c");
+        bob << mapField()
+            << BSON("a"
+                    << "a"
+                    << "b"
+                    << "b"
+                    << "c"
+                    << "c");
         obj = bob.obj();
     }
 
@@ -453,4 +468,70 @@ TEST(EdgeCases, EmbeddedNullStrings) {
     ASSERT_EQUALS(errMsg, "");
 }
 
+TEST(ExtractNumber, IntCases) {
+    const int initialNum = 123;
+    const int defaultNum = 42;
+    const int minNum = INT_MIN;
+    const int maxNum = INT_MAX;
+    const auto decimalNum = mongo::Decimal128("-1.50");
+    auto numbers = BSON("tooSmall" << LLONG_MIN << "tooLarge" << (1LL << 31) << "infinity"
+                                   << std::numeric_limits<double>::infinity() << "minusInfinity"
+                                   << -std::numeric_limits<double>::infinity() << "NaN"
+                                   << std::numeric_limits<double>::quiet_NaN() << "hugeDouble"
+                                   << 9.9E+99 << "decimal" << decimalNum << "int" << defaultNum);
+
+    int num = initialNum;
+    auto tooSmallField = BSONField<int>("tooSmall");
+    auto tooLargeField = BSONField<int>("tooLarge");
+    auto infinityField = BSONField<int>("infinity");
+    auto minusInfinityField = BSONField<int>("minusInfinity");
+    auto NaNField = BSONField<int>("NaN");
+    auto hugeField = BSONField<int>("hugeDouble");
+    auto decimalField = BSONField<int>("decimal");
+    auto intField = BSONField<int>("int");
+    auto missingField = BSONField<int>("missing");
+    auto defaultedField = BSONField<int>("defaulted", defaultNum);
+
+    // Failure case.
+    FieldParser::FieldState fs = FieldParser::extractNumber(numbers, missingField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_NONE);
+    ASSERT_EQ(num, initialNum);
+
+    // Success cases.
+    fs = FieldParser::extractNumber(numbers, defaultedField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_DEFAULT);
+    ASSERT_EQ(num, defaultNum);
+
+    fs = FieldParser::extractNumber(numbers, tooSmallField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_SET);
+    ASSERT_EQ(num, minNum);
+
+    fs = FieldParser::extractNumber(numbers, tooLargeField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_SET);
+    ASSERT_EQ(num, maxNum);
+
+    fs = FieldParser::extractNumber(numbers, hugeField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_SET);
+    ASSERT_EQ(num, maxNum);
+
+    fs = FieldParser::extractNumber(numbers, minusInfinityField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_SET);
+    ASSERT_EQ(num, minNum);
+
+    fs = FieldParser::extractNumber(numbers, infinityField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_SET);
+    ASSERT_EQ(num, maxNum);
+
+    fs = FieldParser::extractNumber(numbers, intField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_SET);
+    ASSERT_EQ(num, defaultNum);
+
+    fs = FieldParser::extractNumber(numbers, NaNField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_SET);
+    ASSERT_EQ(num, 0);
+
+    fs = FieldParser::extractNumber(numbers, decimalField, &num);
+    ASSERT_EQ(fs, FieldParser::FieldState::FIELD_SET);
+    ASSERT_EQ(num, -2);
+}
 }  // unnamed namespace

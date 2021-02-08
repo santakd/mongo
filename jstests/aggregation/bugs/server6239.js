@@ -1,5 +1,8 @@
 // SERVER-6239 reenable $add and $subtract with dates with better semantics
 // Note: error conditions tested also in server6240.js
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 load('jstests/aggregation/extras/utils.js');
 
@@ -10,7 +13,7 @@ var num = 54312;
 db.s6239.drop();
 
 // Populate db
-db.s6239.save({date:new Date(millis), num: num});
+db.s6239.save({date: new Date(millis), num: num});
 
 function test(expression, expected) {
     var res = db.s6239.aggregate({$project: {out: expression}});

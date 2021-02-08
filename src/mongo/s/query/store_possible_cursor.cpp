@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,56 +33,51 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/s/cursors.h"
-#include "mongo/s/strategy.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/s/shard_id.h"
+#include "mongo/s/transaction_router.h"
 
 namespace mongo {
 
-namespace {
-Status storePossibleCursorLegacy(const HostAndPort& server, const BSONObj& cmdResult) {
-    if (cmdResult["ok"].trueValue() && cmdResult.hasField("cursor")) {
-        BSONElement cursorIdElt = cmdResult.getFieldDotted("cursor.id");
+StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
+                                        const NamespaceString& requestedNss,
+                                        OwnedRemoteCursor&& remoteCursor,
+                                        PrivilegeVector privileges,
+                                        TailableModeEnum tailableMode) {
+    auto executorPool = Grid::get(opCtx)->getExecutorPool();
+    auto result = storePossibleCursor(
+        opCtx,
+        remoteCursor->getShardId().toString(),
+        remoteCursor->getHostAndPort(),
+        remoteCursor->getCursorResponse().toBSON(CursorResponse::ResponseType::InitialResponse),
+        requestedNss,
+        executorPool->getArbitraryExecutor(),
+        Grid::get(opCtx)->getCursorManager(),
+        std::move(privileges),
+        tailableMode);
 
-        if (cursorIdElt.type() != mongo::NumberLong) {
-            return Status(ErrorCodes::TypeMismatch,
-                          str::stream() << "expected \"cursor.id\" field from shard "
-                                        << "response to have NumberLong type, instead "
-                                        << "got: " << typeName(cursorIdElt.type()));
-        }
-
-        const long long cursorId = cursorIdElt.Long();
-        if (cursorId != 0) {
-            BSONElement cursorNsElt = cmdResult.getFieldDotted("cursor.ns");
-            if (cursorNsElt.type() != mongo::String) {
-                return Status(ErrorCodes::TypeMismatch,
-                              str::stream() << "expected \"cursor.ns\" field from "
-                                            << "shard response to have String type, "
-                                            << "instead got: " << typeName(cursorNsElt.type()));
-            }
-
-            const std::string cursorNs = cursorNsElt.String();
-            cursorCache.storeRef(server.toString(), cursorId, cursorNs);
-        }
-    }
-
-    return Status::OK();
+    // On success, release ownership of the cursor because it has been registered with the cursor
+    // manager and is now owned there.
+    remoteCursor.releaseCursor();
+    return result;
 }
-}  // namespace
 
-StatusWith<BSONObj> storePossibleCursor(const HostAndPort& server,
+StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
+                                        const ShardId& shardId,
+                                        const HostAndPort& server,
                                         const BSONObj& cmdResult,
-                                        executor::TaskExecutor* executor,
-                                        ClusterCursorManager* cursorManager) {
-    if (!useClusterClientCursor) {
-        Status status = storePossibleCursorLegacy(server, cmdResult);
-        return (status.isOK() ? StatusWith<BSONObj>(cmdResult) : StatusWith<BSONObj>(status));
-    }
-
+                                        const NamespaceString& requestedNss,
+                                        std::shared_ptr<executor::TaskExecutor> executor,
+                                        ClusterCursorManager* cursorManager,
+                                        PrivilegeVector privileges,
+                                        TailableModeEnum tailableMode) {
     if (!cmdResult["ok"].trueValue() || !cmdResult.hasField("cursor")) {
         return cmdResult;
     }
@@ -91,25 +87,62 @@ StatusWith<BSONObj> storePossibleCursor(const HostAndPort& server,
         return incomingCursorResponse.getStatus();
     }
 
+    CurOp::get(opCtx)->debug().nreturned = incomingCursorResponse.getValue().getBatch().size();
+
+    // If nShards has already been set, then we are storing the forwarding $mergeCursors cursor from
+    // a split aggregation pipeline, and the shards half of that pipeline may have targeted multiple
+    // shards. In that case, leave the current value as-is.
+    CurOp::get(opCtx)->debug().nShards = std::max(CurOp::get(opCtx)->debug().nShards, 1);
+
     if (incomingCursorResponse.getValue().getCursorId() == CursorId(0)) {
+        CurOp::get(opCtx)->debug().cursorExhausted = true;
         return cmdResult;
     }
 
-    ClusterClientCursorParams params(incomingCursorResponse.getValue().getNSS());
-    params.remotes.emplace_back(server, incomingCursorResponse.getValue().getCursorId());
+    ClusterClientCursorParams params(incomingCursorResponse.getValue().getNSS(),
+                                     APIParameters::get(opCtx),
+                                     boost::none,
+                                     ReadConcernArgs::get(opCtx));
+    params.remotes.emplace_back();
+    auto& remoteCursor = params.remotes.back();
+    remoteCursor.setShardId(shardId.toString());
+    remoteCursor.setHostAndPort(server);
+    remoteCursor.setCursorResponse(CursorResponse(incomingCursorResponse.getValue().getNSS(),
+                                                  incomingCursorResponse.getValue().getCursorId(),
+                                                  {}));
+    params.originatingCommandObj = CurOp::get(opCtx)->opDescription().getOwned();
+    params.tailableMode = tailableMode;
+    params.lsid = opCtx->getLogicalSessionId();
+    params.txnNumber = opCtx->getTxnNumber();
+    params.originatingPrivileges = std::move(privileges);
 
-    auto ccc = stdx::make_unique<ClusterClientCursorImpl>(executor, std::move(params));
-    auto pinnedCursor =
-        cursorManager->registerCursor(std::move(ccc),
-                                      incomingCursorResponse.getValue().getNSS(),
-                                      ClusterCursorManager::CursorType::NamespaceNotSharded,
-                                      ClusterCursorManager::CursorLifetime::Mortal);
-    CursorId clusterCursorId = pinnedCursor.getCursorId();
-    pinnedCursor.returnCursor(ClusterCursorManager::CursorState::NotExhausted);
+    if (TransactionRouter::get(opCtx)) {
+        params.isAutoCommit = false;
+    }
 
-    CursorResponse outgoingCursorResponse(incomingCursorResponse.getValue().getNSS(),
-                                          clusterCursorId,
-                                          incomingCursorResponse.getValue().getBatch());
+    auto ccc = ClusterClientCursorImpl::make(opCtx, std::move(executor), std::move(params));
+    ccc->incNBatches();
+    // We don't expect to use this cursor until a subsequent getMore, so detach from the current
+    // OperationContext until then.
+    ccc->detachFromOperationContext();
+    auto authUsers = AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames();
+    auto clusterCursorId =
+        cursorManager->registerCursor(opCtx,
+                                      ccc.releaseCursor(),
+                                      requestedNss,
+                                      ClusterCursorManager::CursorType::SingleTarget,
+                                      ClusterCursorManager::CursorLifetime::Mortal,
+                                      authUsers);
+    if (!clusterCursorId.isOK()) {
+        return clusterCursorId.getStatus();
+    }
+
+    CurOp::get(opCtx)->debug().cursorid = clusterCursorId.getValue();
+
+    CursorResponse outgoingCursorResponse(requestedNss,
+                                          clusterCursorId.getValue(),
+                                          incomingCursorResponse.getValue().getBatch(),
+                                          incomingCursorResponse.getValue().getAtClusterTime());
     return outgoingCursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
 }
 

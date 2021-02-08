@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,9 +30,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/fts/unicode/codepoints.h"
 
 namespace mongo {
@@ -46,15 +49,6 @@ class String {
 public:
     String() = default;
 
-#if defined(_MSC_VER) && _MSC_VER < 1900
-    String(String&& other) : _data(std::move(other._data)) {}
-
-    String& operator=(String&& other) {
-        _data = std::move(other._data);
-        return *this;
-    }
-#endif
-
     /**
      * Construct a String with UTF-8 source data (supports standard C++ string literals, and
      * std::strings).
@@ -67,39 +61,19 @@ public:
     void resetData(const StringData utf8_src);
 
     /**
-     * Return a lowercased version of the String instance.
-     */
-    String toLower(CaseFoldMode mode = CaseFoldMode::kNormal) const;
-
-    /**
-     * Returns a version of the String instance with diacritics and combining marks removed.
-     */
-    String removeDiacritics() const;
-
-    /**
-     * Returns a substring of the String instance, using the same semantics as std::string::substr.
-     */
-    String substr(size_t begin, size_t end) const;
-
-    /**
-     * Copies the current String to another String.
-     */
-    void copyToBuf(String& buffer) const;
-
-    /**
      * Takes a substring of the current String and puts it in another String.
+     * Overwrites buffer's previous contents rather than appending.
      */
-    void substrToBuf(size_t pos, size_t len, String& buffer) const;
+    StringData substrToBuf(StackBufBuilder* buffer, size_t pos, size_t len) const;
 
     /**
-     * Lowercases the current String and stores the result in another String.
+     * Lowercases a substring of the current String and stores the UTF8 result in buffer.
+     * Overwrites buffer's previous contents rather than appending.
      */
-    void toLowerToBuf(CaseFoldMode mode, String& buffer) const;
-
-    /**
-     * Removes diacritics from the current String and stores the result in another String.
-     */
-    void removeDiacriticsToBuf(String& buffer) const;
+    StringData toLowerToBuf(StackBufBuilder* buffer,
+                            CaseFoldMode mode,
+                            size_t offset = 0,
+                            size_t len = std::string::npos) const;
 
     /**
      * Returns a UTF-8 encoded std::string version of the String instance. Uses the conversion
@@ -110,12 +84,16 @@ public:
     /**
      * Returns the number Unicode codepoints in the String.
      */
-    size_t size() const;
+    size_t size() const {
+        return _data.size();
+    }
 
     /**
      * Returns the Unicode codepoint at index i of the String.
      */
-    const char32_t& operator[](int i) const;
+    const char32_t& operator[](int i) const {
+        return _data[i];
+    }
 
     /**
      * Options for the substrMatch method.
@@ -143,22 +121,42 @@ public:
      * the search is case insensitive, non-Turkish case folding is used unless the
      * CaseFoldMode::Turkish is passed to mode.
      */
-    static bool substrMatch(const String& str,
-                            const String& find,
+    static bool substrMatch(const std::string& str,
+                            const std::string& find,
                             SubstrMatchOptions options,
                             CaseFoldMode mode = CaseFoldMode::kNormal);
 
-private:
     /**
-     * Private constructor used by substr, toLower, and removeDiacritics to build a String from
-     * UTF-32 data.
+     * Strips diacritics and case-folds the utf8 input string, as needed to support options.
+     *
+     * The options field specifies what operations to *skip*, so kCaseSensitive means to skip case
+     * folding and kDiacriticSensitive means to skip diacritic striping. If both flags are
+     * specified, the input utf8 StringData is returned directly without any processing or copying.
+     *
+     * If processing is performed, the returned StringData will be placed in buffer. buffer's
+     * contents (if any) will be replaced. Since we may return the input unmodified the returned
+     * StringData's lifetime is the shorter of the input utf8 and the next modification to buffer.
+     * The input utf8 must not point into buffer.
      */
-    String(std::u32string&& src);
+    static StringData caseFoldAndStripDiacritics(StackBufBuilder* buffer,
+                                                 StringData utf8,
+                                                 SubstrMatchOptions options,
+                                                 CaseFoldMode mode);
 
+private:
     /**
      * Helper method for converting a UTF-8 string to a UTF-32 string.
      */
     void setData(const StringData utf8_src);
+
+    /**
+     * Unified implementation of substrToBuf and toLowerToBuf.
+     */
+    template <typename Func>
+    StringData substrToBufWithTransform(StackBufBuilder* buffer,
+                                        size_t pos,
+                                        size_t len,
+                                        Func transform) const;
 
     /**
      * The underlying UTF-32 data.

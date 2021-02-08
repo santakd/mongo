@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +32,9 @@
 #include <algorithm>
 #include <tuple>
 #include <utility>
+
+#include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 
 namespace mongo {
 
@@ -100,8 +104,9 @@ bool IndexBounds::operator==(const IndexBounds& other) const {
     }
 
     if (this->isSimpleRange) {
-        return std::tie(this->startKey, this->endKey, this->endKeyInclusive) ==
-            std::tie(other.startKey, other.endKey, other.endKeyInclusive);
+        return SimpleBSONObjComparator::kInstance.evaluate(this->startKey == other.startKey) &&
+            SimpleBSONObjComparator::kInstance.evaluate(this->endKey == other.endKey) &&
+            (this->boundInclusion == other.boundInclusion);
     }
 
     if (this->fields.size() != other.fields.size()) {
@@ -122,7 +127,7 @@ bool IndexBounds::operator!=(const IndexBounds& other) const {
 }
 
 string OrderedIntervalList::toString() const {
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "['" << name << "']: ";
     for (size_t j = 0; j < intervals.size(); ++j) {
         ss << intervals[j].toString();
@@ -132,6 +137,49 @@ string OrderedIntervalList::toString() const {
     }
     return ss;
 }
+
+bool IndexBounds::isStartIncludedInBound(BoundInclusion boundInclusion) {
+    return boundInclusion == BoundInclusion::kIncludeBothStartAndEndKeys ||
+        boundInclusion == BoundInclusion::kIncludeStartKeyOnly;
+}
+
+bool IndexBounds::isEndIncludedInBound(BoundInclusion boundInclusion) {
+    return boundInclusion == BoundInclusion::kIncludeBothStartAndEndKeys ||
+        boundInclusion == BoundInclusion::kIncludeEndKeyOnly;
+}
+
+BoundInclusion IndexBounds::makeBoundInclusionFromBoundBools(bool startKeyInclusive,
+                                                             bool endKeyInclusive) {
+    if (startKeyInclusive) {
+        if (endKeyInclusive) {
+            return BoundInclusion::kIncludeBothStartAndEndKeys;
+        } else {
+            return BoundInclusion::kIncludeStartKeyOnly;
+        }
+    } else {
+        if (endKeyInclusive) {
+            return BoundInclusion::kIncludeEndKeyOnly;
+        } else {
+            return BoundInclusion::kExcludeBothStartAndEndKeys;
+        }
+    }
+}
+
+BoundInclusion IndexBounds::reverseBoundInclusion(BoundInclusion b) {
+    switch (b) {
+        case BoundInclusion::kIncludeStartKeyOnly:
+            return BoundInclusion::kIncludeEndKeyOnly;
+        case BoundInclusion::kIncludeEndKeyOnly:
+            return BoundInclusion::kIncludeStartKeyOnly;
+        case BoundInclusion::kIncludeBothStartAndEndKeys:
+        case BoundInclusion::kExcludeBothStartAndEndKeys:
+            // These are both symmetric.
+            return b;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
 
 bool OrderedIntervalList::operator==(const OrderedIntervalList& other) const {
     if (this->name != other.name) {
@@ -155,31 +203,78 @@ bool OrderedIntervalList::operator!=(const OrderedIntervalList& other) const {
     return !(*this == other);
 }
 
+void OrderedIntervalList::reverse() {
+    for (size_t i = 0; i < (intervals.size() + 1) / 2; i++) {
+        const size_t otherIdx = intervals.size() - i - 1;
+        intervals[i].reverse();
+        if (i != otherIdx) {
+            intervals[otherIdx].reverse();
+            std::swap(intervals[i], intervals[otherIdx]);
+        }
+    }
+}
+
+OrderedIntervalList OrderedIntervalList::reverseClone() const {
+    OrderedIntervalList clone(name);
+
+    for (auto it = intervals.rbegin(); it != intervals.rend(); ++it) {
+        clone.intervals.push_back(it->reverseClone());
+    }
+
+    return clone;
+}
+
+Interval::Direction OrderedIntervalList::computeDirection() const {
+    if (intervals.empty())
+        return Interval::Direction::kDirectionNone;
+
+    // Because the interval list is ordered, we only need to compare the two endpoints of the
+    // overall list. If the endpoints are ascending or descending, then each interval already
+    // respects that order. And if the endpoints are equal, then all the intervals must be squeezed
+    // into a single point.
+    bool compareFieldNames = false;
+    int res = intervals.front().start.woCompare(intervals.back().end, compareFieldNames);
+    if (res == 0)
+        return Interval::Direction::kDirectionNone;
+    return res < 0 ? Interval::Direction::kDirectionAscending
+                   : Interval::Direction::kDirectionDescending;
+}
+
+bool OrderedIntervalList::isMinToMax() const {
+    return intervals.size() == 1 && intervals[0].isMinToMax();
+}
+
 // static
 void OrderedIntervalList::complement() {
     BSONObjBuilder minBob;
     minBob.appendMinKey("");
     BSONObj minObj = minBob.obj();
 
-    // We complement by scanning the entire range of BSON values
-    // from MinKey to MaxKey. The value from which we must begin
-    // the next complemented interval is kept in 'curBoundary'.
+    // We complement by scanning the entire range of BSON values from MinKey to MaxKey. The value
+    // from which we must begin the next complemented interval is kept in 'curBoundary'.
     BSONElement curBoundary = minObj.firstElement();
 
-    // If 'curInclusive' is true, then 'curBoundary' is
-    // included in one of the original intervals, and hence
-    // should not be included in the complement (and vice-versa
-    // if 'curInclusive' is false).
+    // If 'curInclusive' is true, then 'curBoundary' is included in one of the original intervals,
+    // and hence should not be included in the complement (and vice-versa if 'curInclusive' is
+    // false).
     bool curInclusive = false;
 
-    // We will build up a list of intervals that represents
-    // the inversion of those in the OIL.
+    // We will build up a list of intervals that represents the inversion of those in the OIL.
     vector<Interval> newIntervals;
-    for (size_t j = 0; j < intervals.size(); ++j) {
-        Interval curInt = intervals[j];
-        if (0 != curInt.start.woCompare(curBoundary) || (!curInclusive && !curInt.startInclusive)) {
-            // Make a new interval from 'curBoundary' to
-            // the start of 'curInterval'.
+    for (const auto& curInt : intervals) {
+
+        // There is one special case worth optimizing for: we will generate two point queries for an
+        // equality-to-null predicate like {a: {$eq: null}}. The points are undefined and null, so
+        // when complementing (for {a: {$ne: null}} or similar), we know that there is nothing in
+        // between these two points, and can avoid adding that range.
+        const bool isProvablyEmptyRange =
+            (curBoundary.type() == BSONType::Undefined && curInclusive &&
+             curInt.start.type() == BSONType::jstNULL && curInt.startInclusive);
+
+        if ((0 != curInt.start.woCompare(curBoundary) ||
+             (!curInclusive && !curInt.startInclusive)) &&
+            !isProvablyEmptyRange) {
+            // Make a new interval from 'curBoundary' to the start of 'curInterval'.
             BSONObjBuilder intBob;
             intBob.append(curBoundary);
             intBob.append(curInt.start);
@@ -211,14 +306,19 @@ void OrderedIntervalList::complement() {
 }
 
 string IndexBounds::toString() const {
-    mongoutils::str::stream ss;
+    str::stream ss;
     if (isSimpleRange) {
-        ss << "[" << startKey.toString() << ", ";
+        if (IndexBounds::isStartIncludedInBound(boundInclusion)) {
+            ss << "[";
+        } else {
+            ss << "(";
+        }
+        ss << startKey.toString() << ", ";
         if (endKey.isEmpty()) {
             ss << "]";
         } else {
             ss << endKey.toString();
-            if (endKeyInclusive) {
+            if (IndexBounds::isEndIncludedInBound(boundInclusion)) {
                 ss << "]";
             } else {
                 ss << ")";
@@ -261,6 +361,56 @@ BSONObj IndexBounds::toBSON() const {
     }
 
     return bob.obj();
+}
+
+IndexBounds IndexBounds::forwardize() const {
+    IndexBounds newBounds;
+    newBounds.isSimpleRange = isSimpleRange;
+
+    if (isSimpleRange) {
+        const int cmpRes = startKey.woCompare(endKey);
+        if (cmpRes <= 0) {
+            newBounds.startKey = startKey;
+            newBounds.endKey = endKey;
+            newBounds.boundInclusion = boundInclusion;
+        } else {
+            // Swap start and end key.
+            newBounds.endKey = startKey;
+            newBounds.startKey = endKey;
+            newBounds.boundInclusion = IndexBounds::reverseBoundInclusion(boundInclusion);
+        }
+
+        return newBounds;
+    }
+
+    newBounds.fields.reserve(fields.size());
+    std::transform(fields.begin(),
+                   fields.end(),
+                   std::back_inserter(newBounds.fields),
+                   [](const OrderedIntervalList& oil) {
+                       if (oil.computeDirection() == Interval::Direction::kDirectionDescending) {
+                           return oil.reverseClone();
+                       }
+                       return oil;
+                   });
+
+    return newBounds;
+}
+
+IndexBounds IndexBounds::reverse() const {
+    IndexBounds reversed(*this);
+
+    if (reversed.isSimpleRange) {
+        std::swap(reversed.startKey, reversed.endKey);
+        // If only one bound is included, swap which one is included.
+        reversed.boundInclusion = reverseBoundInclusion(reversed.boundInclusion);
+    } else {
+        for (auto& orderedIntervalList : reversed.fields) {
+            orderedIntervalList.reverse();
+        }
+    }
+
+    return reversed;
 }
 
 //

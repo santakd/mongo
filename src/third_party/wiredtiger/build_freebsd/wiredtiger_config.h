@@ -119,7 +119,7 @@
 /* #undef HAVE_VERBOSE */
 
 /* Define to 1 if you have the <x86intrin.h> header file. */
-#define HAVE_X86INTRIN_H 1
+/* #undef HAVE_X86INTRIN_H */
 
 /* Spinlock type from mutex.h. */
 #define SPINLOCK_TYPE SPINLOCK_PTHREAD_MUTEX
@@ -141,6 +141,9 @@
 
 /* Default alignment of buffers used for I/O */
 #define WT_BUFFER_ALIGNMENT_DEFAULT 0
+
+/* Size of a transaction timestamp in bytes */
+#define WT_TIMESTAMP_SIZE 8
 
 /* Enable large inode numbers on Mac OS X 10.5.  */
 #ifndef _DARWIN_USE_64_BIT_INODE

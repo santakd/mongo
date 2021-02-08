@@ -1,30 +1,30 @@
-// status_with.h
-
-/*    Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -34,13 +34,34 @@
 #include <type_traits>
 #include <utility>
 
+#include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
+#include "mongo/platform/compiler.h"
 
 #define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
 #include "mongo/util/invariant.h"
 #undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
 
+
 namespace mongo {
+
+// Including builder.h here would cause a cycle.
+template <typename Allocator>
+class StringBuilderImpl;
+
+template <typename T>
+class StatusWith;
+
+template <typename T>
+inline constexpr bool isStatusWith = false;
+template <typename T>
+inline constexpr bool isStatusWith<StatusWith<T>> = true;
+
+template <typename T>
+inline constexpr bool isStatusOrStatusWith = std::is_same_v<T, Status> || isStatusWith<T>;
+
+template <typename T>
+using StatusOrStatusWith = std::conditional_t<std::is_void_v<T>, Status, StatusWith<T>>;
 
 /**
  * StatusWith is used to return an error or a value.
@@ -60,20 +81,42 @@ namespace mongo {
  * }
  */
 template <typename T>
-class StatusWith {
-    static_assert(!(std::is_same<T, mongo::Status>::value), "StatusWith<Status> is banned.");
+class MONGO_WARN_UNUSED_RESULT_CLASS StatusWith {
+private:
+    MONGO_STATIC_ASSERT_MSG(!isStatusOrStatusWith<T>,
+                            "StatusWith<Status> and StatusWith<StatusWith<T>> are banned.");
+    // `TagTypeBase` is used as a base for the `TagType` type, to prevent it from being an
+    // aggregate.
+    struct TagTypeBase {
+    protected:
+        TagTypeBase() = default;
+    };
+    // `TagType` is used as a placeholder type in parameter lists for `enable_if` clauses.  They
+    // have to be real parameters, not template parameters, due to MSVC limitations.
+    class TagType : TagTypeBase {
+        TagType() = default;
+        friend StatusWith;
+    };
 
 public:
-    /**
-     * for the error case
-     */
-    StatusWith(ErrorCodes::Error code, std::string reason, int location = 0)
-        : _status(code, std::move(reason), location) {}
+    using value_type = T;
 
     /**
      * for the error case
      */
-    StatusWith(Status status) : _status(std::move(status)) {
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, StringData reason)
+        : _status(code, reason) {}
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, std::string reason)
+        : _status(code, std::move(reason)) {}
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, const char* reason)
+        : _status(code, reason) {}
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(ErrorCodes::Error code, const str::stream& reason)
+        : _status(code, reason) {}
+
+    /**
+     * for the error case
+     */
+    MONGO_COMPILER_COLD_FUNCTION StatusWith(Status status) : _status(std::move(status)) {
         dassert(!isOK());
     }
 
@@ -82,23 +125,20 @@ public:
      */
     StatusWith(T t) : _status(Status::OK()), _t(std::move(t)) {}
 
-#if defined(_MSC_VER) && _MSC_VER < 1900
-    StatusWith(const StatusWith& s) : _status(s._status), _t(s._t) {}
+    template <typename Alien>
+    StatusWith(Alien&& alien,
+               typename std::enable_if_t<std::is_convertible<Alien, T>::value, TagType> = makeTag(),
+               typename std::enable_if_t<!std::is_same<Alien, T>::value, TagType> = makeTag())
+        : StatusWith(static_cast<T>(std::forward<Alien>(alien))) {}
 
-    StatusWith(StatusWith&& s) : _status(std::move(s._status)), _t(std::move(s._t)) {}
-
-    StatusWith& operator=(const StatusWith& other) {
-        _status = other._status;
-        _t = other._t;
-        return *this;
+    template <typename Alien>
+    StatusWith(StatusWith<Alien> alien,
+               typename std::enable_if_t<std::is_convertible<Alien, T>::value, TagType> = makeTag(),
+               typename std::enable_if_t<!std::is_same<Alien, T>::value, TagType> = makeTag())
+        : _status(std::move(alien.getStatus())) {
+        if (alien.isOK())
+            this->_t = std::move(alien.getValue());
     }
-
-    StatusWith& operator=(StatusWith&& other) {
-        _status = std::move(other._status);
-        _t = std::move(other._t);
-        return *this;
-    }
-#endif
 
     const T& getValue() const {
         dassert(isOK());
@@ -118,18 +158,149 @@ public:
         return _status.isOK();
     }
 
+    /**
+     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
+     * the function to the _t member or forwarding the _status. This is the lvalue overload.
+     */
+    template <typename F>
+    StatusWith<std::invoke_result_t<F&&, T&>> transform(F&& f) & {
+        if (_t)
+            return {std::forward<F>(f)(*_t)};
+        else
+            return {_status};
+    }
+
+    /**
+     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
+     * the function to the _t member or forwarding the _status. This is the const overload.
+     */
+    template <typename F>
+    StatusWith<std::invoke_result_t<F&&, const T&>> transform(F&& f) const& {
+        if (_t)
+            return {std::forward<F>(f)(*_t)};
+        else
+            return {_status};
+    }
+
+    /**
+     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
+     * the function to the _t member or forwarding the _status. This is the rvalue overload.
+     */
+    template <typename F>
+    StatusWith<std::invoke_result_t<F&&, T&&>> transform(F&& f) && {
+        if (_t)
+            return {std::forward<F>(f)(*std::move(_t))};
+        else
+            return {std::move(_status)};
+    }
+
+    /**
+     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
+     * the function to the _t member or forwarding the _status. This is the const rvalue overload.
+     */
+    template <typename F>
+    StatusWith<std::invoke_result_t<F&&, const T&&>> transform(F&& f) const&& {
+        if (_t)
+            return {std::forward<F>(f)(*std::move(_t))};
+        else
+            return {std::move(_status)};
+    }
+
+    /**
+     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
+     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
+     * _status. andThen performs the same function as transform but for a function f with a return
+     * type of StatusWith. This is the lvalue overload.
+     */
+    template <typename F>
+    StatusWith<typename std::invoke_result_t<F&&, T&>::value_type> andThen(F&& f) & {
+        if (_t)
+            return {std::forward<F>(f)(*_t)};
+        else
+            return {_status};
+    }
+
+    /**
+     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
+     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
+     * _status. andThen performs the same function as transform but for a function f with a return
+     * type of StatusWith. This is the const overload.
+     */
+    template <typename F>
+    StatusWith<typename std::invoke_result_t<F&&, const T&>::value_type> andThen(F&& f) const& {
+        if (_t)
+            return {std::forward<F>(f)(*_t)};
+        else
+            return {_status};
+    }
+
+    /**
+     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
+     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
+     * _status. andThen performs the same function as transform but for a function f with a return
+     * type of StatusWith. This is the rvalue overload.
+     */
+    template <typename F>
+    StatusWith<typename std::invoke_result_t<F&&, T&&>::value_type> andThen(F&& f) && {
+        if (_t)
+            return {std::forward<F>(f)(*std::move(_t))};
+        else
+            return {std::move(_status)};
+    }
+
+    /**
+     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
+     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
+     * _status. andThen performs the same function as transform but for a function f with a return
+     * type of StatusWith. This is the const rvalue overload.
+     */
+    template <typename F>
+    StatusWith<typename std::invoke_result_t<F&&, const T&&>::value_type> andThen(F&& f) const&& {
+        if (_t)
+            return {std::forward<F>(f)(*std::move(_t))};
+        else
+            return {std::move(_status)};
+    }
+
+    /**
+     * This method is a transitional tool, to facilitate transition to compile-time enforced status
+     * checking.
+     *
+     * NOTE: DO NOT ADD NEW CALLS TO THIS METHOD. This method serves the same purpose as
+     * `.getStatus().ignore()`; however, it indicates a situation where the code that presently
+     * ignores a status code has not been audited for correctness. This method will be removed at
+     * some point. If you encounter a compiler error from ignoring the result of a `StatusWith`
+     * returning function be sure to check the return value, or deliberately ignore the return
+     * value. The function is named to be auditable independently from unaudited `Status` ignore
+     * cases.
+     */
+    void status_with_transitional_ignore() && noexcept {};
+    void status_with_transitional_ignore() const& noexcept = delete;
+
 private:
+    // The `TagType` type cannot be constructed as a default function-parameter in Clang.  So we use
+    // a static member function that initializes that default parameter.
+    static TagType makeTag() {
+        return {};
+    }
+
     Status _status;
     boost::optional<T> _t;
 };
 
-template <typename T, typename... Args>
-StatusWith<T> makeStatusWith(Args&&... args) {
-    return StatusWith<T>{T(std::forward<Args>(args)...)};
+template <typename T>
+auto operator<<(std::ostream& stream, const StatusWith<T>& sw)
+    -> decltype(stream << sw.getValue())  // SFINAE on T streamability.
+{
+    if (sw.isOK())
+        return stream << sw.getValue();
+    return stream << sw.getStatus();
 }
 
-template <typename T>
-std::ostream& operator<<(std::ostream& stream, const StatusWith<T>& sw) {
+template <typename Allocator, typename T>
+auto operator<<(StringBuilderImpl<Allocator>& stream, const StatusWith<T>& sw)
+    -> decltype(stream << sw.getValue())  // SFINAE on T streamability.
+{
     if (sw.isOK())
         return stream << sw.getValue();
     return stream << sw.getStatus();

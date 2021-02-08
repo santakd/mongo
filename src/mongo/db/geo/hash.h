@@ -1,35 +1,37 @@
 /**
-*    Copyright (C) 2008-2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include "mongo/platform/basic.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/storage/key_string.h"
+#include "mongo/platform/basic.h"
 
 namespace mongo {
 
@@ -110,6 +112,9 @@ public:
 
     // Append the minimum range of the hash to the builder provided (inclusive)
     void appendHashMin(BSONObjBuilder* builder, const char* fieldName) const;
+    // Append the minimum range of the hash to the KeyString provided (inclusive)
+    void appendHashMin(KeyString::Builder* ks) const;
+    void appendHashMin(KeyString::PooledBuilder* ks) const;
     // Append the maximum range of the hash to the builder provided (inclusive)
     void appendHashMax(BSONObjBuilder* builder, const char* fieldName) const;
 
@@ -136,6 +141,10 @@ public:
     // closest (in particular, level == kMaxBits is not allowed).
     void appendVertexNeighbors(unsigned level, std::vector<GeoHash>* output) const;
 
+    // public but only for the purpose of testing
+    void unhash_fast(unsigned* x, unsigned* y) const;
+    void unhash_slow(unsigned* x, unsigned* y) const;
+
 private:
     // Create a hash from the provided string.  Used by the std::string and char* cons.
     void initFromString(const char* s);
@@ -145,9 +154,6 @@ private:
     void clearUnusedBits();
     // XXX: what does this do
     void _move(unsigned offset, int d);
-    // XXX: this is nasty and has no example
-    void unhash_fast(unsigned* x, unsigned* y) const;
-    void unhash_slow(unsigned* x, unsigned* y) const;
 
     long long _hash;
     // Bits per field.  Our hash is 64 bits, and we have an X and a Y field,
@@ -174,14 +180,18 @@ public:
         double scaling;
     };
 
-    GeoHashConverter(const Parameters& params);
+    /**
+     * Factory method to return a new instance with status. Uses hashing parameters parsed from a
+     * BSONObj.
+     */
+    static StatusWith<std::unique_ptr<GeoHashConverter>> createFromDoc(const BSONObj& paramDoc);
 
     /**
-     * Returns hashing parameters parsed from a BSONObj
+     * Factory method to return a new instance with status.
      */
-    static Status parseParameters(const BSONObj& paramDoc, Parameters* params);
+    static StatusWith<std::unique_ptr<GeoHashConverter>> createFromParams(const Parameters& params);
 
-    static double calcUnhashToBoxError(const GeoHashConverter::Parameters& params);
+    static double calcUnhashToBoxError(const Parameters& params);
 
     /**
      * Return converter parameterss which can be used to
@@ -252,6 +262,8 @@ public:
     double convertToDoubleHashScale(double in) const;
 
 private:
+    GeoHashConverter(const Parameters& params);
+
     void init();
 
     // Convert from an unsigned in [0, (max-min)*scaling] to [min, max]

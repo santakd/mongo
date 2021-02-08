@@ -1,205 +1,166 @@
-// test_commands.cpp
-
 /**
-*    Copyright (C) 2013-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+#include <string>
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/commands/test_commands.h"
+
 #include "mongo/base/init.h"
-#include "mongo/base/initializer_context.h"
 #include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/index_builder.h"
+#include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/util/log.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
+namespace {
+const NamespaceString kDurableHistoryTestNss("mdb_testing.pinned_timestamp");
+const std::string kTestingDurableHistoryPinName = "_testing";
+}  // namespace
+
+using repl::UnreplicatedWritesBlock;
 using std::endl;
 using std::string;
 using std::stringstream;
 
 /* For testing only, not for general use. Enabled via command-line */
-class GodInsert : public Command {
+class GodInsert : public ErrmsgCommandDeprecated {
 public:
-    GodInsert() : Command("godinsert") {}
+    GodInsert() : ErrmsgCommandDeprecated("godinsert") {}
     virtual bool adminOnly() const {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
-    virtual void help(stringstream& help) const {
-        help << "internal. for testing only.";
+                                       std::vector<Privilege>* out) const {}
+    std::string help() const override {
+        return "internal. for testing only.";
     }
-    virtual bool run(OperationContext* txn,
-                     const string& dbname,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
-        string coll = cmdObj["godinsert"].valuestrsafe();
-        log() << "test only command godinsert invoked coll:" << coll << endl;
-        uassert(13049, "godinsert must specify a collection", !coll.empty());
-        string ns = dbname + "." + coll;
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        LOGV2(20505,
+              "Test-only command 'godinsert' invoked coll:{collection}",
+              "Test-only command 'godinsert' invoked",
+              "collection"_attr = nss.coll());
         BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
 
-        ScopedTransaction transaction(txn, MODE_IX);
-        Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, ns);
+        Lock::DBLock lk(opCtx, dbname, MODE_X);
+        OldClientContext ctx(opCtx, nss.ns());
         Database* db = ctx.db();
 
-        WriteUnitOfWork wunit(txn);
-        txn->setReplicatedWrites(false);
-        Collection* collection = db->getCollection(ns);
+        WriteUnitOfWork wunit(opCtx);
+        UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
-            collection = db->createCollection(txn, ns);
+            collection = db->createCollection(opCtx, nss);
             if (!collection) {
                 errmsg = "could not create collection";
                 return false;
             }
         }
-        Status status = collection->insertDocument(txn, obj, false);
+        OpDebug* const nullOpDebug = nullptr;
+        Status status = collection->insertDocument(opCtx, InsertStatement(obj), nullOpDebug, false);
         if (status.isOK()) {
             wunit.commit();
         }
-        return appendCommandStatus(result, status);
-    }
-};
-
-/* for diagnostic / testing purposes. Enabled via command line. */
-class CmdSleep : public Command {
-public:
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
-    virtual bool adminOnly() const {
-        return true;
-    }
-    virtual bool slaveOk() const {
-        return true;
-    }
-    virtual void help(stringstream& help) const {
-        help << "internal testing command.  Makes db block (in a read lock) for 100 seconds\n";
-        help << "w:true write lock. secs:<seconds>";
-    }
-    // No auth needed because it only works when enabled via command line.
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
-    CmdSleep() : Command("sleep") {}
-    bool run(OperationContext* txn,
-             const string& ns,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
-        log() << "test only command sleep invoked" << endl;
-        long long millis = 10 * 1000;
-
-        if (cmdObj["secs"].isNumber() && cmdObj["millis"].isNumber()) {
-            millis = cmdObj["secs"].numberLong() * 1000 + cmdObj["millis"].numberLong();
-        } else if (cmdObj["secs"].isNumber()) {
-            millis = cmdObj["secs"].numberLong() * 1000;
-        } else if (cmdObj["millis"].isNumber()) {
-            millis = cmdObj["millis"].numberLong();
-        }
-
-        if (cmdObj.getBoolField("w")) {
-            ScopedTransaction transaction(txn, MODE_X);
-            Lock::GlobalWrite lk(txn->lockState());
-            sleepmillis(millis);
-        } else {
-            ScopedTransaction transaction(txn, MODE_S);
-            Lock::GlobalRead lk(txn->lockState());
-            sleepmillis(millis);
-        }
-
-        // Interrupt point for testing (e.g. maxTimeMS).
-        txn->checkForInterrupt();
-
+        uassertStatusOK(status);
         return true;
     }
 };
+
+MONGO_REGISTER_TEST_COMMAND(GodInsert);
 
 // Testing only, enabled via command-line.
-class CapTrunc : public Command {
+class CapTrunc : public BasicCommand {
 public:
-    CapTrunc() : Command("captrunc") {}
-    virtual bool slaveOk() const {
-        return false;
+    CapTrunc() : BasicCommand("captrunc") {}
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
-    virtual bool run(OperationContext* txn,
+                                       std::vector<Privilege>* out) const {}
+    virtual bool run(OperationContext* opCtx,
                      const string& dbname,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        const std::string fullNs = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString fullNs = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
+        if (!fullNs.isValid()) {
+            uasserted(ErrorCodes::InvalidNamespace,
+                      str::stream() << "collection name " << fullNs.ns() << " is not valid");
+        }
+
         int n = cmdObj.getIntField("n");
         bool inc = cmdObj.getBoolField("inc");  // inclusive range?
 
-        OldClientWriteContext ctx(txn, fullNs);
-        Collection* collection = ctx.getCollection();
+        if (n <= 0) {
+            uasserted(ErrorCodes::BadValue, "n must be a positive integer");
+        }
 
+        // Lock the database in mode IX and lock the collection exclusively.
+        AutoGetCollection collection(opCtx, fullNs, MODE_X);
         if (!collection) {
-            return appendCommandStatus(
-                result,
-                {ErrorCodes::NamespaceNotFound,
-                 str::stream() << "collection " << fullNs << " does not exist"});
+            uasserted(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "collection " << fullNs.ns() << " does not exist");
         }
 
         if (!collection->isCapped()) {
-            return appendCommandStatus(result,
-                                       {ErrorCodes::IllegalOperation, "collection must be capped"});
+            uasserted(ErrorCodes::IllegalOperation, "collection must be capped");
         }
 
         RecordId end;
@@ -207,64 +168,159 @@ public:
             // Scan backwards through the collection to find the document to start truncating from.
             // We will remove 'n' documents, so start truncating from the (n + 1)th document to the
             // end.
-            std::unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-                txn, fullNs, collection, PlanExecutor::YIELD_MANUAL, InternalPlanner::BACKWARD));
+            auto exec = InternalPlanner::collectionScan(opCtx,
+                                                        fullNs.ns(),
+                                                        &collection.getCollection(),
+                                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                        InternalPlanner::BACKWARD);
 
             for (int i = 0; i < n + 1; ++i) {
-                PlanExecutor::ExecState state = exec->getNext(nullptr, &end);
+                PlanExecutor::ExecState state = exec->getNext(static_cast<BSONObj*>(nullptr), &end);
                 if (PlanExecutor::ADVANCED != state) {
-                    return appendCommandStatus(result,
-                                               {ErrorCodes::IllegalOperation,
-                                                str::stream()
-                                                    << "invalid n, collection contains fewer than "
-                                                    << n << " documents"});
+                    uasserted(ErrorCodes::IllegalOperation,
+                              str::stream() << "invalid n, collection contains fewer than " << n
+                                            << " documents");
                 }
             }
         }
 
-        collection->temp_cappedTruncateAfter(txn, end, inc);
+        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
+            collection->uuid());
+
+        collection->cappedTruncateAfter(opCtx, end, inc);
 
         return true;
     }
 };
 
+MONGO_REGISTER_TEST_COMMAND(CapTrunc);
+
 // Testing-only, enabled via command line.
-class EmptyCapped : public Command {
+class EmptyCapped : public BasicCommand {
 public:
-    EmptyCapped() : Command("emptycapped") {}
-    virtual bool slaveOk() const {
-        return false;
+    EmptyCapped() : BasicCommand("emptycapped") {}
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
+                                       std::vector<Privilege>* out) const {}
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const string& dbname,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString nss = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
 
-        return appendCommandStatus(result, emptyCapped(txn, NamespaceString(ns)));
+        uassertStatusOK(emptyCapped(opCtx, nss));
+        return true;
     }
 };
 
-// ----------------------------
+MONGO_REGISTER_TEST_COMMAND(EmptyCapped);
 
-MONGO_INITIALIZER(RegisterEmptyCappedCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new CapTrunc();
-        new CmdSleep();
-        new EmptyCapped();
-        new GodInsert();
+class DurableHistoryReplicatedTestCmd : public BasicCommand {
+public:
+    DurableHistoryReplicatedTestCmd() : BasicCommand("pinHistoryReplicated") {}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
-    return Status::OK();
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool requiresAuth() const override {
+        return false;
+    }
+
+    // No auth needed because it only works when enabled via command line.
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) const override {}
+
+    std::string help() const override {
+        return "pins the oldest timestamp";
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const Timestamp requestedPinTs = cmdObj.firstElement().timestamp();
+        const bool round = cmdObj["round"].booleanSafe();
+
+        AutoGetOrCreateDb db(opCtx, kDurableHistoryTestNss.db(), MODE_IX);
+        Lock::CollectionLock collLock(opCtx, kDurableHistoryTestNss, MODE_IX);
+        if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+                opCtx,
+                kDurableHistoryTestNss)) {  // someone else may have beat us to it.
+            uassertStatusOK(userAllowedCreateNS(kDurableHistoryTestNss));
+            WriteUnitOfWork wuow(opCtx);
+            CollectionOptions defaultCollectionOptions;
+            uassertStatusOK(
+                db.getDb()->userCreateNS(opCtx, kDurableHistoryTestNss, defaultCollectionOptions));
+            wuow.commit();
+        }
+
+        AutoGetCollection autoColl(opCtx, kDurableHistoryTestNss, MODE_IX);
+        WriteUnitOfWork wuow(opCtx);
+
+        // Note, this write will replicate to secondaries, but a secondary will not in-turn pin the
+        // oldest timestamp. The write otherwise must be timestamped in a storage engine table with
+        // logging disabled. This is to test that rolling back the written document also results in
+        // the pin being lifted.
+        Timestamp pinTs =
+            uassertStatusOK(opCtx->getServiceContext()->getStorageEngine()->pinOldestTimestamp(
+                opCtx, kTestingDurableHistoryPinName, requestedPinTs, round));
+
+        uassertStatusOK(autoColl->insertDocument(
+            opCtx,
+            InsertStatement(fixDocumentForInsert(opCtx, BSON("pinTs" << pinTs)).getValue()),
+            nullptr));
+        wuow.commit();
+
+        result.append("requestedPinTs", requestedPinTs);
+        result.append("pinTs", pinTs);
+        return true;
+    }
+};
+
+MONGO_REGISTER_TEST_COMMAND(DurableHistoryReplicatedTestCmd);
+
+std::string TestingDurableHistoryPin::getName() {
+    return kTestingDurableHistoryPinName;
 }
+
+boost::optional<Timestamp> TestingDurableHistoryPin::calculatePin(OperationContext* opCtx) {
+    AutoGetCollectionForRead autoColl(opCtx, kDurableHistoryTestNss);
+    if (!autoColl) {
+        return boost::none;
+    }
+
+    Timestamp ret = Timestamp::max();
+    auto cursor = autoColl->getCursor(opCtx);
+    for (auto doc = cursor->next(); doc; doc = cursor->next()) {
+        const BSONObj obj = doc.get().data.toBson();
+        const Timestamp ts = obj["pinTs"].timestamp();
+        ret = std::min(ret, ts);
+    }
+
+    if (ret == Timestamp::min()) {
+        return boost::none;
+    }
+
+    return ret;
 }
+
+
+}  // namespace mongo

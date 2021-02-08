@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,71 +29,180 @@
 
 #pragma once
 
+#include <iosfwd>
 #include <string>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/metadata.h"
-#include "mongo/rpc/request_interface.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/concepts.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace executor {
 
-/**
- * Type of object describing a command to execute against a remote MongoDB node.
- */
-struct RemoteCommandRequest {
+struct RemoteCommandRequestBase {
+    struct HedgeOptions {
+        size_t count = 0;
+        int maxTimeMSForHedgedReads = 0;
+    };
+
+    enum FireAndForgetMode { kOn, kOff };
+
     // Indicates that there is no timeout for the request to complete
-    static const Milliseconds kNoTimeout;
+    static constexpr Milliseconds kNoTimeout{-1};
 
-    // Indicates that there is no expiration time by when the request needs to complete
-    static const Date_t kNoExpirationDate;
+    // Type to represent the internal id of this request
+    typedef uint64_t RequestId;
 
-    RemoteCommandRequest() = default;
+    RemoteCommandRequestBase();
+    RemoteCommandRequestBase(RequestId requestId,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             Milliseconds timeoutMillis,
+                             boost::optional<HedgeOptions> hedgeOptions,
+                             FireAndForgetMode fireAndForgetMode);
 
-    RemoteCommandRequest(const HostAndPort& theTarget,
-                         const std::string& theDbName,
-                         const BSONObj& theCmdObj,
-                         const BSONObj& metadataObj,
-                         Milliseconds timeoutMillis = kNoTimeout)
-        : target(theTarget),
-          dbname(theDbName),
-          metadata(metadataObj),
-          cmdObj(theCmdObj),
-          timeout(timeoutMillis) {
-        if (timeoutMillis == kNoTimeout) {
-            expirationDate = kNoExpirationDate;
-        }
-    }
+    // Internal id of this request. Not interpreted and used for tracing purposes only.
+    RequestId id;
 
-    RemoteCommandRequest(const HostAndPort& theTarget,
-                         const std::string& theDbName,
-                         const BSONObj& theCmdObj,
-                         Milliseconds timeoutMillis = kNoTimeout)
-        : RemoteCommandRequest(
-              theTarget, theDbName, theCmdObj, rpc::makeEmptyMetadata(), timeoutMillis) {}
-
-    RemoteCommandRequest(const HostAndPort& theTarget,
-                         const rpc::RequestInterface& request,
-                         Milliseconds timeoutMillis = kNoTimeout)
-        : RemoteCommandRequest(theTarget,
-                               request.getDatabase().toString(),
-                               request.getCommandArgs(),
-                               request.getMetadata(),
-                               timeoutMillis) {}
-
-    std::string toString() const;
-
-    HostAndPort target;
     std::string dbname;
     BSONObj metadata{rpc::makeEmptyMetadata()};
     BSONObj cmdObj;
-    Milliseconds timeout = kNoTimeout;
 
-    // Deadline by when the request must be completed
-    Date_t expirationDate = kNoExpirationDate;
+    // OperationContext is added to each request to allow OP_Command metadata attachment access to
+    // the Client object. The OperationContext is only accessed on the thread that calls
+    // NetworkInterface::startCommand. It is not safe to access from a thread that does not own the
+    // OperationContext in the general case. OperationContext should be non-null on
+    // NetworkInterfaces that do user work (i.e. reads, and writes) so that audit and client
+    // metadata is propagated. It is allowed to be null if used on NetworkInterfaces without
+    // metadata attachment (i.e., replication).
+    OperationContext* opCtx{nullptr};
+
+    boost::optional<HedgeOptions> hedgeOptions;
+
+    boost::optional<UUID> operationKey;
+
+    FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff;
+
+    // When false, the network interface will refrain from enforcing the 'timeout' for this request,
+    // but will still pass the timeout on as maxTimeMSOpOnly.
+    bool enforceLocalTimeout = true;
+
+    Milliseconds timeout = kNoTimeout;
+    ErrorCodes::Error timeoutCode = ErrorCodes::NetworkInterfaceExceededTimeLimit;
+
+    // Time when the request was scheduled.
+    boost::optional<Date_t> dateScheduled;
+
+    transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
+
+protected:
+    ~RemoteCommandRequestBase() = default;
+
+private:
+    /**
+     * Sets 'timeout' to the min of the current 'timeout' value and the remaining time on the OpCtx.
+     * If the remaining time is less than the provided 'timeout', remembers the timeout error code
+     * from the opCtx to use later if the timeout is indeed triggered.  This is important so that
+     * timeouts that are a direct result of a user-provided maxTimeMS return MaxTimeMSExpired rather
+     * than NetworkInterfaceExceededTimeLimit.
+     */
+    void _updateTimeoutFromOpCtxDeadline(const OperationContext* opCtx);
 };
+
+/**
+ * Type of object describing a command to execute against a remote MongoDB node.
+ */
+template <typename Target>
+struct RemoteCommandRequestImpl : RemoteCommandRequestBase {
+    RemoteCommandRequestImpl();
+
+    // Allow implicit conversion from RemoteCommandRequest to RemoteCommandRequestOnAny
+    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<Target, std::vector<HostAndPort>>)
+    RemoteCommandRequestImpl(const RemoteCommandRequestImpl<HostAndPort>& other)
+        : RemoteCommandRequestBase(other), target({other.target}) {}
+
+    // Allow conversion from RemoteCommandRequestOnAny to RemoteCommandRequest with the index of a
+    // particular host
+    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<Target, HostAndPort>)
+    RemoteCommandRequestImpl(const RemoteCommandRequestImpl<std::vector<HostAndPort>>& other,
+                             size_t idx)
+        : RemoteCommandRequestBase(other), target(other.target[idx]) {}
+
+    RemoteCommandRequestImpl(RequestId requestId,
+                             const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff);
+
+    RemoteCommandRequestImpl(const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff);
+
+    RemoteCommandRequestImpl(const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             boost::optional<HedgeOptions> hedgeOptions,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff)
+        : RemoteCommandRequestImpl(theTarget,
+                                   theDbName,
+                                   theCmdObj,
+                                   metadataObj,
+                                   opCtx,
+                                   kNoTimeout,
+                                   hedgeOptions,
+                                   fireAndForgetMode) {}
+
+
+    RemoteCommandRequestImpl(const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             OperationContext* opCtx,
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff)
+        : RemoteCommandRequestImpl(theTarget,
+                                   theDbName,
+                                   theCmdObj,
+                                   rpc::makeEmptyMetadata(),
+                                   opCtx,
+                                   timeoutMillis,
+                                   hedgeOptions,
+                                   fireAndForgetMode) {}
+
+    std::string toString() const;
+
+    bool operator==(const RemoteCommandRequestImpl& rhs) const;
+    bool operator!=(const RemoteCommandRequestImpl& rhs) const;
+
+    friend std::ostream& operator<<(std::ostream& os, const RemoteCommandRequestImpl& response) {
+        return (os << response.toString());
+    }
+
+    Target target;
+};
+
+extern template struct RemoteCommandRequestImpl<HostAndPort>;
+extern template struct RemoteCommandRequestImpl<std::vector<HostAndPort>>;
+
+using RemoteCommandRequest = RemoteCommandRequestImpl<HostAndPort>;
+using RemoteCommandRequestOnAny = RemoteCommandRequestImpl<std::vector<HostAndPort>>;
 
 }  // namespace executor
 }  // namespace mongo

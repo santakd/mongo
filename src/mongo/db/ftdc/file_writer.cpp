@@ -1,32 +1,31 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
-
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -42,12 +41,11 @@
 #include "mongo/db/ftdc/util.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
 FTDCFileWriter::~FTDCFileWriter() {
-    close();
+    close().transitional_ignore();
 }
 
 Status FTDCFileWriter::open(const boost::filesystem::path& file) {
@@ -56,9 +54,6 @@ Status FTDCFileWriter::open(const boost::filesystem::path& file) {
     }
 
     _archiveFile = file;
-
-    // Disable file buffering
-    _archiveStream.rdbuf()->pubsetbuf(0, 0);
 
     // Ideally, we create a file from scratch via O_CREAT but there is not portable way via C++
     // iostreams to do this.
@@ -86,9 +81,6 @@ Status FTDCFileWriter::open(const boost::filesystem::path& file) {
 Status FTDCFileWriter::writeInterimFileBuffer(ConstDataRange buf) {
     // Fixed size interim stream
     std::ofstream interimStream;
-
-    // Disable file buffering
-    interimStream.rdbuf()->pubsetbuf(0, 0);
 
     // Open up a temporary interim file
     interimStream.open(_interimTempFile.c_str(),
@@ -131,6 +123,18 @@ Status FTDCFileWriter::writeArchiveFileBuffer(ConstDataRange buf) {
             ErrorCodes::FileStreamFailed,
             str::stream()
                 << "Failed to write to archive file buffer for full-time diagnostic data capture: "
+                << _archiveFile.generic_string()};
+    }
+
+    // Flush the stream explictly, this is preferred over "pubsetbuf(0,0)" which has implementation
+    // defined behavior of "before any I/O has occurred".
+    _archiveStream.flush();
+
+    if (_archiveStream.fail()) {
+        return {
+            ErrorCodes::FileStreamFailed,
+            str::stream()
+                << "Failed to flush to archive file buffer for full-time diagnostic data capture: "
                 << _archiveFile.generic_string()};
     }
 
@@ -198,14 +202,20 @@ Status FTDCFileWriter::flush(const boost::optional<ConstDataRange>& range, Date_
         }
     }
 
-    boost::filesystem::remove(_interimFile);
+    boost::system::error_code ec;
+    boost::filesystem::remove(_interimFile, ec);
+    if (ec) {
+        return {ErrorCodes::NonExistentPath,
+                str::stream() << "\"" << _interimFile.generic_string()
+                              << "\" could not be removed during flush: " << ec.message()};
+    }
 
     return Status::OK();
 }
 
 Status FTDCFileWriter::close() {
     if (_archiveStream.is_open()) {
-        Status s = flush(boost::none_t(), Date_t());
+        Status s = flush(boost::none, Date_t());
 
         _archiveStream.close();
 

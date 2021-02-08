@@ -1,25 +1,24 @@
-// bson_collection_catalog_entry.h
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,7 +32,8 @@
 #include <string>
 #include <vector>
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/index/multikey_paths.h"
 
 namespace mongo {
 
@@ -41,45 +41,47 @@ namespace mongo {
  * This is a helper class for any storage engine that wants to store catalog information
  * as BSON. It is totally optional to use this.
  */
-class BSONCollectionCatalogEntry : public CollectionCatalogEntry {
+class BSONCollectionCatalogEntry {
 public:
-    BSONCollectionCatalogEntry(StringData ns);
+    static const StringData kIndexBuildScanning;
+    static const StringData kIndexBuildDraining;
+
+    /**
+     * Incremented when breaking changes are made to the index build procedure so that other servers
+     * know whether or not to resume or discard unfinished index builds.
+     */
+    static constexpr int kIndexBuildVersion = 1;
+
+    BSONCollectionCatalogEntry() = default;
 
     virtual ~BSONCollectionCatalogEntry() {}
-
-    virtual CollectionOptions getCollectionOptions(OperationContext* txn) const;
-
-    virtual int getTotalIndexCount(OperationContext* txn) const;
-
-    virtual int getCompletedIndexCount(OperationContext* txn) const;
-
-    virtual BSONObj getIndexSpec(OperationContext* txn, StringData idxName) const;
-
-    virtual void getAllIndexes(OperationContext* txn, std::vector<std::string>* names) const;
-
-    virtual bool isIndexMultikey(OperationContext* txn, StringData indexName) const;
-
-    virtual RecordId getIndexHead(OperationContext* txn, StringData indexName) const;
-
-    virtual bool isIndexReady(OperationContext* txn, StringData indexName) const;
 
     // ------ for implementors
 
     struct IndexMetaData {
         IndexMetaData() {}
-        IndexMetaData(BSONObj s, bool r, RecordId h, bool m)
-            : spec(s), ready(r), head(h), multikey(m) {}
 
         void updateTTLSetting(long long newExpireSeconds);
+
+        void updateHiddenSetting(bool hidden);
 
         std::string name() const {
             return spec["name"].String();
         }
 
         BSONObj spec;
-        bool ready;
-        RecordId head;
-        bool multikey;
+        bool ready = false;
+        bool multikey = false;
+        bool isBackgroundSecondaryBuild = false;
+
+        // If initialized, a two-phase index build is in progress.
+        boost::optional<UUID> buildUUID;
+
+        // If non-empty, 'multikeyPaths' is a vector with size equal to the number of elements in
+        // the index key pattern. Each element in the vector is an ordered set of positions
+        // (starting at 0) into the corresponding indexed field that represent what prefixes of the
+        // indexed field cause the index to be multikey.
+        MultikeyPaths multikeyPaths;
     };
 
     struct MetaData {
@@ -94,14 +96,9 @@ public:
          */
         bool eraseIndex(StringData name);
 
-        void rename(StringData toNS);
-
         std::string ns;
         CollectionOptions options;
         std::vector<IndexMetaData> indexes;
     };
-
-protected:
-    virtual MetaData _getMetaData(OperationContext* txn) const = 0;
 };
-}
+}  // namespace mongo

@@ -1,71 +1,273 @@
-// mongo/shell/shell_utils.cpp
-/*
- *    Copyright 2010 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/shell/shell_utils.h"
 
+#include <algorithm>
+#include <boost/filesystem.hpp>
+#include <memory>
+#include <set>
+#include <stdlib.h>
+#include <string>
+#include <vector>
+
+#ifndef _WIN32
+#include <pwd.h>
+#include <sys/types.h>
+#endif
+
+#include "mongo/base/shim.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/index/external_key_generator.h"
-#include "mongo/shell/bench.h"
+#include "mongo/db/hasher.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/platform/random.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/shell/bench.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils_extended.h"
 #include "mongo/shell/shell_utils_launcher.h"
-#include "mongo/util/concurrency/threadlocal.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
+namespace mongo::shell_utils {
+namespace {
+boost::filesystem::path getUserDir() {
+#ifdef _WIN32
+    auto wenvp = _wgetenv(L"USERPROFILE");
+    if (wenvp)
+        return toUtf8String(wenvp);
+
+    return "./";
+#else
+    const auto homeDir = getenv("HOME");
+    if (homeDir)
+        return homeDir;
+
+    // The storage for these variables has to live until the value is captured into a std::string at
+    // the end of this function.  This is because getpwuid_r(3) doesn't use static storage, but
+    // storage provided by the caller.  As a fallback, reserve enough space to store 8 paths, on the
+    // theory that the pwent buffer probably needs about that many paths, to fully describe a user
+    // -- shell paths, home directory paths, etc.
+
+    const long pwentBufferSize = std::max<long>(sysconf(_SC_GETPW_R_SIZE_MAX), PATH_MAX * 8);
+
+    struct passwd pwent;
+    struct passwd* res;
+
+    std::vector<char> buffer(pwentBufferSize);
+
+    do {
+        if (!getpwuid_r(getuid(), &pwent, &buffer[0], buffer.size(), &res))
+            break;
+
+        if (errno != EINTR)
+            uasserted(mongo::ErrorCodes::InternalError,
+                      "Unable to get home directory for the current user.");
+    } while (errno == EINTR);
+
+    return pwent.pw_dir;
+#endif
+}
+
+}  // namespace
+}  // namespace mongo::shell_utils
+
+boost::filesystem::path mongo::shell_utils::getHistoryFilePath() {
+    static const auto& historyFile = *new boost::filesystem::path(getUserDir() / ".dbshell");
+
+    return historyFile;
+}
+
+
 namespace mongo {
-
-using std::set;
-using std::map;
-using std::string;
-
 namespace JSFiles {
 extern const JSFile servers;
 extern const JSFile shardingtest;
 extern const JSFile servers_misc;
 extern const JSFile replsettest;
-extern const JSFile replsetbridge;
+extern const JSFile data_consistency_checker;
+extern const JSFile bridge;
+extern const JSFile feature_compatibility_version;
+}  // namespace JSFiles
+
+namespace {
+
+std::unique_ptr<DBClientBase> benchRunConfigCreateConnectionImplProvider(
+    const BenchRunConfig& config) {
+    const ConnectionString connectionString = uassertStatusOK(ConnectionString::parse(config.host));
+    auto swConn{connectionString.connect("BenchRun")};
+    uassert(16158, swConn.getStatus().reason(), swConn.isOK());
+    return std::move(swConn.getValue());
 }
+
+auto benchRunConfigCreateConnectionImplRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
+    BenchRunConfig::createConnectionImpl, benchRunConfigCreateConnectionImplProvider);
+
+// helper functions for isBalanced
+bool isUseCmd(std::string code) {
+    size_t first_space = code.find(" ");
+    if (first_space)
+        code = code.substr(0, first_space);
+    return code == "use";
+}
+
+/**
+ * Skip over a quoted string, including quotes escaped with backslash
+ *
+ * @param code      String
+ * @param start     Starting position within string, always > 0
+ * @param quote     Quote character (single or double quote)
+ * @return          Position of ending quote, or code.size() if no quote found
+ */
+size_t skipOverString(const std::string& code, size_t start, char quote) {
+    size_t pos = start;
+    while (pos < code.size()) {
+        pos = code.find(quote, pos);
+        if (pos == std::string::npos) {
+            return code.size();
+        }
+        // We want to break if the quote we found is not escaped, but we need to make sure
+        // that the escaping backslash is not itself escaped.  Comparisons of start and pos
+        // are to keep us from reading beyond the beginning of the quoted string.
+        //
+        if (start == pos || code[pos - 1] != '\\' ||   // previous char was backslash
+            start == pos - 1 || code[pos - 2] == '\\'  // char before backslash was not another
+        ) {
+            break;  // The quote we found was not preceded by an unescaped backslash; it is real
+        }
+        ++pos;  // The quote we found was escaped with backslash, so it doesn't count
+    }
+    return pos;
+}
+
+bool isOpSymbol(char c) {
+    static std::string OpSymbols = "~!%^&*-+=|:,<>/?.";
+
+    for (size_t i = 0; i < OpSymbols.size(); i++)
+        if (OpSymbols[i] == c)
+            return true;
+    return false;
+}
+
+}  // namespace
 
 namespace shell_utils {
 
-std::string _dbConnect;
-std::string _dbAuth;
 
-const char* argv0 = 0;
+bool isBalanced(const std::string& code) {
+    if (isUseCmd(code))
+        return true;  // don't balance "use <dbname>" in case dbname contains special chars
+    int curlyBrackets = 0;
+    int squareBrackets = 0;
+    int parens = 0;
+    bool danglingOp = false;
+
+    for (size_t i = 0; i < code.size(); i++) {
+        switch (code[i]) {
+            case '/':
+                if (i + 1 < code.size() && code[i + 1] == '/') {
+                    while (i < code.size() && code[i] != '\n')
+                        i++;
+                }
+                continue;
+            case '{':
+                curlyBrackets++;
+                break;
+            case '}':
+                if (curlyBrackets <= 0)
+                    return true;
+                curlyBrackets--;
+                break;
+            case '[':
+                squareBrackets++;
+                break;
+            case ']':
+                if (squareBrackets <= 0)
+                    return true;
+                squareBrackets--;
+                break;
+            case '(':
+                parens++;
+                break;
+            case ')':
+                if (parens <= 0)
+                    return true;
+                parens--;
+                break;
+            case '"':
+            case '\'':
+                i = skipOverString(code, i + 1, code[i]);
+                if (i >= code.size()) {
+                    return true;  // Do not let unterminated strings enter multi-line mode
+                }
+                break;
+            case '\\':
+                if (i + 1 < code.size() && code[i + 1] == '/')
+                    i++;
+                break;
+            case '+':
+            case '-':
+                if (i + 1 < code.size() && code[i + 1] == code[i]) {
+                    i++;
+                    continue;  // postfix op (++/--) can't be a dangling op
+                }
+                break;
+        }
+        if (i >= code.size()) {
+            danglingOp = false;
+            break;
+        }
+        if ("~!%^&*-+=|:,<>/?."_sd.find(code[i]) != std::string::npos)
+            danglingOp = true;
+        else if (!ctype::isSpace(code[i]))
+            danglingOp = false;
+    }
+
+    return curlyBrackets == 0 && squareBrackets == 0 && parens == 0 && !danglingOp;
+}
+
+
+std::string dbConnect;
+
+static const char* argv0 = nullptr;
+EnterpriseShellCallback* enterpriseCallback = nullptr;
+
 void RecordMyLocation(const char* _argv0) {
     argv0 = _argv0;
 }
@@ -84,14 +286,6 @@ BSONElement singleArg(const BSONObj& args) {
     return args.firstElement();
 }
 
-const char* getUserDir() {
-#ifdef _WIN32
-    return getenv("USERPROFILE");
-#else
-    return getenv("HOME");
-#endif
-}
-
 // real methods
 
 BSONObj JSGetMemInfo(const BSONObj& args, void* data) {
@@ -108,32 +302,24 @@ BSONObj JSGetMemInfo(const BSONObj& args, void* data) {
     return b.obj();
 }
 
-#if !defined(_WIN32)
-ThreadLocalValue<unsigned int> _randomSeed;
-#endif
+thread_local auto _prng = PseudoRandom(0);
 
 BSONObj JSSrand(const BSONObj& a, void* data) {
-    uassert(12518,
-            "srand requires a single numeric argument",
-            a.nFields() == 1 && a.firstElement().isNumber());
-#if !defined(_WIN32)
-    _randomSeed.set(
-        static_cast<unsigned int>(a.firstElement().numberLong()));  // grab least significant digits
-#else
-    srand(static_cast<unsigned int>(a.firstElement().numberLong()));
-#endif
-    return undefinedReturn;
+    int64_t seed;
+    // grab the least significant bits of either the supplied argument or
+    // a random number from SecureRandom.
+    if (a.nFields() == 1 && a.firstElement().isNumber()) {
+        seed = a.firstElement().safeNumberLong();
+    } else {
+        seed = SecureRandom().nextInt64();
+    }
+    _prng = PseudoRandom(seed);
+    return BSON("" << static_cast<double>(seed));
 }
 
 BSONObj JSRand(const BSONObj& a, void* data) {
     uassert(12519, "rand accepts no arguments", a.nFields() == 0);
-    unsigned r;
-#if !defined(_WIN32)
-    r = rand_r(&_randomSeed.getRef());
-#else
-    r = rand();
-#endif
-    return BSON("" << double(r) / (double(RAND_MAX) + 1));
+    return BSON("" << _prng.nextCanonicalDouble());
 }
 
 BSONObj isWindows(const BSONObj& a, void* data) {
@@ -145,47 +331,79 @@ BSONObj isWindows(const BSONObj& a, void* data) {
 #endif
 }
 
-BSONObj isAddressSanitizerActive(const BSONObj& a, void* data) {
-    bool isSanitized = false;
-// See the following for information on how we detect address sanitizer in clang and gcc.
-//
-// - http://clang.llvm.org/docs/AddressSanitizer.html#has-feature-address-sanitizer
-// - https://gcc.gnu.org/ml/gcc-patches/2012-11/msg01827.html
-//
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-    isSanitized = true;
-#endif
-#elif defined(__SANITIZE_ADDRESS__)
-    isSanitized = true;
-#endif
-    return BSON("" << isSanitized);
-}
-
 BSONObj getBuildInfo(const BSONObj& a, void* data) {
     uassert(16822, "getBuildInfo accepts no arguments", a.nFields() == 0);
     BSONObjBuilder b;
-    appendBuildInfo(b);
+    VersionInfoInterface::instance().appendBuildInfo(&b);
     return BSON("" << b.done());
 }
 
-BSONObj isKeyTooLarge(const BSONObj& a, void* data) {
-    uassert(17428, "keyTooLarge takes exactly 2 arguments", a.nFields() == 2);
-    BSONObjIterator i(a);
-    BSONObj index = i.next().Obj();
-    BSONObj doc = i.next().Obj();
+BSONObj _setShellFailPoint(const BSONObj& a, void* data) {
+    if (a.nFields() != 1) {
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "_setShellFailPoint takes exactly 1 argument, but was given "
+                                << a.nFields());
+    }
 
-    return BSON("" << isAnyIndexKeyTooLarge(index, doc));
+    if (!a.firstElement().isABSONObj()) {
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "_setShellFailPoint given a non-object as an argument.");
+    }
+
+    auto cmdObj = a.firstElement().Obj();
+    setGlobalFailPoint(cmdObj.firstElement().str(), cmdObj);
+
+    return BSON("" << true);
 }
 
-BSONObj validateIndexKey(const BSONObj& a, void* data) {
-    BSONObj key = a[0].Obj();
-    Status indexValid = validateKeyPattern(key);
-    if (!indexValid.isOK()) {
-        return BSON("" << BSON("ok" << false << "type" << indexValid.codeString() << "errmsg"
-                                    << indexValid.reason()));
+BSONObj computeSHA256Block(const BSONObj& a, void* data) {
+    std::vector<ConstDataRange> blocks;
+
+    auto ele = a[0];
+
+    BSONObjBuilder bob;
+    switch (ele.type()) {
+        case BinData: {
+            int len;
+            const char* ptr = ele.binData(len);
+            SHA256Block::computeHash({ConstDataRange(ptr, len)}).appendAsBinData(bob, ""_sd);
+
+            break;
+        }
+        case String: {
+            auto str = ele.valueStringData();
+            SHA256Block::computeHash({ConstDataRange(str.rawData(), str.size())})
+                .appendAsBinData(bob, ""_sd);
+            break;
+        }
+        default:
+            uasserted(ErrorCodes::BadValue, "Can only computeSHA256Block of strings and bindata");
     }
-    return BSON("" << BSON("ok" << true));
+
+    return bob.obj();
+}
+
+/**
+ * This function computes a hash value for a document.
+ * Specifically, this is the same hash function that is used to form a hashed index,
+ * and thus used to generate shard keys for a collection.
+ *
+ * e.g.
+ * > // For a given collection prepared like so:
+ * > use mydb
+ * > db.mycollection.createIndex({ x: "hashed" })
+ * > sh.shardCollection("mydb.mycollection", { x: "hashed" })
+ * > // And a sample object like so:
+ * > var obj = { x: "Whatever key", y: 2, z: 10.0 }
+ * > // The hashed value of the shard key can be acquired by passing in the shard key value:
+ * > convertShardKeyToHashed("Whatever key")
+ */
+BSONObj convertShardKeyToHashed(const BSONObj& a, void* data) {
+    uassert(10151, "convertShardKeyToHashed accepts 1 argument", a.nFields() == 1);
+    const auto& objEl = a.firstElement();
+
+    auto key = BSONElementHasher::hash64(objEl, BSONElementHasher::DEFAULT_HASH_SEED);
+    return BSON("" << key);
 }
 
 BSONObj replMonitorStats(const BSONObj& a, void* data) {
@@ -193,7 +411,8 @@ BSONObj replMonitorStats(const BSONObj& a, void* data) {
             "replMonitorStats requires a single string argument (the ReplSet name)",
             a.nFields() == 1 && a.firstElement().type() == String);
 
-    ReplicaSetMonitorPtr rsm = ReplicaSetMonitor::get(a.firstElement().valuestrsafe());
+    auto name = a.firstElement().valuestrsafe();
+    auto rsm = ReplicaSetMonitor::get(name);
     if (!rsm) {
         return BSON(""
                     << "no ReplSetMonitor exists by that name");
@@ -201,7 +420,8 @@ BSONObj replMonitorStats(const BSONObj& a, void* data) {
 
     BSONObjBuilder result;
     rsm->appendInfo(result);
-    return result.obj();
+    // Stats are like {replSetName: {hosts: [{ ... }, { ... }]}}.
+    return result.obj()[name].Obj().getOwned();
 }
 
 BSONObj useWriteCommandsDefault(const BSONObj& a, void* data) {
@@ -216,9 +436,34 @@ BSONObj readMode(const BSONObj&, void*) {
     return BSON("" << shellGlobalParams.readMode);
 }
 
+BSONObj shouldRetryWrites(const BSONObj&, void* data) {
+    return BSON("" << shellGlobalParams.shouldRetryWrites);
+}
+
+BSONObj shouldUseImplicitSessions(const BSONObj&, void* data) {
+    return BSON("" << shellGlobalParams.shouldUseImplicitSessions);
+}
+
+BSONObj apiParameters(const BSONObj&, void* data) {
+    return BSON("" << BSON("apiVersion" << shellGlobalParams.apiVersion << "apiStrict"
+                                        << shellGlobalParams.apiStrict << "apiDeprecationErrors"
+                                        << shellGlobalParams.apiDeprecationErrors));
+}
+
 BSONObj interpreterVersion(const BSONObj& a, void* data) {
     uassert(16453, "interpreterVersion accepts no arguments", a.nFields() == 0);
-    return BSON("" << globalScriptEngine->getInterpreterVersionString());
+    return BSON("" << getGlobalScriptEngine()->getInterpreterVersionString());
+}
+
+BSONObj fileExistsJS(const BSONObj& a, void*) {
+    uassert(40678,
+            "fileExists expects one string argument",
+            a.nFields() == 1 && a.firstElement().type() == String);
+    return BSON("" << fileExists(a.firstElement().valuestrsafe()));
+}
+
+BSONObj isInteractive(const BSONObj& a, void*) {
+    return BSON("" << shellGlobalParams.runShell);
 }
 
 void installShellUtils(Scope& scope) {
@@ -227,17 +472,26 @@ void installShellUtils(Scope& scope) {
     scope.injectNative("_srand", JSSrand);
     scope.injectNative("_rand", JSRand);
     scope.injectNative("_isWindows", isWindows);
-    scope.injectNative("_isAddressSanitizerActive", isAddressSanitizerActive);
+    scope.injectNative("_setShellFailPoint", _setShellFailPoint);
     scope.injectNative("interpreterVersion", interpreterVersion);
     scope.injectNative("getBuildInfo", getBuildInfo);
-    scope.injectNative("isKeyTooLarge", isKeyTooLarge);
-    scope.injectNative("validateIndexKey", validateIndexKey);
+    scope.injectNative("computeSHA256Block", computeSHA256Block);
+    scope.injectNative("convertShardKeyToHashed", convertShardKeyToHashed);
+    scope.injectNative("fileExists", fileExistsJS);
+    scope.injectNative("isInteractive", isInteractive);
 
-#ifndef MONGO_SAFE_SHELL
-    // can't launch programs
     installShellUtilsLauncher(scope);
     installShellUtilsExtended(scope);
-#endif
+}
+
+void setEnterpriseShellCallback(EnterpriseShellCallback* callback) {
+    enterpriseCallback = callback;
+}
+
+void initializeEnterpriseScope(Scope& scope) {
+    if (enterpriseCallback != nullptr) {
+        enterpriseCallback(scope);
+    }
 }
 
 void initScope(Scope& scope) {
@@ -245,28 +499,32 @@ void initScope(Scope& scope) {
     scope.injectNative("_useWriteCommandsDefault", useWriteCommandsDefault);
     scope.injectNative("_writeMode", writeMode);
     scope.injectNative("_readMode", readMode);
+    scope.injectNative("_shouldRetryWrites", shouldRetryWrites);
+    scope.injectNative("_shouldUseImplicitSessions", shouldUseImplicitSessions);
+    scope.injectNative("_apiParameters", apiParameters);
     scope.externalSetup();
     mongo::shell_utils::installShellUtils(scope);
     scope.execSetup(JSFiles::servers);
     scope.execSetup(JSFiles::shardingtest);
     scope.execSetup(JSFiles::servers_misc);
     scope.execSetup(JSFiles::replsettest);
-    scope.execSetup(JSFiles::replsetbridge);
+    scope.execSetup(JSFiles::data_consistency_checker);
+    scope.execSetup(JSFiles::bridge);
+    scope.execSetup(JSFiles::feature_compatibility_version);
+
+    initializeEnterpriseScope(scope);
 
     scope.injectNative("benchRun", BenchRunner::benchRunSync);
     scope.injectNative("benchRunSync", BenchRunner::benchRunSync);
     scope.injectNative("benchStart", BenchRunner::benchStart);
     scope.injectNative("benchFinish", BenchRunner::benchFinish);
 
-    if (!_dbConnect.empty()) {
-        uassert(12513, "connect failed", scope.exec(_dbConnect, "(connect)", false, true, false));
-    }
-    if (!_dbAuth.empty()) {
-        uassert(12514, "login failed", scope.exec(_dbAuth, "(auth)", true, true, false));
+    if (!dbConnect.empty()) {
+        uassert(12513, "connect failed", scope.exec(dbConnect, "(connect)", false, true, false));
     }
 }
 
-Prompter::Prompter(const string& prompt) : _prompt(prompt), _confirmed() {}
+Prompter::Prompter(const std::string& prompt) : _prompt(prompt), _confirmed() {}
 
 bool Prompter::confirm() {
     if (_confirmed) {
@@ -286,45 +544,75 @@ bool Prompter::confirm() {
 
 ConnectionRegistry::ConnectionRegistry() = default;
 
-void ConnectionRegistry::registerConnection(DBClientWithCommands& client) {
+void ConnectionRegistry::registerConnection(DBClientBase& client, StringData uri) {
     BSONObj info;
-    if (client.runCommand("admin", BSON("whatsmyuri" << 1), info)) {
-        string connstr = dynamic_cast<DBClientBase&>(client).getServerAddress();
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        _connectionUris[connstr].insert(info["you"].str());
+    BSONObj command;
+    // If apiStrict is set override it, whatsmyuri is not in the Versioned API.
+    if (client.getApiParameters().getStrict()) {
+        command = BSON("whatsmyuri" << 1 << "apiStrict" << false);
+    } else {
+        command = BSON("whatsmyuri" << 1);
+    }
+
+    if (client.runCommand("admin", command, info)) {
+        stdx::lock_guard<Latch> lk(_mutex);
+        _connectionUris[uri.toString()].insert(info["you"].str());
     }
 }
 
 void ConnectionRegistry::killOperationsOnAllConnections(bool withPrompt) const {
     Prompter prompter("do you want to kill the current op(s) on the server?");
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    for (map<string, set<string>>::const_iterator i = _connectionUris.begin();
-         i != _connectionUris.end();
-         ++i) {
-        auto status = ConnectionString::parse(i->first);
-        if (!status.isOK()) {
-            continue;
-        }
+    stdx::lock_guard<Latch> lk(_mutex);
+    for (auto& connection : _connectionUris) {
+        std::string errmsg;
 
-        const ConnectionString cs(status.getValue());
-
-        string errmsg;
-        std::unique_ptr<DBClientWithCommands> conn(cs.connect(errmsg));
+        auto uri = uassertStatusOK(MongoURI::parse(connection.first));
+        std::unique_ptr<DBClientBase> conn(uri.connect("MongoDB Shell", errmsg));
         if (!conn) {
             continue;
         }
 
-        const set<string>& uris = i->second;
+        const std::set<std::string>& uris = connection.second;
 
         BSONObj currentOpRes;
         conn->runPseudoCommand("admin", "currentOp", "$cmd.sys.inprog", {}, currentOpRes);
+        if (!currentOpRes["inprog"].isABSONObj()) {
+            // We don't have permissions (or the call didn't succeed) - go to the next connection.
+            continue;
+        }
         auto inprog = currentOpRes["inprog"].embeddedObject();
-        BSONForEach(op, inprog) {
-            if (uris.count(op["client"].String())) {
+        for (const auto& op : inprog) {
+            // For sharded clusters, `client_s` is used instead and `client` is not present.
+            std::string client;
+            if (auto elem = op["client"]) {
+                // mongod currentOp client
+                if (elem.type() != String) {
+                    std::cout << "Ignoring operation " << op["opid"].toString(false)
+                              << "; expected 'client' field in currentOp response to have type "
+                                 "string, but found "
+                              << typeName(elem.type()) << std::endl;
+                    continue;
+                }
+                client = elem.str();
+            } else if (auto elem = op["client_s"]) {
+                // mongos currentOp client
+                if (elem.type() != String) {
+                    std::cout << "Ignoring operation " << op["opid"].toString(false)
+                              << "; expected 'client_s' field in currentOp response to have type "
+                                 "string, but found "
+                              << typeName(elem.type()) << std::endl;
+                    continue;
+                }
+                client = elem.str();
+            } else {
+                // Internal operation, like TTL index.
+                continue;
+            }
+            if (uris.count(client)) {
                 if (!withPrompt || prompter.confirm()) {
                     BSONObjBuilder cmdBob;
                     BSONObj info;
-                    cmdBob.append("op", op["opid"]);
+                    cmdBob.appendAs(op["opid"], "op");
                     auto cmdArgs = cmdBob.done();
                     conn->runPseudoCommand("admin", "killOp", "$cmd.sys.killop", cmdArgs, info);
                 } else {
@@ -337,9 +625,8 @@ void ConnectionRegistry::killOperationsOnAllConnections(bool withPrompt) const {
 
 ConnectionRegistry connectionRegistry;
 
-bool _nokillop = false;
-void onConnect(DBClientWithCommands& c) {
-    if (_nokillop) {
+void onConnect(DBClientBase& c, StringData uri) {
+    if (shellGlobalParams.nokillop) {
         return;
     }
 
@@ -348,7 +635,7 @@ void onConnect(DBClientWithCommands& c) {
         c.setClientRPCProtocols(*shellGlobalParams.rpcProtocols);
     }
 
-    connectionRegistry.registerConnection(c);
+    connectionRegistry.registerConnection(c, uri);
 }
 
 bool fileExists(const std::string& file) {
@@ -365,6 +652,6 @@ bool fileExists(const std::string& file) {
 }
 
 
-stdx::mutex& mongoProgramOutputMutex(*(new stdx::mutex()));
-}
-}
+Mutex& mongoProgramOutputMutex(*(new Mutex()));
+}  // namespace shell_utils
+}  // namespace mongo

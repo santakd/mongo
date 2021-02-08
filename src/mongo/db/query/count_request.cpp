@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,95 +31,38 @@
 
 #include "mongo/db/query/count_request.h"
 
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/query/query_request.h"
 
 namespace mongo {
-namespace {
+namespace count_request {
 
-const char kCmdName[] = "count";
-const char kQueryField[] = "query";
-const char kLimitField[] = "limit";
-const char kSkipField[] = "skip";
-const char kHintField[] = "hint";
+long long countParseLimit(const BSONElement& element) {
+    uassert(ErrorCodes::BadValue, "limit value is not a valid number", element.isNumber());
+    auto limit = uassertStatusOK(element.parseIntegerElementToLong());
+    // The absolute value of the smallest long long is too large to be represented as a long
+    // long, so we fail to parse such count commands.
+    uassert(ErrorCodes::BadValue,
+            "limit value for count cannot be min long",
+            limit != std::numeric_limits<long long>::min());
 
-}  // namespace
-
-CountRequest::CountRequest(const std::string& fullNs, BSONObj query)
-    : _nss(fullNs), _query(query.getOwned()) {}
-
-void CountRequest::setHint(BSONObj hint) {
-    _hint = hint.getOwned();
+    // For counts, limit and -limit mean the same thing.
+    if (limit < 0) {
+        limit = -limit;
+    }
+    return limit;
 }
 
-BSONObj CountRequest::toBSON() const {
-    BSONObjBuilder builder;
-
-    builder.append(kCmdName, _nss.ns());
-    builder.append(kQueryField, _query);
-
-    if (_limit) {
-        builder.append(kLimitField, _limit.get());
-    }
-
-    if (_skip) {
-        builder.append(kSkipField, _skip.get());
-    }
-
-    if (_hint) {
-        builder.append(kHintField, _hint.get());
-    }
-
-    return builder.obj();
+long long countParseSkip(const BSONElement& element) {
+    uassert(ErrorCodes::BadValue, "skip value is not a valid number", element.isNumber());
+    auto skip = uassertStatusOK(element.parseIntegerElementToNonNegativeLong());
+    return skip;
 }
 
-StatusWith<CountRequest> CountRequest::parseFromBSON(const std::string& dbname,
-                                                     const BSONObj& cmdObj) {
-    BSONElement firstElt = cmdObj.firstElement();
-    const std::string coll = (firstElt.type() == BSONType::String) ? firstElt.str() : "";
-
-    const std::string ns = str::stream() << dbname << "." << coll;
-    if (!nsIsFull(ns)) {
-        return Status(ErrorCodes::BadValue, "invalid collection name");
-    }
-
-    // We don't validate that "query" is a nested object due to SERVER-15456.
-    CountRequest request(ns, cmdObj.getObjectField(kQueryField));
-
-    // Limit
-    if (cmdObj[kLimitField].isNumber()) {
-        long long limit = cmdObj[kLimitField].numberLong();
-
-        // For counts, limit and -limit mean the same thing.
-        if (limit < 0) {
-            limit = -limit;
-        }
-
-        request.setLimit(limit);
-    } else if (cmdObj[kLimitField].ok()) {
-        return Status(ErrorCodes::BadValue, "limit value is not a valid number");
-    }
-
-    // Skip
-    if (cmdObj[kSkipField].isNumber()) {
-        long long skip = cmdObj[kSkipField].numberLong();
-        if (skip < 0) {
-            return Status(ErrorCodes::BadValue, "skip value is negative in count query");
-        }
-
-        request.setSkip(skip);
-    } else if (cmdObj[kSkipField].ok()) {
-        return Status(ErrorCodes::BadValue, "skip value is not a valid number");
-    }
-
-    // Hint
-    if (Object == cmdObj[kHintField].type()) {
-        request.setHint(cmdObj[kHintField].Obj());
-    } else if (String == cmdObj[kHintField].type()) {
-        const std::string hint = cmdObj.getStringField(kHintField);
-        request.setHint(BSON("$hint" << hint));
-    }
-
-    return request;
+long long countParseMaxTime(const BSONElement& element) {
+    auto maxTimeVal = uassertStatusOK(parseMaxTimeMS(element));
+    return static_cast<long long>(maxTimeVal);
 }
-
+}  // namespace count_request
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,175 +29,88 @@
 
 #pragma once
 
-#include <list>
-#include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/status.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/client/fetcher.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/base_cloner.h"
-#include "mongo/db/repl/replication_executor.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/net/hostandport.h"
+#include "mongo/db/repl/collection_cloner.h"
+#include "mongo/db/repl/initial_sync_base_cloner.h"
+#include "mongo/db/repl/initial_sync_shared_data.h"
 
 namespace mongo {
 namespace repl {
 
-class DatabaseCloner : public BaseCloner {
-    MONGO_DISALLOW_COPYING(DatabaseCloner);
-
+class DatabaseCloner final : public InitialSyncBaseCloner {
 public:
-    /**
-     * Predicate used on the collection info objects returned by listCollections.
-     * Each collection info is represented by a document in the following format:
-     * {
-     *     name: <collection name>,
-     *     options: <collection options>
-     * }
-     *
-     * Returns true if the collection described by the info object should be cloned.
-     * Returns false if the collection should be ignored.
-     */
-    using ListCollectionsPredicateFn = stdx::function<bool(const BSONObj&)>;
+    struct Stats {
+        std::string dbname;
+        Date_t start;
+        Date_t end;
+        size_t collections{0};
+        size_t clonedCollections{0};
+        std::vector<CollectionCloner::Stats> collectionStats;
 
-    /**
-     * Callback function to report progress of collection cloning. Arguments are:
-     *     - status from the collection cloner's 'onCompletion' callback.
-     *     - source namespace of the collection cloner that completed (or failed).
-     *
-     * Called exactly once for every collection cloner started by the the database cloner.
-     */
-    using CollectionCallbackFn = stdx::function<void(const Status&, const NamespaceString&)>;
+        std::string toString() const;
+        BSONObj toBSON() const;
+        void append(BSONObjBuilder* builder) const;
+    };
 
-    /**
-     * Type of function to start a collection cloner.
-     */
-    using StartCollectionClonerFn = stdx::function<Status(CollectionCloner&)>;
-
-    /**
-     * Creates DatabaseCloner task in inactive state. Use start() to activate cloner.
-     *
-     * The cloner calls 'onCompletion' when the database cloning has completed or failed.
-     *
-     * 'onCompletion' will be called exactly once.
-     *
-     * Takes ownership of the passed StorageInterface object.
-     */
-    DatabaseCloner(ReplicationExecutor* executor,
+    DatabaseCloner(const std::string& dbName,
+                   InitialSyncSharedData* sharedData,
                    const HostAndPort& source,
-                   const std::string& dbname,
-                   const BSONObj& listCollectionsFilter,
-                   const ListCollectionsPredicateFn& listCollectionsPredicate,
-                   CollectionCloner::StorageInterface* storageInterface,
-                   const CollectionCallbackFn& collectionWork,
-                   const CallbackFn& onCompletion);
+                   DBClientConnection* client,
+                   StorageInterface* storageInterface,
+                   ThreadPool* dbPool);
 
-    virtual ~DatabaseCloner();
+    virtual ~DatabaseCloner() = default;
 
-    /**
-     * Returns collection info objects read from listCollections result.
-     * This will return an empty vector until we have processed the last
-     * batch of results from listCollections.
-     */
-    const std::vector<BSONObj>& getCollectionInfos() const;
+    Stats getStats() const;
 
-    std::string getDiagnosticString() const override;
+    std::string toString() const;
 
-    bool isActive() const override;
+    static CollectionOptions parseCollectionOptions(const BSONObj& element);
 
-    Status start() override;
+protected:
+    ClonerStages getStages() final;
 
-    void cancel() override;
-
-    void wait() override;
-
-    //
-    // Testing only functions below.
-    //
-
-    /**
-     * Overrides how executor schedules database work.
-     *
-     * For testing only.
-     */
-    void setScheduleDbWorkFn(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
-
-    /**
-     * Overrides how executor starts a collection cloner.
-     *
-     * For testing only
-     */
-    void setStartCollectionClonerFn(const StartCollectionClonerFn& startCollectionCloner);
+    bool isMyFailPoint(const BSONObj& data) const final;
 
 private:
-    /**
-     * Read collection names and options from listCollections result.
-     */
-    void _listCollectionsCallback(const StatusWith<Fetcher::QueryResponse>& fetchResult,
-                                  Fetcher::NextAction* nextAction,
-                                  BSONObjBuilder* getMoreBob);
+    friend class DatabaseClonerTest;
 
     /**
-     * Forwards collection cloner result to client.
-     * Starts a new cloner on a different collection.
+     * Stage function that retrieves collection information from the sync source.
      */
-    void _collectionClonerCallback(const Status& status, const NamespaceString& nss);
+    AfterStageBehavior listCollectionsStage();
 
     /**
-     * Reports completion status.
-     * Sets cloner to inactive.
+     * The preStage sets the start time in _stats.
      */
-    void _finishCallback(const Status& status);
+    void preStage() final;
 
-    // Not owned by us.
-    ReplicationExecutor* _executor;
+    /**
+     * The postStage creates and runs the individual CollectionCloners on each database found on
+     * the sync source, and sets the end time in _stats when done.
+     */
+    void postStage() final;
 
-    HostAndPort _source;
-    std::string _dbname;
-    BSONObj _listCollectionsFilter;
-    ListCollectionsPredicateFn _listCollectionsPredicate;
-    CollectionCloner::StorageInterface* _storageInterface;
+    std::string describeForFuzzer(BaseClonerStage* stage) const final {
+        return _dbName + " db: { " + stage->getName() + ": 1 } ";
+    }
 
-    // Invoked once for every successfully started collection cloner.
-    CollectionCallbackFn _collectionWork;
-
-    // Invoked once when cloning completes or fails.
-    CallbackFn _onCompletion;
-
-    // Protects member data of this database cloner.
-    mutable stdx::mutex _mutex;
-
-    mutable stdx::condition_variable _condition;
-
-    // _active is true when database cloner is started.
-    bool _active;
-
-    // Fetcher instance for running listCollections command.
-    Fetcher _listCollectionsFetcher;
-
-    // Collection info objects returned from listCollections.
-    // Format of each document:
-    // {
-    //     name: <collection name>,
-    //     options: <collection options>
-    // }
-    // Holds all collection infos from listCollections.
-    std::vector<BSONObj> _collectionInfos;
-
-    std::vector<NamespaceString> _collectionNamespaces;
-
-    std::list<CollectionCloner> _collectionCloners;
-    std::list<CollectionCloner>::iterator _currentCollectionClonerIter;
-
-    // Function for scheduling database work using the executor.
-    CollectionCloner::ScheduleDbWorkFn _scheduleDbWorkFn;
-
-    StartCollectionClonerFn _startCollectionCloner;
+    // All member variables are labeled with one of the following codes indicating the
+    // synchronization rules for accessing them.
+    //
+    // (R)  Read-only in concurrent operation; no synchronization required.
+    // (S)  Self-synchronizing; access according to class's own rules.
+    // (M)  Reads and writes guarded by _mutex (defined in base class).
+    // (X)  Access only allowed from the main flow of control called from run() or constructor.
+    // (MX) Write access with mutex from main flow of control, read access with mutex from other
+    //      threads, read access allowed from main flow without mutex.
+    const std::string _dbName;                                                // (R)
+    ClonerStage<DatabaseCloner> _listCollectionsStage;                        // (R)
+    std::vector<std::pair<NamespaceString, CollectionOptions>> _collections;  // (X)
+    std::unique_ptr<CollectionCloner> _currentCollectionCloner;               // (MX)
+    Stats _stats;                                                             // (MX)
 };
 
 }  // namespace repl

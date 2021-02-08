@@ -1,9 +1,13 @@
 # -*- mode: python -*-
 
+import sys
+
 Import("env")
 Import("has_option")
 Import("debugBuild")
+Import("get_option")
 
+env = env.Clone()
 
 files = [
     "LIBRARY/float128/dpml_exception.c",
@@ -269,12 +273,15 @@ def float53_object(target, source, extra_defines=None):
     obj_env = env.Clone()
     defines = (extra_defines or []) + ['T_FLOAT']
     obj_env.Append(CPPDEFINES=defines)
-    for to_remove in ['-Werror', '-Wall', '-W']:
-        removeIfPresent(obj_env['CCFLAGS'], to_remove)
-    return obj_env.Object(target, source)
+
+    if env.ToolchainIs('msvc'):
+        removeIfPresent(obj_env['CCFLAGS'], '/W3')
+    else:
+        obj_env.Append(CCFLAGS='-w')
+    return obj_env.LibraryObject(target, source)
 
 # Set OS Defines
-if env.TargetOSIs('osx'):
+if env.TargetOSIs('darwin'):
     cpp_defines['LINUX'] = '1'
     cpp_defines['mach'] = '1'
     extra_objects = [
@@ -291,18 +298,28 @@ if env.TargetOSIs('linux') or env.TargetOSIs('solaris'):
 if env.TargetOSIs('freebsd') or env.TargetOSIs('openbsd'):
     cpp_defines['LINUX'] = '1'
     cpp_defines['freebsd'] = '1'
+    libs.append('m')
 
 # Set Architecture Defines
 processor = env['TARGET_ARCH']
 # Using 32 bit
-if processor == 'i386':
+if processor == 'i386' or processor == 'emscripten':
     cpp_defines['IA32'] = '1'
     cpp_defines['ia32'] = '1'
-
-# Using 64 bit
-elif processor == 'x86_64':
+elif processor == 'arm':
+    cpp_defines['IA32'] = '1'
+    cpp_defines['ia32'] = '1'
+elif processor == "aarch64":
     cpp_defines['efi2'] = '1'
     cpp_defines['EFI2'] = '1'
+# Using 64 bit little endian
+elif processor == 'x86_64' or processor == 'ppc64le':
+    cpp_defines['efi2'] = '1'
+    cpp_defines['EFI2'] = '1'
+# Using 64 bit big endian
+elif processor == 's390x':
+    cpp_defines['s390x'] = '1'
+    cpp_defines['BID_BIG_ENDIAN'] = '1'
 else:
     assert False, "Unsupported architecture: " + processor
 
@@ -319,47 +336,157 @@ env.Append(CPPDEFINES=cpp_defines)
 if env.TargetOSIs('windows'):
     extra_defines = ['WINDOWS', 'WNT', 'winnt']
     env.Append(CPPDEFINES=extra_defines)
+    # C4273: '...': inconsistent dll linkage
+    env.Append(CCFLAGS=['/wd4273'])
+    # C4477: incorrect scanf format string
+    env.Append(CCFLAGS=['/wd4477'])
 
-    # Compile extra Float53 files
-    extra_objects = [
-        float53_object('dpml_asinh_t', 'dpml_asinh',
-                       [('ASINH', '1'),('BUILD_FILE_NAME', 'dpml_asinh_t.h')]),
-        float53_object('dpml_acosh_t', 'dpml_asinh', [('ACOSH', '1')]),
-        float53_object('dpml_cbrt_t', 'dpml_cbrt',
-                       [('CBRT', '1'),('BUILD_FILE_NAME', 'dpml_cbrt_t_table.c')]),
-        float53_object('dpml_erf_t', 'dpml_erf',
-                       [('ERF', '1'),('BUILD_FILE_NAME', 'dpml_erf_t.h')]),
-        float53_object('dpml_erfc_t', 'dpml_erf',
-                       [('ERFC', '1'),('BUILD_FILE_NAME', 'dpml_erf_t.h')]),
-        float53_object('dpml_expm1_t', 'dpml_expm1', [('EXPM1', '1'),('USE_CONTROL87', '1')]),
-        float53_object('dpml_exp10_t', 'dpml_exp', [('EXP10', '1'),('USE_CONTROL87', '1')]),
-        # float53_object('dpml_exp2_t', 'dpml_exp', [('EXP2', '1'),('USE_CONTROL87', '1')]),
-        float53_object('dpml_lgamma_t', 'dpml_lgamma',
-                       [('DBUILD_FILE_NAME', 'dpml_lgamma_t.h'), ('DO_LGAMMA', '1'),
-                        ('HACK_GAMMA_INLINE', '0')]),
-        float53_object('dpml_log1p_t', 'dpml_log', [('LOG1P', '1')]),
-        float53_object('dpml_tgamma_t', 'dpml_tgamma', [('TGAMMA', '1')]),
-        float53_object('dpml_rt_lgamma_t', 'dpml_lgamma',
-                       [('DBUILD_FILE_NAME', 'dpml_lgamma_t.h')]),
-        float53_object('dpml_pow_t_table', 'dpml_pow_t_table'),
-        float53_object('dpml_cbrt_t_table', 'dpml_cbrt_t_table'),
-        float53_object('dpml_special_exp_t', 'dpml_exp', [('SPECIAL_EXP', '1')]),
+
+if env.ToolchainIs('msvc'):
+    removeIfPresent(env['CCFLAGS'], '/W3')
+else:
+    env.Append(CCFLAGS='-w')
+
+
+libenv = env.Clone()
+
+# On windows and macos we don't have this problem, but on other
+# platforms we do, where the system ligbcc may duplicate symbols that
+# exist in the intel library. We use a version script to force our
+# verion of the symbols into a version namespace that we control,
+# avoiding the conflict. It also allows us to restrict the set of
+# visibile symbols in the library to just those used in
+# platform/decimal128.cpp. We still use an exported_symbol_list on
+# macOS too though, so that we can catch the case where we have a
+# symbolic dependency on a symbol that isn't exported. We will catch
+# that on macOS, whereas we might not on libgcc platforms where we
+# could end up binding to the shadow version.
+def export_file_generator(target, source, env, for_signature):
+    if env.TargetOSIs('darwin'):
+        script = env.File(env.subst("${TARGET.base}.exported_symbols_list", target=target))
+        ret_value = script.get_csig() if for_signature else "-Wl,-exported_symbols_list," + str(script)
+    elif env.TargetOSIs('posix'):
+        script = env.File(env.subst("${TARGET.base}.version_script", target=target))
+        ret_value = script.get_csig() if for_signature else "-Wl,--version-script," + str(script)
+    else:
+        script = None
+        ret_value = None
+
+
+    if script and not for_signature:
+        # ninja workaround:
+        #   This is redundant for scons because the content signiture of this generator
+        #   will cause the targets to be out of date. However ninja is not able to
+        #   content signature checks for expansions, so we setup the explicit depends
+        #   to create this dependency for ninja.
+        #
+        # TODO remove this after https://jira.mongodb.org/browse/SERVER-54253
+        env.Depends(target, script)
+
+    return ret_value
+
+libenv['EXPORT_FILE_SHLINKFLAGS'] = export_file_generator
+libenv.AppendUnique(
+    SHLINKFLAGS=[
+        '$EXPORT_FILE_SHLINKFLAGS'
+    ],
+)
+
+libenv.Library(
+    target='intel_decimal128',
+    source=source_files,
+    LIBS=libenv['LIBS'] + libs,
+    LIBDEPS_TAGS=[
+        'init-no-global-side-effects',
     ]
+)
 
-    if processor == 'i386':
-        extra_objects += [
-            float53_object('dpml_log2_t', 'dpml_log', ['LOG2'])
-        ]
+if env["BUILDERS"].get("Ninja", None) is not None:
+    Return()
 
-    files += extra_objects
+readtestEnv = env.Clone()
 
-for to_remove in ['-Werror', '-Wall', '-W']:
-    removeIfPresent(env['CCFLAGS'], to_remove)
+# Since the readtest program is fully C, smartlink was trying to link
+# it with the C compiler driver. That is fine for dynamic builds, but
+# in static builds falls afoul of
+# https://github.com/SCons/scons/issues/3673 if the allocator library
+# needs the C++ runtime.
+if env["LINK"] == "$SMARTLINK" and get_option("link-model") != "dynamic":
+    readtestEnv["LINK"] = "$CXX"
 
-if GetOption('experimental-decimal-support') == 'on':
-    env.Library(
-        target='intel_decimal128',
-        source=source_files,
-        LIBS=libs,
+readtest = readtestEnv.Program(
+    target='intel_decimal128_readtest',
+    source=[
+        'TESTS/readtest.c',
+    ],
+    LIBDEPS=[
+        'intel_decimal128',
+    ],
+    LIBS=readtestEnv['LIBS'] + libs,
+    AIB_COMPONENT="intel-test",
+    AIB_COMPONENTS_EXTRA=[
+        "unittests",
+        "tests",
+    ],
+)
+
+readtest_input = env.AutoInstall(
+    target="$PREFIX_BINDIR",
+    source=["TESTS/readtest.in"],
+    AIB_ROLE="runtime",
+    AIB_COMPONENT="intel-test",
+    AIB_COMPONENTS_EXTRA=[
+        "unittests",
+        "tests",
+    ],
+)
+
+env.Depends(readtest_input, readtest)
+
+readtest_dict = {
+    '@readtest_python_interpreter@' : sys.executable.replace('\\', r'\\'),
+    '@readtest_program@' : readtest[0].name,
+    '@readtest_input@' : readtest_input[0].name,
+}
+
+readtest_wrapper = env.Substfile(
+    target='intel_decimal128_readtest_wrapper.py',
+    source=['intel_decimal128_readtest_wrapper.py.in'],
+    SUBST_DICT=readtest_dict,
+)
+env.Depends(readtest_wrapper, readtest_input)
+
+readtest_wrapper_install = env.AutoInstall(
+    target="$PREFIX_BINDIR",
+    source=readtest_wrapper,
+    AIB_ROLE="runtime",
+    AIB_COMPONENT="intel-test",
+    AIB_COMPONENTS_EXTRA=[
+        "unittests",
+        "tests",
+    ],
+)
+
+if env.TargetOSIs('windows'):
+    readtest_wrapper_bat = env.Substfile(
+        target='intel_decimal128_readtest_wrapper.bat',
+        source=['intel_decimal128_readtest_wrapper.bat.in'],
+        SUBST_DICT=readtest_dict,
     )
+    env.Depends(readtest_wrapper_bat, readtest_wrapper)
 
+    readtest_wrapper_bat_install = env.AutoInstall(
+        target="$PREFIX_BINDIR",
+        source=readtest_wrapper_bat,
+        AIB_ROLE="runtime",
+        AIB_COMPONENT="intel-test",
+        AIB_COMPONENTS_EXTRA=[
+            "unittests",
+            "tests",
+        ],
+    )
+    env.RegisterTest("$UNITTEST_LIST", readtest_wrapper_bat_install[0])
+
+else:
+    env.RegisterTest("$UNITTEST_LIST", readtest_wrapper_install[0])
+    env.AddPostAction(readtest_wrapper[0], Chmod(readtest_wrapper[0], 'oug+x'))

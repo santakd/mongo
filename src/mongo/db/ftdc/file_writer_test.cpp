@@ -1,34 +1,36 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem.hpp>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonmisc.h"
@@ -38,16 +40,18 @@
 #include "mongo/db/ftdc/file_writer.h"
 #include "mongo/db/ftdc/ftdc_test.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
 const char* kTestFile = "metrics.test";
+const char* kTestFileCopy = "metrics.test.copy";
+
+class FTDCFileTest : public ServiceContextTest {};
 
 // File Sanity check
-TEST(FTDCFileTest, TestFileBasicMetadata) {
+TEST_F(FTDCFileTest, TestFileBasicMetadata) {
     unittest::TempDir tempdir("metrics_testpath");
     boost::filesystem::path p(tempdir.path());
     p /= kTestFile;
@@ -69,7 +73,7 @@ TEST(FTDCFileTest, TestFileBasicMetadata) {
     ASSERT_OK(writer.writeMetadata(doc1, Date_t()));
     ASSERT_OK(writer.writeMetadata(doc2, Date_t()));
 
-    writer.close();
+    writer.close().transitional_ignore();
 
     FTDCFileReader reader;
     ASSERT_OK(reader.open(p));
@@ -78,13 +82,13 @@ TEST(FTDCFileTest, TestFileBasicMetadata) {
 
     BSONObj doc1a = std::get<1>(reader.next());
 
-    ASSERT_TRUE(doc1 == doc1a);
+    ASSERT_BSONOBJ_EQ(doc1, doc1a);
 
     ASSERT_OK(reader.hasNext());
 
     BSONObj doc2a = std::get<1>(reader.next());
 
-    ASSERT_TRUE(doc2 == doc2a);
+    ASSERT_BSONOBJ_EQ(doc2, doc2a);
 
     auto sw = reader.hasNext();
     ASSERT_OK(sw);
@@ -92,7 +96,7 @@ TEST(FTDCFileTest, TestFileBasicMetadata) {
 }
 
 // File Sanity check
-TEST(FTDCFileTest, TestFileBasicCompress) {
+TEST_F(FTDCFileTest, TestFileBasicCompress) {
     unittest::TempDir tempdir("metrics_testpath");
     boost::filesystem::path p(tempdir.path());
     p /= kTestFile;
@@ -114,7 +118,7 @@ TEST(FTDCFileTest, TestFileBasicCompress) {
     ASSERT_OK(writer.writeSample(doc1, Date_t()));
     ASSERT_OK(writer.writeSample(doc2, Date_t()));
 
-    writer.close();
+    writer.close().transitional_ignore();
 
     FTDCFileReader reader;
     ASSERT_OK(reader.open(p));
@@ -123,13 +127,13 @@ TEST(FTDCFileTest, TestFileBasicCompress) {
 
     BSONObj doc1a = std::get<1>(reader.next());
 
-    ASSERT_TRUE(doc1 == doc1a);
+    ASSERT_BSONOBJ_EQ(doc1, doc1a);
 
     ASSERT_OK(reader.hasNext());
 
     BSONObj doc2a = std::get<1>(reader.next());
 
-    ASSERT_TRUE(doc2 == doc2a);
+    ASSERT_BSONOBJ_EQ(doc2, doc2a);
 
     auto sw = reader.hasNext();
     ASSERT_OK(sw);
@@ -160,10 +164,30 @@ public:
     }
 
 private:
-    void validate(bool forceCompress = true) {
-        _writer.close();
+    void validate() {
+        // Verify we are flushing writes correctly by copying the file, and then reading it.
+        auto tempfile(boost::filesystem::path(_tempdir.path()) / kTestFileCopy);
+        boost::filesystem::copy_file(_path, tempfile);
 
-        ValidateDocumentList(_path, _docs);
+        // Read the file to make sure it is correct.
+        // We do not verify contents because the compressor may not have flushed the final records
+        // which is expected.
+        {
+            FTDCFileReader reader;
+
+            ASSERT_OK(reader.open(tempfile));
+
+            auto sw = reader.hasNext();
+            while (sw.isOK() && sw.getValue()) {
+                sw = reader.hasNext();
+            }
+
+            ASSERT_OK(sw);
+        }
+
+        _writer.close().transitional_ignore();
+
+        ValidateDocumentList(_path, _docs, FTDCValidationMode::kStrict);
     }
 
 private:
@@ -175,7 +199,7 @@ private:
 };
 
 // Test various schema changes
-TEST(FTDCFileTest, TestSchemaChanges) {
+TEST_F(FTDCFileTest, TestSchemaChanges) {
     FileTestTie c;
 
     c.addSample(BSON("name"
@@ -218,7 +242,7 @@ TEST(FTDCFileTest, TestSchemaChanges) {
 }
 
 // Test a full buffer
-TEST(FTDCFileTest, TestFull) {
+TEST_F(FTDCFileTest, TestFull) {
     // Test a large numbers of zeros, and incremental numbers in a full buffer
     for (int j = 0; j < 2; j++) {
         FileTestTie c;
@@ -244,8 +268,27 @@ TEST(FTDCFileTest, TestFull) {
     }
 }
 
+// Test a large documents so that we cause multiple 4kb buffers to flush on Windows.
+TEST_F(FTDCFileTest, TestLargeDocuments) {
+    FileTestTie c;
+
+    for (int j = 0; j < 5; j++) {
+        for (size_t i = 0; i <= FTDCConfig::kMaxSamplesPerArchiveMetricChunkDefault; i++) {
+            BSONObjBuilder b;
+            b.append("name", "joe");
+            for (size_t k = 0; k < 200; k++) {
+                b.appendNumber(
+                    "num",
+                    static_cast<long long int>(i * j + 5000 - (sin(static_cast<double>(k)) * 100)));
+            }
+
+            c.addSample(b.obj());
+        }
+    }
+}
+
 // Test a bad file
-TEST(FTDCFileTest, TestBadFile) {
+TEST_F(FTDCFileTest, TestBadFile) {
     unittest::TempDir tempdir("metrics_testpath");
     boost::filesystem::path p(tempdir.path());
     p /= kTestFile;

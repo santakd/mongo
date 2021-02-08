@@ -1,68 +1,63 @@
+/**
+ * This test is labeled resource intensive because its total io_write is 95MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
 (function() {
+"use strict";
 
-var st = new ShardingTest({ name: 'migrateBig_balancer',
-                            shards: 2,
-                            other: { enableBalancer: true } });
+load("jstests/sharding/libs/find_chunks_util.js");
+
+var st = new ShardingTest({name: 'migrateBig_balancer', shards: 2, other: {enableBalancer: true}});
 var mongos = st.s;
-
 var admin = mongos.getDB("admin");
-db = mongos.getDB("test");
-var coll = db.getCollection("stuff")
+var db = mongos.getDB("test");
+var coll = db.getCollection("stuff");
 
-assert.commandWorked(admin.runCommand({ enablesharding : coll.getDB().getName() }));
-st.ensurePrimaryShard(coll.getDB().getName(), 'shard0001');
+assert.commandWorked(admin.runCommand({enablesharding: coll.getDB().getName()}));
+st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
 
-var data = "x"
-var nsq = 16
-var n = 255
+var data = "x";
+var nsq = 16;
+var n = 255;
 
-for( var i = 0; i < nsq; i++ ) data += data
+for (var i = 0; i < nsq; i++)
+    data += data;
 
-dataObj = {}
-for( var i = 0; i < n; i++ ) dataObj["data-" + i] = data
+var dataObj = {};
+for (var i = 0; i < n; i++)
+    dataObj["data-" + i] = data;
 
 var bulk = coll.initializeUnorderedBulkOp();
-for( var i = 0; i < 40; i++ ) {
-    bulk.insert({ data: dataObj });
+for (var i = 0; i < 40; i++) {
+    bulk.insert({data: dataObj});
 }
-assert.writeOK(bulk.execute());
 
-assert.eq( 40 , coll.count() , "prep1" );
+assert.commandWorked(bulk.execute());
+assert.eq(40, coll.count(), "prep1");
 
-printjson( coll.stats() )
+assert.commandWorked(admin.runCommand({shardcollection: "" + coll, key: {_id: 1}}));
+st.printShardingStatus();
 
-admin.printShardingStatus()
+assert.lt(5,
+          findChunksUtil.findChunksByNs(mongos.getDB("config"), "test.stuff").count(),
+          "not enough chunks");
 
-admin.runCommand({ shardcollection : "" + coll, key : { _id : 1 } })
-
-assert.lt( 5 , mongos.getDB( "config" ).chunks.find( { ns : "test.stuff" } ).count() , "not enough chunks" );
-
-assert.soon( 
-    function() {
-        // On *extremely* slow or variable systems, we've seen migrations fail in the critical section and
-        // kill the server.  Do an explicit check for this. SERVER-8781
-        // TODO: Remove once we can better specify what systems to run what tests on.
-        try {
-            assert.commandWorked(st.shard0.getDB("admin").runCommand({ ping: 1 }));
-            assert.commandWorked(st.shard1.getDB("admin").runCommand({ ping: 1 }));
+assert.soon(() => {
+    const aggMatch = (function() {
+        const collMetadata = mongos.getDB("config").collections.findOne({_id: "test.stuff"});
+        if (collMetadata.timestamp) {
+            return {$match: {uuid: collMetadata.uuid}};
+        } else {
+            return {$match: {ns: "test.stuff"}};
         }
-        catch(e) {
-            print("An error occurred contacting a shard during balancing," +
-                  " this may be due to slow disk I/O, aborting test.");
-            throw e;
-        }
-         
-        res = mongos.getDB( "config" ).chunks.group( { cond : { ns : "test.stuff" } , 
-                                                       key : { shard : 1 }  , 
-                                                       reduce : function( doc , out ){ out.nChunks++; } , 
-                                                       initial : { nChunks : 0 } } );
-        
-        printjson( res );
-        return res.length > 1 && Math.abs( res[0].nChunks - res[1].nChunks ) <= 3;
-
-    } , 
-    "never migrated" , 10 * 60 * 1000 , 1000 );
+    }());
+    let res = mongos.getDB("config")
+                  .chunks.aggregate([aggMatch, {$group: {_id: "$shard", nChunks: {$sum: 1}}}])
+                  .toArray();
+    printjson(res);
+    return res.length > 1 && Math.abs(res[0].nChunks - res[1].nChunks) <= 3;
+}, "never migrated", 10 * 60 * 1000, 1000);
 
 st.stop();
-
 })();

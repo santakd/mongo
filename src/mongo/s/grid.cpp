@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2010-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,57 +27,83 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/grid.h"
 
-#include "mongo/base/status_with.h"
-#include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/forwarding_catalog_manager.h"
-#include "mongo/s/catalog/type_settings.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/util/log.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/balancer_configuration.h"
+#include "mongo/s/client/shard_factory.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 
 namespace mongo {
+namespace {
+const auto grid = ServiceContext::declareDecoration<Grid>();
+}  // namespace
 
-// Global grid instance
-Grid grid;
+Grid::Grid() = default;
 
-Grid::Grid() : _allowLocalShard(true) {}
+Grid::~Grid() = default;
 
-void Grid::init(std::unique_ptr<ForwardingCatalogManager> catalogManager,
+Grid* Grid::get(ServiceContext* serviceContext) {
+    return &grid(serviceContext);
+}
+
+Grid* Grid::get(OperationContext* operationContext) {
+    return get(operationContext->getServiceContext());
+}
+
+void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
+                std::unique_ptr<CatalogCache> catalogCache,
                 std::unique_ptr<ShardRegistry> shardRegistry,
-                std::unique_ptr<ClusterCursorManager> cursorManager) {
-    invariant(!_catalogManager);
+                std::unique_ptr<ClusterCursorManager> cursorManager,
+                std::unique_ptr<BalancerConfiguration> balancerConfig,
+                std::unique_ptr<executor::TaskExecutorPool> executorPool,
+                executor::NetworkInterface* network) {
+    invariant(!_catalogClient);
     invariant(!_catalogCache);
     invariant(!_shardRegistry);
     invariant(!_cursorManager);
+    invariant(!_balancerConfig);
+    invariant(!_executorPool);
+    invariant(!_network);
 
-    _catalogManager = std::move(catalogManager);
-    _catalogCache = stdx::make_unique<CatalogCache>();
+    _catalogClient = std::move(catalogClient);
+    _catalogCache = std::move(catalogCache);
     _shardRegistry = std::move(shardRegistry);
     _cursorManager = std::move(cursorManager);
+    _balancerConfig = std::move(balancerConfig);
+    _executorPool = std::move(executorPool);
+    _network = network;
+
+    _shardRegistry->init(grid.owner(this));
 }
 
-StatusWith<std::shared_ptr<DBConfig>> Grid::implicitCreateDb(OperationContext* txn,
-                                                             const std::string& dbName) {
-    auto status = catalogCache()->getDatabase(txn, dbName);
-    if (status.isOK()) {
-        return status;
-    }
+bool Grid::isShardingInitialized() const {
+    return _shardingInitialized.load();
+}
 
-    if (status == ErrorCodes::NamespaceNotFound) {
-        auto statusCreateDb = catalogManager(txn)->createDatabase(txn, dbName);
-        if (statusCreateDb.isOK() || statusCreateDb == ErrorCodes::NamespaceExists) {
-            return catalogCache()->getDatabase(txn, dbName);
-        }
+void Grid::setShardingInitialized() {
+    invariant(!_shardingInitialized.load());
+    _shardingInitialized.store(true);
+}
 
-        return statusCreateDb;
-    }
+Grid::CustomConnectionPoolStatsFn Grid::getCustomConnectionPoolStatsFn() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return _customConnectionPoolStatsFn;
+}
 
-    return status;
+void Grid::setCustomConnectionPoolStatsFn(CustomConnectionPoolStatsFn statsFn) {
+    stdx::lock_guard<Latch> lk(_mutex);
+    invariant(!_customConnectionPoolStatsFn || !statsFn);
+    _customConnectionPoolStatsFn = std::move(statsFn);
 }
 
 bool Grid::allowLocalHost() const {
@@ -87,56 +114,92 @@ void Grid::setAllowLocalHost(bool allow) {
     _allowLocalShard = allow;
 }
 
-/*
- * Returns whether balancing is enabled, with optional namespace "ns" parameter for balancing on a
- * particular collection.
- */
-bool Grid::shouldBalance(const SettingsType& balancerSettings) const {
-    if (balancerSettings.isBalancerStoppedSet() && balancerSettings.getBalancerStopped()) {
-        return false;
-    }
-
-    if (balancerSettings.isBalancerActiveWindowSet()) {
-        boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
-        return balancerSettings.inBalancingWindow(now);
-    }
-
-    return true;
+repl::ReadConcernArgs Grid::readConcernWithConfigTime(
+    repl::ReadConcernLevel readConcernLevel) const {
+    return ReadConcernArgs(configOpTime(), readConcernLevel);
 }
 
-bool Grid::getConfigShouldBalance(OperationContext* txn) const {
-    auto balSettingsResult =
-        grid.catalogManager(txn)->getGlobalSettings(txn, SettingsType::BalancerDocKey);
-    if (!balSettingsResult.isOK()) {
-        warning() << balSettingsResult.getStatus();
-        return false;
-    }
-    SettingsType balSettings = balSettingsResult.getValue();
+ReadPreferenceSetting Grid::readPreferenceWithConfigTime(
+    const ReadPreferenceSetting& readPreference) const {
+    ReadPreferenceSetting readPrefToReturn(readPreference);
+    readPrefToReturn.minClusterTime = configOpTime().getTimestamp();
+    return readPrefToReturn;
+}
 
-    if (!balSettings.isKeySet()) {
-        // Balancer settings doc does not exist. Default to yes.
-        return true;
+// TODO SERVER-50675: directly use VectorClock's configTime once 5.0 becomes last-lts.
+repl::OpTime Grid::configOpTime() const {
+    invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
+
+    auto configTime = [this] {
+        stdx::lock_guard<Latch> lk(_mutex);
+        return _configOpTime;
+    }();
+
+    const auto& fcv = serverGlobalParams.featureCompatibility;
+    if (fcv.isVersionInitialized() &&
+        fcv.isGreaterThanOrEqualTo(ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
+        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
+        const auto vcConfigTimeTs = currentTime.configTime().asTimestamp();
+        if (!vcConfigTimeTs.isNull() && vcConfigTimeTs >= configTime.getTimestamp()) {
+            // TODO SERVER-44097: investigate why not using a term (e.g. with a LogicalTime)
+            // can lead - upon CSRS stepdowns - to a last applied opTime lower than the
+            // previous primary's committed opTime
+            configTime =
+                mongo::repl::OpTime(vcConfigTimeTs, mongo::repl::OpTime::kUninitializedTerm);
+        }
     }
 
-    return shouldBalance(balSettings);
+    return configTime;
+}
+
+boost::optional<repl::OpTime> Grid::advanceConfigOpTime(OperationContext* opCtx,
+                                                        repl::OpTime opTime,
+                                                        StringData what) {
+    const auto prevOpTime = _advanceConfigOpTime(opTime);
+    if (prevOpTime && prevOpTime->getTerm() != mongo::repl::OpTime::kUninitializedTerm &&
+        opTime.getTerm() != mongo::repl::OpTime::kUninitializedTerm &&
+        prevOpTime->getTerm() != opTime.getTerm()) {
+        std::string clientAddr = "(unknown)";
+        if (opCtx && opCtx->getClient()) {
+            clientAddr = opCtx->getClient()->clientAddress(true);
+        }
+        LOGV2(22792,
+              "Received {reason} {clientAddress} indicating config server"
+              " term has increased, previous opTime {prevOpTime}, now {opTime}",
+              "Term advanced for config server",
+              "opTime"_attr = opTime,
+              "prevOpTime"_attr = prevOpTime,
+              "reason"_attr = what,
+              "clientAddress"_attr = clientAddr);
+    }
+    return prevOpTime;
+}
+
+boost::optional<repl::OpTime> Grid::_advanceConfigOpTime(const repl::OpTime& opTime) {
+    invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
+    auto vectorClock = VectorClock::get(grid.owner(this));
+    if (vectorClock->isEnabled()) {
+        vectorClock->gossipInConfigOpTime(opTime);
+    }
+    stdx::lock_guard<Latch> lk(_mutex);
+    if (_configOpTime < opTime) {
+        repl::OpTime prev = _configOpTime;
+        _configOpTime = opTime;
+        return prev;
+    }
+    return boost::none;
 }
 
 void Grid::clearForUnitTests() {
-    _catalogManager.reset();
     _catalogCache.reset();
-
-    _shardRegistry->shutdown();
+    _catalogClient.reset();
     _shardRegistry.reset();
-
     _cursorManager.reset();
-}
+    _balancerConfig.reset();
+    _executorPool.reset();
+    _network = nullptr;
 
-ForwardingCatalogManager* Grid::forwardingCatalogManager() {
-    return _catalogManager.get();
-}
-
-CatalogManager* Grid::catalogManager(OperationContext* txn) {
-    return _catalogManager->getCatalogManagerToUse(txn);
+    _configOpTime = repl::OpTime();
 }
 
 }  // namespace mongo

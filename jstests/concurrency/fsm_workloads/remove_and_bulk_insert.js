@@ -10,14 +10,13 @@
  * accessed after a WriteConflictException occurred in Collection::deleteDocument().
  */
 var $config = (function() {
-
     var states = {
         insert: function insert(db, collName) {
             var bulk = db[collName].initializeUnorderedBulkOp();
-            for (var i = 0; i < 1000; ++i) {
+            for (var i = 0; i < 100; ++i) {
                 bulk.insert({});
             }
-            assert.writeOK(bulk.execute());
+            assert.commandWorked(bulk.execute());
         },
 
         remove: function remove(db, collName) {
@@ -26,10 +25,7 @@ var $config = (function() {
         }
     };
 
-    var transitions = {
-        insert: { insert: 0.5, remove: 0.5 },
-        remove: { insert: 0.5, remove: 0.5 }
-    };
+    var transitions = {insert: {insert: 0.5, remove: 0.5}, remove: {insert: 0.5, remove: 0.5}};
 
     return {
         threadCount: 5,
@@ -38,5 +34,4 @@ var $config = (function() {
         states: states,
         transitions: transitions
     };
-
 })();

@@ -4,22 +4,17 @@ Welcome to MongoDB!
 
 COMPONENTS
 
-  mongod - The database process.
-  mongos - Sharding controller.
+  mongod - The database server.
+  mongos - Sharding router.
   mongo  - The database shell (uses interactive javascript).
 
 UTILITIES
 
-  mongodump         - MongoDB dump tool - for backups, snapshots, etc.
-  mongorestore      - MongoDB restore a dump
-  mongoexport       - Export a single collection to test (JSON, CSV)
-  mongoimport       - Import from JSON or CSV
-  mongofiles        - Utility for putting and getting files from MongoDB GridFS
-  mongostat         - Show performance statistics
+  install_compass   - Installs MongoDB Compass for your platform.
 
 BUILDING
 
-  See docs/building.md, also www.mongodb.org search for "Building".
+  See docs/building.md.
 
 RUNNING
 
@@ -29,51 +24,63 @@ RUNNING
 
   To run a single server database:
 
-    $ mkdir /data/db
+    $ sudo mkdir -p /data/db
     $ ./mongod
     $
     $ # The mongo javascript shell connects to localhost and test database by default:
-    $ ./mongo 
+    $ ./mongo
     > help
+
+INSTALLING COMPASS
+
+  You can install compass using the install_compass script packaged with MongoDB:
+
+    $ ./install_compass
+
+  This will download the appropriate MongoDB Compass package for your platform
+  and install it.
 
 DRIVERS
 
-  Client drivers for most programming languages are available at mongodb.org.  Use the 
-  shell ("mongo") for administrative tasks.
+  Client drivers for most programming languages are available at
+  https://docs.mongodb.com/manual/applications/drivers/. Use the shell
+  ("mongo") for administrative tasks.
+
+BUG REPORTS
+
+  See https://github.com/mongodb/mongo/wiki/Submit-Bug-Reports.
 
 PACKAGING
 
-  Packages are created dynamically by the package.py script located in the buildscripts directory. This will 
-  generate RPM and Debian packages.
+  Packages are created dynamically by the package.py script located in the
+  buildscripts directory. This will generate RPM and Debian packages.
 
 DOCUMENTATION
 
-  http://www.mongodb.org/
- 
-CLOUD MANAGED MONGODB
+  https://docs.mongodb.com/manual/
 
-  http://cloud.mongodb.com/
+CLOUD HOSTED MONGODB
 
-MAIL LISTS AND IRC
+  https://www.mongodb.com/cloud/atlas
 
-  http://dochub.mongodb.org/core/community
-  
+FORUMS
+
+  https://community.mongodb.com
+
+    A forum for technical questions about using MongoDB.
+
+  https://community.mongodb.com/c/server-dev
+
+    A forum for technical questions about building and developing MongoDB.
+
 LEARN MONGODB
 
-  http://university.mongodb.com/
-
-32 BIT BUILD NOTES
-
-  MongoDB uses memory mapped files.  If built as a 32 bit executable, you will
-  not be able to work with large (multi-gigabyte) databases.  However, 32 bit
-  builds work fine with small development databases.
+  https://university.mongodb.com/
 
 LICENSE
 
-  Most MongoDB source files (src/mongo folder and below) are made available under the terms of the
-  GNU Affero General Public License (AGPL).  See individual files for
+  MongoDB is free and the source is available. Versions released prior to
+  October 16, 2018 are published under the AGPL. All versions released after
+  October 16, 2018, including patch fixes for prior versions, are published
+  under the Server Side Public License (SSPL) v1. See individual files for
   details.
-
-  As an exception, the files in the client/, debian/, rpm/,
-  utils/mongoutils, and all subdirectories thereof are made available under
-  the terms of the Apache License, version 2.0.

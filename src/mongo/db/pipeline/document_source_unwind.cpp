@@ -1,38 +1,41 @@
 /**
- * Copyright 2011 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/pipeline/document_source_unwind.h"
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 
 namespace mongo {
 
@@ -55,7 +58,7 @@ public:
      *
      * Returns boost::none if the array is exhausted.
      */
-    boost::optional<Document> getNext();
+    DocumentSource::GetNextResult getNext();
 
 private:
     // Tracks whether or not we can possibly return any more documents. Note we may return
@@ -100,11 +103,11 @@ void DocumentSourceUnwind::Unwinder::resetDocument(const Document& document) {
     _haveNext = true;
 }
 
-boost::optional<Document> DocumentSourceUnwind::Unwinder::getNext() {
+DocumentSource::GetNextResult DocumentSourceUnwind::Unwinder::getNext() {
     // WARNING: Any functional changes to this method must also be implemented in the unwinding
     // implementation of the $lookup stage.
     if (!_haveNext) {
-        return boost::none;
+        return GetNextResult::makeEOF();
     }
 
     // Track which index this value came from. If 'includeArrayIndex' was specified, we will use
@@ -119,7 +122,7 @@ boost::optional<Document> DocumentSourceUnwind::Unwinder::getNext() {
             // Preserve documents with empty arrays if asked to, otherwise skip them.
             _haveNext = false;
             if (!_preserveNullAndEmptyArrays) {
-                return boost::none;
+                return GetNextResult::makeEOF();
             }
             _output.removeNestedField(_unwindPathFieldIndexes);
         } else {
@@ -138,7 +141,7 @@ boost::optional<Document> DocumentSourceUnwind::Unwinder::getNext() {
         // Preserve a nullish value if asked to, otherwise skip it.
         _haveNext = false;
         if (!_preserveNullAndEmptyArrays) {
-            return boost::none;
+            return GetNextResult::makeEOF();
         }
     } else {
         // Any non-nullish, non-array type should pass through.
@@ -157,16 +160,18 @@ DocumentSourceUnwind::DocumentSourceUnwind(const intrusive_ptr<ExpressionContext
                                            const FieldPath& fieldPath,
                                            bool preserveNullAndEmptyArrays,
                                            const boost::optional<FieldPath>& indexPath)
-    : DocumentSource(pExpCtx),
+    : DocumentSource(kStageName, pExpCtx),
       _unwindPath(fieldPath),
       _preserveNullAndEmptyArrays(preserveNullAndEmptyArrays),
       _indexPath(indexPath),
       _unwinder(new Unwinder(fieldPath, preserveNullAndEmptyArrays, indexPath)) {}
 
-REGISTER_DOCUMENT_SOURCE(unwind, DocumentSourceUnwind::createFromBson);
+REGISTER_DOCUMENT_SOURCE(unwind,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceUnwind::createFromBson);
 
 const char* DocumentSourceUnwind::getSourceName() const {
-    return "$unwind";
+    return kStageName.rawData();
 }
 
 intrusive_ptr<DocumentSourceUnwind> DocumentSourceUnwind::create(
@@ -174,43 +179,51 @@ intrusive_ptr<DocumentSourceUnwind> DocumentSourceUnwind::create(
     const string& unwindPath,
     bool preserveNullAndEmptyArrays,
     const boost::optional<string>& indexPath) {
-    return new DocumentSourceUnwind(expCtx,
-                                    FieldPath(unwindPath),
-                                    preserveNullAndEmptyArrays,
-                                    indexPath ? FieldPath(*indexPath)
-                                              : boost::optional<FieldPath>());
+    intrusive_ptr<DocumentSourceUnwind> source(
+        new DocumentSourceUnwind(expCtx,
+                                 FieldPath(unwindPath),
+                                 preserveNullAndEmptyArrays,
+                                 indexPath ? FieldPath(*indexPath) : boost::optional<FieldPath>()));
+    return source;
 }
 
-boost::optional<Document> DocumentSourceUnwind::getNext() {
-    pExpCtx->checkForInterrupt();
-
-    boost::optional<Document> out = _unwinder->getNext();
-    while (!out) {
+DocumentSource::GetNextResult DocumentSourceUnwind::doGetNext() {
+    auto nextOut = _unwinder->getNext();
+    while (nextOut.isEOF()) {
         // No more elements in array currently being unwound. This will loop if the input
         // document is missing the unwind field or has an empty array.
-        boost::optional<Document> input = pSource->getNext();
-        if (!input)
-            return boost::none;  // input exhausted
+        auto nextInput = pSource->getNext();
+        if (!nextInput.isAdvanced()) {
+            return nextInput;
+        }
 
         // Try to extract an output document from the new input document.
-        _unwinder->resetDocument(*input);
-        out = _unwinder->getNext();
+        _unwinder->resetDocument(nextInput.releaseDocument());
+        nextOut = _unwinder->getNext();
     }
 
-    return out;
+    return nextOut;
 }
 
-Value DocumentSourceUnwind::serialize(bool explain) const {
+DocumentSource::GetModPathsReturn DocumentSourceUnwind::getModifiedPaths() const {
+    std::set<std::string> modifiedFields{_unwindPath.fullPath()};
+    if (_indexPath) {
+        modifiedFields.insert(_indexPath->fullPath());
+    }
+    return {GetModPathsReturn::Type::kFiniteSet, std::move(modifiedFields), {}};
+}
+
+Value DocumentSourceUnwind::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     return Value(DOC(getSourceName() << DOC(
-                         "path" << _unwindPath.getPath(true) << "preserveNullAndEmptyArrays"
+                         "path" << _unwindPath.fullPathWithPrefix() << "preserveNullAndEmptyArrays"
                                 << (_preserveNullAndEmptyArrays ? Value(true) : Value())
                                 << "includeArrayIndex"
-                                << (_indexPath ? Value((*_indexPath).getPath(false)) : Value()))));
+                                << (_indexPath ? Value((*_indexPath).fullPath()) : Value()))));
 }
 
-DocumentSource::GetDepsReturn DocumentSourceUnwind::getDependencies(DepsTracker* deps) const {
-    deps->fields.insert(_unwindPath.getPath(false));
-    return SEE_NEXT;
+DepsTracker::State DocumentSourceUnwind::getDependencies(DepsTracker* deps) const {
+    deps->fields.insert(_unwindPath.fullPath());
+    return DepsTracker::State::SEE_NEXT;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
@@ -244,7 +257,8 @@ intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
                 indexPath = subElem.String();
                 uassert(28822,
                         str::stream() << "includeArrayIndex option to $unwind stage should not be "
-                                         "prefixed with a '$': " << (*indexPath),
+                                         "prefixed with a '$': "
+                                      << (*indexPath),
                         (*indexPath)[0] != '$');
             } else {
                 uasserted(28811,
@@ -270,4 +284,4 @@ intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
     string pathString(Expression::removeFieldPrefix(prefixedPathString));
     return DocumentSourceUnwind::create(pExpCtx, pathString, preserveNullAndEmptyArrays, indexPath);
 }
-}
+}  // namespace mongo

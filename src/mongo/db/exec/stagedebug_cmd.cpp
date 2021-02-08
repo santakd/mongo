@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,17 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
@@ -54,29 +57,16 @@
 #include "mongo/db/index/fts_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/query/plan_executor.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#include "mongo/db/matcher/expression_text_base.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/plan_executor_factory.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
-
-namespace {
-
-BSONObj stripFieldNames(const BSONObj& obj) {
-    BSONObjIterator it(obj);
-    BSONObjBuilder bob;
-    while (it.more()) {
-        bob.appendAs(it.next(), "");
-    }
-    return bob.obj();
-}
-
-}  // namespace
 
 /**
  * A command for manually constructing a query tree and running it.
@@ -113,33 +103,30 @@ BSONObj stripFieldNames(const BSONObj& obj) {
  * node -> {dedup: {filter: {filter}, args: {node: node, field: field}}}
  * node -> {unwind: {filter: filter}, args: {node: node, field: field}}
  */
-class StageDebugCmd : public Command {
+class StageDebugCmd : public BasicCommand {
 public:
-    StageDebugCmd() : Command("stageDebug") {}
+    StageDebugCmd() : BasicCommand("stageDebug") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
-    bool slaveOverrideOk() const {
-        return false;
+    std::string help() const override {
+        return {};
     }
-    void help(std::stringstream& h) const {}
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         // Command is testing-only, and can only be enabled at command line.  Hence, no auth
         // check needed.
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         BSONElement argElt = cmdObj["stageDebug"];
         if (argElt.eoo() || !argElt.isABSONObj()) {
@@ -152,20 +139,26 @@ public:
         if (collElt.eoo() || (String != collElt.type())) {
             return false;
         }
-        string collName = collElt.String();
 
-        // Need a context to get the actual Collection*
+        const NamespaceString nss(dbname, collElt.String());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << nss.toString() << " is not a valid namespace",
+                nss.isValid());
+
+        auto expCtx = make_intrusive<ExpressionContext>(
+            opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
+
+        // Need a context to get the actual const CollectionPtr&
         // TODO A write lock is currently taken here to accommodate stages that perform writes
         //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
         //      execution trees.
-        ScopedTransaction transaction(txn, MODE_IX);
-        Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, dbname);
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
 
         // Make sure the collection is valid.
-        Database* db = ctx.db();
-        Collection* collection = db->getCollection(db->name() + '.' + collName);
-        uassert(17446, "Couldn't find the collection " + collName, NULL != collection);
+        const auto& collection = autoColl.getCollection();
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "Couldn't find collection " << nss.ns(),
+                collection);
 
         // Pull out the plan
         BSONElement planElt = argObj["plan"];
@@ -175,60 +168,54 @@ public:
         BSONObj planObj = planElt.Obj();
 
         // Parse the plan into these.
-        OwnedPointerVector<MatchExpression> exprs;
+        std::vector<std::unique_ptr<MatchExpression>> exprs;
         unique_ptr<WorkingSet> ws(new WorkingSet());
 
-        PlanStage* userRoot = parseQuery(txn, collection, planObj, ws.get(), &exprs);
-        uassert(16911, "Couldn't parse plan from " + cmdObj.toString(), NULL != userRoot);
+        std::unique_ptr<PlanStage> userRoot{
+            parseQuery(expCtx, collection, planObj, ws.get(), nss, &exprs)};
+        uassert(16911, "Couldn't parse plan from " + cmdObj.toString(), nullptr != userRoot);
 
         // Add a fetch at the top for the user so we can get obj back for sure.
-        // TODO: Do we want to do this for the user?  I think so.
-        unique_ptr<PlanStage> rootFetch =
-            make_unique<FetchStage>(txn, ws.get(), userRoot, nullptr, collection);
+        unique_ptr<PlanStage> rootFetch = std::make_unique<FetchStage>(
+            expCtx.get(), ws.get(), std::move(userRoot), nullptr, collection);
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            txn, std::move(ws), std::move(rootFetch), collection, PlanExecutor::YIELD_AUTO);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(expCtx,
+                                        std::move(ws),
+                                        std::move(rootFetch),
+                                        &collection,
+                                        PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                        false /* whether owned BSON must be returned */);
         fassert(28536, statusWithPlanExecutor.getStatus());
-        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder resultBuilder(result.subarrayStart("results"));
 
         BSONObj obj;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
             resultBuilder.append(obj);
         }
 
         resultBuilder.done();
-
-        if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-            const std::unique_ptr<PlanStageStats> stats(exec->getStats());
-            error() << "Plan executor error during StageDebug command: "
-                    << PlanExecutor::statestr(state) << ", stats: " << Explain::statsToBSON(*stats);
-
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream()
-                           << "Executor error during "
-                           << "StageDebug command: " << WorkingSetCommon::toStatusString(obj)));
-        }
-
         return true;
     }
 
-    PlanStage* parseQuery(OperationContext* txn,
-                          Collection* collection,
+    PlanStage* parseQuery(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                          const CollectionPtr& collection,
                           BSONObj obj,
                           WorkingSet* workingSet,
-                          OwnedPointerVector<MatchExpression>* exprs) {
+                          const NamespaceString& nss,
+                          std::vector<std::unique_ptr<MatchExpression>>* exprs) {
+        OperationContext* opCtx = expCtx->opCtx;
+
         BSONElement firstElt = obj.firstElement();
         if (!firstElt.isABSONObj()) {
-            return NULL;
+            return nullptr;
         }
         BSONObj paramObj = firstElt.Obj();
 
-        MatchExpression* matcher = NULL;
+        MatchExpression* matcher = nullptr;
         BSONObj nodeArgs;
 
         // Every node has these two fields.
@@ -239,54 +226,77 @@ public:
         while (it.more()) {
             BSONElement e = it.next();
             if (!e.isABSONObj()) {
-                return NULL;
+                return nullptr;
             }
             BSONObj argObj = e.Obj();
             if (filterTag == e.fieldName()) {
-                StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-                    argObj, WhereCallbackReal(txn, collection->ns().db()));
+                auto statusWithMatcher =
+                    MatchExpressionParser::parse(argObj,
+                                                 expCtx,
+                                                 ExtensionsCallbackReal(opCtx, &collection->ns()),
+                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
                 if (!statusWithMatcher.isOK()) {
-                    return NULL;
+                    return nullptr;
                 }
                 std::unique_ptr<MatchExpression> me = std::move(statusWithMatcher.getValue());
                 // exprs is what will wind up deleting this.
-                matcher = me.release();
-                verify(NULL != matcher);
-                exprs->mutableVector().push_back(matcher);
+                matcher = me.get();
+                verify(nullptr != matcher);
+                exprs->push_back(std::move(me));
             } else if (argsTag == e.fieldName()) {
                 nodeArgs = argObj;
             } else {
                 uasserted(16910,
                           "Unknown fieldname " + string(e.fieldName()) + " in query node " +
                               obj.toString());
-                return NULL;
+                return nullptr;
             }
         }
 
         string nodeName = firstElt.fieldName();
 
         if ("ixscan" == nodeName) {
-            // This'll throw if it's not an obj but that's OK.
-            BSONObj keyPatternObj = nodeArgs["keyPattern"].Obj();
+            const IndexDescriptor* desc;
+            if (BSONElement keyPatternElement = nodeArgs["keyPattern"]) {
+                // This'll throw if it's not an obj but that's OK.
+                BSONObj keyPatternObj = keyPatternElement.Obj();
+                std::vector<const IndexDescriptor*> indexes;
+                collection->getIndexCatalog()->findIndexesByKeyPattern(
+                    opCtx, keyPatternObj, false, &indexes);
+                uassert(16890,
+                        str::stream() << "Can't find index: " << keyPatternObj,
+                        !indexes.empty());
+                uassert(ErrorCodes::AmbiguousIndexKeyPattern,
+                        str::stream() << indexes.size()
+                                      << " matching indexes for key pattern: " << keyPatternObj
+                                      << ". Conflicting indexes: " << indexes[0]->infoObj() << ", "
+                                      << indexes[1]->infoObj(),
+                        indexes.size() == 1);
+                desc = indexes[0];
+            } else {
+                uassert(40306,
+                        str::stream() << "Index 'name' must be a string in: " << nodeArgs,
+                        nodeArgs["name"].type() == BSONType::String);
+                StringData name = nodeArgs["name"].valueStringData();
+                desc = collection->getIndexCatalog()->findIndexByName(opCtx, name);
+                uassert(40223, str::stream() << "Can't find index: " << name.toString(), desc);
+            }
 
-            IndexDescriptor* desc =
-                collection->getIndexCatalog()->findIndexByKeyPattern(txn, keyPatternObj);
-            uassert(16890, "Can't find index: " + keyPatternObj.toString(), desc);
-
-            IndexScanParams params;
-            params.descriptor = desc;
+            IndexScanParams params(opCtx, desc);
             params.bounds.isSimpleRange = true;
-            params.bounds.startKey = stripFieldNames(nodeArgs["startKey"].Obj());
-            params.bounds.endKey = stripFieldNames(nodeArgs["endKey"].Obj());
-            params.bounds.endKeyInclusive = nodeArgs["endKeyInclusive"].Bool();
+            params.bounds.startKey = BSONObj::stripFieldNames(nodeArgs["startKey"].Obj());
+            params.bounds.endKey = BSONObj::stripFieldNames(nodeArgs["endKey"].Obj());
+            params.bounds.boundInclusion = IndexBounds::makeBoundInclusionFromBoundBools(
+                nodeArgs["startKeyInclusive"].Bool(), nodeArgs["endKeyInclusive"].Bool());
             params.direction = nodeArgs["direction"].numberInt();
+            params.shouldDedup = desc->getEntry()->isMultikey();
 
-            return new IndexScan(txn, params, workingSet, matcher);
+            return new IndexScan(expCtx.get(), collection, params, workingSet, matcher);
         } else if ("andHash" == nodeName) {
             uassert(
                 16921, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
 
-            auto andStage = make_unique<AndHashStage>(txn, workingSet, collection);
+            auto andStage = std::make_unique<AndHashStage>(expCtx.get(), workingSet);
 
             int nodesAdded = 0;
             BSONObjIterator it(nodeArgs["nodes"].Obj());
@@ -294,11 +304,12 @@ public:
                 BSONElement e = it.next();
                 uassert(16922, "node of AND isn't an obj?: " + e.toString(), e.isABSONObj());
 
-                PlanStage* subNode = parseQuery(txn, collection, e.Obj(), workingSet, exprs);
-                uassert(
-                    16923, "Can't parse sub-node of AND: " + e.Obj().toString(), NULL != subNode);
-                // takes ownership
-                andStage->addChild(subNode);
+                std::unique_ptr<PlanStage> subNode{
+                    parseQuery(expCtx, collection, e.Obj(), workingSet, nss, exprs)};
+                uassert(16923,
+                        "Can't parse sub-node of AND: " + e.Obj().toString(),
+                        nullptr != subNode);
+                andStage->addChild(std::move(subNode));
                 ++nodesAdded;
             }
 
@@ -309,7 +320,7 @@ public:
             uassert(
                 16924, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
 
-            auto andStage = make_unique<AndSortedStage>(txn, workingSet, collection);
+            auto andStage = std::make_unique<AndSortedStage>(expCtx.get(), workingSet);
 
             int nodesAdded = 0;
             BSONObjIterator it(nodeArgs["nodes"].Obj());
@@ -317,11 +328,12 @@ public:
                 BSONElement e = it.next();
                 uassert(16925, "node of AND isn't an obj?: " + e.toString(), e.isABSONObj());
 
-                PlanStage* subNode = parseQuery(txn, collection, e.Obj(), workingSet, exprs);
-                uassert(
-                    16926, "Can't parse sub-node of AND: " + e.Obj().toString(), NULL != subNode);
-                // takes ownership
-                andStage->addChild(subNode);
+                std::unique_ptr<PlanStage> subNode{
+                    parseQuery(expCtx, collection, e.Obj(), workingSet, nss, exprs)};
+                uassert(16926,
+                        "Can't parse sub-node of AND: " + e.Obj().toString(),
+                        nullptr != subNode);
+                andStage->addChild(std::move(subNode));
                 ++nodesAdded;
             }
 
@@ -333,55 +345,60 @@ public:
                 16934, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
             uassert(16935, "Dedup argument must be provided to OR", !nodeArgs["dedup"].eoo());
             BSONObjIterator it(nodeArgs["nodes"].Obj());
-            auto orStage = make_unique<OrStage>(txn, workingSet, nodeArgs["dedup"].Bool(), matcher);
+            auto orStage = std::make_unique<OrStage>(
+                expCtx.get(), workingSet, nodeArgs["dedup"].Bool(), matcher);
             while (it.more()) {
                 BSONElement e = it.next();
                 if (!e.isABSONObj()) {
-                    return NULL;
+                    return nullptr;
                 }
-                PlanStage* subNode = parseQuery(txn, collection, e.Obj(), workingSet, exprs);
+                std::unique_ptr<PlanStage> subNode{
+                    parseQuery(expCtx, collection, e.Obj(), workingSet, nss, exprs)};
                 uassert(
-                    16936, "Can't parse sub-node of OR: " + e.Obj().toString(), NULL != subNode);
-                // takes ownership
-                orStage->addChild(subNode);
+                    16936, "Can't parse sub-node of OR: " + e.Obj().toString(), nullptr != subNode);
+                orStage->addChild(std::move(subNode));
             }
 
             return orStage.release();
         } else if ("fetch" == nodeName) {
             uassert(
                 16929, "Node argument must be provided to fetch", nodeArgs["node"].isABSONObj());
-            PlanStage* subNode =
-                parseQuery(txn, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            std::unique_ptr<PlanStage> subNode{
+                parseQuery(expCtx, collection, nodeArgs["node"].Obj(), workingSet, nss, exprs)};
             uassert(28731,
                     "Can't parse sub-node of FETCH: " + nodeArgs["node"].Obj().toString(),
-                    NULL != subNode);
-            return new FetchStage(txn, workingSet, subNode, matcher, collection);
+                    nullptr != subNode);
+            return new FetchStage(
+                expCtx.get(), workingSet, std::move(subNode), matcher, collection);
         } else if ("limit" == nodeName) {
-            uassert(
-                16937, "Limit stage doesn't have a filter (put it on the child)", NULL == matcher);
+            uassert(16937,
+                    "Limit stage doesn't have a filter (put it on the child)",
+                    nullptr == matcher);
             uassert(
                 16930, "Node argument must be provided to limit", nodeArgs["node"].isABSONObj());
             uassert(16931, "Num argument must be provided to limit", nodeArgs["num"].isNumber());
-            PlanStage* subNode =
-                parseQuery(txn, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            std::unique_ptr<PlanStage> subNode{
+                parseQuery(expCtx, collection, nodeArgs["node"].Obj(), workingSet, nss, exprs)};
             uassert(28732,
                     "Can't parse sub-node of LIMIT: " + nodeArgs["node"].Obj().toString(),
-                    NULL != subNode);
-            return new LimitStage(txn, nodeArgs["num"].numberInt(), workingSet, subNode);
+                    nullptr != subNode);
+            return new LimitStage(
+                expCtx.get(), nodeArgs["num"].numberInt(), workingSet, std ::move(subNode));
         } else if ("skip" == nodeName) {
-            uassert(
-                16938, "Skip stage doesn't have a filter (put it on the child)", NULL == matcher);
+            uassert(16938,
+                    "Skip stage doesn't have a filter (put it on the child)",
+                    nullptr == matcher);
             uassert(16932, "Node argument must be provided to skip", nodeArgs["node"].isABSONObj());
             uassert(16933, "Num argument must be provided to skip", nodeArgs["num"].isNumber());
-            PlanStage* subNode =
-                parseQuery(txn, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            std::unique_ptr<PlanStage> subNode{
+                parseQuery(expCtx, collection, nodeArgs["node"].Obj(), workingSet, nss, exprs)};
             uassert(28733,
                     "Can't parse sub-node of SKIP: " + nodeArgs["node"].Obj().toString(),
-                    NULL != subNode);
-            return new SkipStage(txn, nodeArgs["num"].numberInt(), workingSet, subNode);
+                    nullptr != subNode);
+            return new SkipStage(
+                expCtx.get(), nodeArgs["num"].numberInt(), workingSet, std::move(subNode));
         } else if ("cscan" == nodeName) {
             CollectionScanParams params;
-            params.collection = collection;
 
             // What direction?
             uassert(16963,
@@ -393,22 +410,8 @@ public:
                 params.direction = CollectionScanParams::BACKWARD;
             }
 
-            return new CollectionScan(txn, params, workingSet, matcher);
-        }
-// sort is disabled for now.
-#if 0
-            else if ("sort" == nodeName) {
-                uassert(16969, "Node argument must be provided to sort",
-                        nodeArgs["node"].isABSONObj());
-                uassert(16970, "Pattern argument must be provided to sort",
-                        nodeArgs["pattern"].isABSONObj());
-                PlanStage* subNode = parseQuery(txn, db, nodeArgs["node"].Obj(), workingSet, exprs);
-                SortStageParams params;
-                params.pattern = nodeArgs["pattern"].Obj();
-                return new SortStage(params, workingSet, subNode);
-            }
-#endif
-        else if ("mergeSort" == nodeName) {
+            return new CollectionScan(expCtx.get(), collection, params, workingSet, matcher);
+        } else if ("mergeSort" == nodeName) {
             uassert(
                 16971, "Nodes argument must be provided to sort", nodeArgs["nodes"].isABSONObj());
             uassert(16972,
@@ -419,31 +422,32 @@ public:
             params.pattern = nodeArgs["pattern"].Obj();
             // Dedup is true by default.
 
-            auto mergeStage = make_unique<MergeSortStage>(txn, params, workingSet, collection);
+            auto mergeStage = std::make_unique<MergeSortStage>(expCtx.get(), params, workingSet);
 
             BSONObjIterator it(nodeArgs["nodes"].Obj());
             while (it.more()) {
                 BSONElement e = it.next();
                 uassert(16973, "node of mergeSort isn't an obj?: " + e.toString(), e.isABSONObj());
 
-                PlanStage* subNode = parseQuery(txn, collection, e.Obj(), workingSet, exprs);
+                std::unique_ptr<PlanStage> subNode{
+                    parseQuery(expCtx, collection, e.Obj(), workingSet, nss, exprs)};
                 uassert(16974,
                         "Can't parse sub-node of mergeSort: " + e.Obj().toString(),
-                        NULL != subNode);
-                // takes ownership
-                mergeStage->addChild(subNode);
+                        nullptr != subNode);
+                mergeStage->addChild(std::move(subNode));
             }
             return mergeStage.release();
         } else if ("text" == nodeName) {
             string search = nodeArgs["search"].String();
 
-            vector<IndexDescriptor*> idxMatches;
-            collection->getIndexCatalog()->findIndexByType(txn, "text", idxMatches);
+            vector<const IndexDescriptor*> idxMatches;
+            collection->getIndexCatalog()->findIndexByType(opCtx, "text", idxMatches);
             uassert(17194, "Expected exactly one text index", idxMatches.size() == 1);
 
-            IndexDescriptor* index = idxMatches[0];
-            FTSAccessMethod* fam =
-                dynamic_cast<FTSAccessMethod*>(collection->getIndexCatalog()->getIndex(index));
+            const IndexDescriptor* index = idxMatches[0];
+            const FTSAccessMethod* fam = dynamic_cast<const FTSAccessMethod*>(
+                collection->getIndexCatalog()->getEntry(index)->accessMethod());
+            invariant(fam);
             TextStageParams params(fam->getSpec());
             params.index = index;
 
@@ -451,49 +455,44 @@ public:
             // that can only be checked for equality.  We ignore this now.
             Status s = fam->getSpec().getIndexPrefix(BSONObj(), &params.indexPrefix);
             if (!s.isOK()) {
-                // errmsg = s.toString();
-                return NULL;
+                return nullptr;
             }
 
             params.spec = fam->getSpec();
 
-            if (!params.query.parse(search,
-                                    fam->getSpec().defaultLanguage().str().c_str(),
-                                    fts::FTSQuery::caseSensitiveDefault,
-                                    fts::FTSQuery::diacriticSensitiveDefault,
-                                    fam->getSpec().getTextIndexVersion()).isOK()) {
-                return NULL;
+            params.query.setQuery(search);
+            params.query.setLanguage(fam->getSpec().defaultLanguage().str());
+            params.query.setCaseSensitive(TextMatchExpressionBase::kCaseSensitiveDefault);
+            params.query.setDiacriticSensitive(TextMatchExpressionBase::kDiacriticSensitiveDefault);
+            if (!params.query.parse(fam->getSpec().getTextIndexVersion()).isOK()) {
+                return nullptr;
             }
 
-            return new TextStage(txn, params, workingSet, matcher);
+            return new TextStage(expCtx.get(), collection, params, workingSet, matcher);
         } else if ("delete" == nodeName) {
-            uassert(
-                18636, "Delete stage doesn't have a filter (put it on the child)", NULL == matcher);
+            uassert(18636,
+                    "Delete stage doesn't have a filter (put it on the child)",
+                    nullptr == matcher);
             uassert(
                 18637, "node argument must be provided to delete", nodeArgs["node"].isABSONObj());
             uassert(18638,
                     "isMulti argument must be provided to delete",
                     nodeArgs["isMulti"].type() == Bool);
             PlanStage* subNode =
-                parseQuery(txn, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+                parseQuery(expCtx, collection, nodeArgs["node"].Obj(), workingSet, nss, exprs);
             uassert(28734,
                     "Can't parse sub-node of DELETE: " + nodeArgs["node"].Obj().toString(),
-                    NULL != subNode);
-            DeleteStageParams params;
-            params.isMulti = nodeArgs["isMulti"].Bool();
-            return new DeleteStage(txn, params, workingSet, collection, subNode);
+                    nullptr != subNode);
+            auto params = std::make_unique<DeleteStageParams>();
+            params->isMulti = nodeArgs["isMulti"].Bool();
+            return new DeleteStage(
+                expCtx.get(), std::move(params), workingSet, collection, subNode);
         } else {
-            return NULL;
+            return nullptr;
         }
     }
 };
 
-MONGO_INITIALIZER(RegisterStageDebugCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new StageDebugCmd();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(StageDebugCmd);
 
 }  // namespace mongo

@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -35,14 +36,13 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-const std::string ChangeLogType::ConfigNS = "config.changelog";
-
 const BSONField<std::string> ChangeLogType::changeId("_id");
 const BSONField<std::string> ChangeLogType::server("server");
+const BSONField<std::string> ChangeLogType::shard("shard");
 const BSONField<std::string> ChangeLogType::clientAddr("clientAddr");
 const BSONField<Date_t> ChangeLogType::time("time");
 const BSONField<std::string> ChangeLogType::what("what");
@@ -66,6 +66,15 @@ StatusWith<ChangeLogType> ChangeLogType::fromBSON(const BSONObj& source) {
         if (!status.isOK())
             return status;
         changeLog._server = changeLogServer;
+    }
+
+    {
+        std::string changeLogShard;
+        Status status =
+            bsonExtractStringFieldWithDefault(source, shard.name(), "", &changeLogShard);
+        if (!status.isOK())
+            return status;
+        changeLog._shard = changeLogShard;
     }
 
     {
@@ -94,7 +103,7 @@ StatusWith<ChangeLogType> ChangeLogType::fromBSON(const BSONObj& source) {
 
     {
         std::string changeLogNs;
-        Status status = bsonExtractStringField(source, ns.name(), &changeLogNs);
+        Status status = bsonExtractStringFieldWithDefault(source, ns.name(), "", &changeLogNs);
         if (!status.isOK())
             return status;
         changeLog._ns = changeLogNs;
@@ -129,9 +138,6 @@ Status ChangeLogType::validate() const {
     if (!_what.is_initialized() || _what->empty())
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << what.name() << " field"};
 
-    if (!_ns.is_initialized() || _ns->empty())
-        return {ErrorCodes::NoSuchKey, str::stream() << "missing " << ns.name() << " field"};
-
     if (!_details.is_initialized() || _details->isEmpty())
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << details.name() << " field"};
 
@@ -145,6 +151,8 @@ BSONObj ChangeLogType::toBSON() const {
         builder.append(changeId.name(), getChangeId());
     if (_server)
         builder.append(server.name(), getServer());
+    if (_shard)
+        builder.append(shard.name(), getShard());
     if (_clientAddr)
         builder.append(clientAddr.name(), getClientAddr());
     if (_time)
@@ -165,6 +173,10 @@ void ChangeLogType::setChangeId(const std::string& changeId) {
 
 void ChangeLogType::setServer(const std::string& server) {
     _server = server;
+}
+
+void ChangeLogType::setShard(const std::string& shard) {
+    _shard = shard;
 }
 
 void ChangeLogType::setClientAddr(const std::string& clientAddr) {

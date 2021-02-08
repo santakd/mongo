@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,12 +30,17 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
 #include <limits>
+#include <map>
+#include <string>
 
+#include <third_party/murmurhash3/MurmurHash3.h>
+
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
+#include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
 #include "mongo/config.h"
-#include "mongo/platform/hash_namespace.h"
 
 namespace mongo {
 
@@ -44,26 +50,35 @@ struct LockHead;
 struct PartitionedLockHead;
 
 /**
- * Lock modes.
+ * LockMode compatibility matrix.
  *
- * Compatibility Matrix
- *                                          Granted mode
- *   ---------------.--------------------------------------------------------.
- *   Requested Mode | MODE_NONE  MODE_IS   MODE_IX  MODE_S   MODE_X  |
- *     MODE_IS      |      +        +         +        +        -    |
- *     MODE_IX      |      +        +         +        -        -    |
- *     MODE_S       |      +        +         -        +        -    |
- *     MODE_X       |      +        -         -        -        -    |
+ * This matrix answers the question, "Is a lock request with mode 'Requested Mode' compatible with
+ * an existing lock held in mode 'Granted Mode'?"
+ *
+ * | Requested Mode |                      Granted Mode                     |
+ * |----------------|:------------:|:-------:|:--------:|:------:|:--------:|
+ * |                |  MODE_NONE   | MODE_IS |  MODE_IX | MODE_S |  MODE_X  |
+ * | MODE_IS        |      +       |    +    |     +    |    +   |          |
+ * | MODE_IX        |      +       |    +    |     +    |        |          |
+ * | MODE_S         |      +       |    +    |          |    +   |          |
+ * | MODE_X         |      +       |         |          |        |          |
  */
 enum LockMode {
+    /** None */
     MODE_NONE = 0,
+    /** Intent shared */
     MODE_IS = 1,
+    /** Intent exclusive */
     MODE_IX = 2,
+    /** Shared */
     MODE_S = 3,
+    /** Exclusive */
     MODE_X = 4,
 
-    // Counts the lock modes. Used for array size allocations, etc. Always insert new lock
-    // modes above this entry.
+    /**
+     * Counts the lock modes. Used for array size allocations, etc. Always insert new lock modes
+     * above this entry.
+     */
     LockModesCount
 };
 
@@ -118,16 +133,7 @@ enum LockResult {
     LOCK_TIMEOUT,
 
     /**
-     * The lock request was not granted because it would result in a deadlock. No changes to
-     * the state of the Locker would be made if this value is returned (i.e., it will not be
-     * killed due to deadlock). It is up to the caller to decide how to recover from this
-     * return value - could be either release some locks and try again, or just bail with an
-     * error and have some upper code handle it.
-     */
-    LOCK_DEADLOCK,
-
-    /**
-     * This is used as an initialiser value. Should never be returned.
+     * This is used as an initializer value. Should never be returned.
      */
     LOCK_INVALID
 };
@@ -147,24 +153,51 @@ enum LockResult {
  * ordering is consistent so deadlock cannot occur.
  */
 enum ResourceType {
-    // Types used for special resources, use with a hash id from ResourceId::SingletonHashIds.
     RESOURCE_INVALID = 0,
-    RESOURCE_GLOBAL,        // Used for mode changes or global exclusive operations
-    RESOURCE_MMAPV1_FLUSH,  // Necessary only for the MMAPv1 engine
 
-    // Generic resources
+    /** Parallel batch writer mode lock */
+    RESOURCE_PBWM,
+
+    /** Replication state transition lock. */
+    RESOURCE_RSTL,
+
+    /**  Used for global exclusive operations */
+    RESOURCE_GLOBAL,
+
+    /** Generic resources, used for multi-granularity locking, together with the above locks */
     RESOURCE_DATABASE,
     RESOURCE_COLLECTION,
     RESOURCE_METADATA,
 
-    // Counts the rest. Always insert new resource types above this entry.
+    /** Resource type used for locking general resources not related to the storage hierarchy. */
+    RESOURCE_MUTEX,
+
+    /** Counts the rest. Always insert new resource types above this entry. */
     ResourceTypesCount
 };
 
 /**
+ * Maps the resource id to a human-readable string.
+ */
+static const char* ResourceTypeNames[] = {"Invalid",
+                                          "ParallelBatchWriterMode",
+                                          "ReplicationStateTransition",
+                                          "Global",
+                                          "Database",
+                                          "Collection",
+                                          "Metadata",
+                                          "Mutex"};
+
+// Ensure we do not add new types without updating the names array.
+MONGO_STATIC_ASSERT((sizeof(ResourceTypeNames) / sizeof(ResourceTypeNames[0])) ==
+                    ResourceTypesCount);
+
+/**
  * Returns a human-readable name for the specified resource type.
  */
-const char* resourceTypeName(ResourceType resourceType);
+static const char* resourceTypeName(ResourceType resourceType) {
+    return ResourceTypeNames[resourceType];
+}
 
 /**
  * Uniquely identifies a lockable resource.
@@ -172,27 +205,14 @@ const char* resourceTypeName(ResourceType resourceType);
 class ResourceId {
     // We only use 3 bits for the resource type in the ResourceId hash
     enum { resourceTypeBits = 3 };
-    static_assert(ResourceTypesCount <= (1 << resourceTypeBits),
-                  "ResourceTypesCount <= (1 << resourceTypeBits)");
+    MONGO_STATIC_ASSERT(ResourceTypesCount <= (1 << resourceTypeBits));
 
 public:
-    /**
-     * Assign hash ids for special resources to avoid accidental reuse of ids. For ids used
-     * with the same ResourceType, the order here must be the same as the locking order.
-     */
-    enum SingletonHashIds {
-        SINGLETON_INVALID = 0,
-        SINGLETON_PARALLEL_BATCH_WRITER_MODE,
-        SINGLETON_GLOBAL,
-        SINGLETON_MMAPV1_FLUSH,
-        SINGLETON_CAPPED_IN_FLIGHT_OTHER_DB,
-        SINGLETON_CAPPED_IN_FLIGHT_LOCAL_DB,
-    };
-
     ResourceId() : _fullHash(0) {}
-    ResourceId(ResourceType type, StringData ns);
-    ResourceId(ResourceType type, const std::string& ns);
-    ResourceId(ResourceType type, uint64_t hashId);
+    ResourceId(ResourceType type, StringData ns) : _fullHash(fullHash(type, hashStringData(ns))) {}
+    ResourceId(ResourceType type, const std::string& ns)
+        : _fullHash(fullHash(type, hashStringData(ns))) {}
+    ResourceId(ResourceType type, uint64_t hashId) : _fullHash(fullHash(type, hashId)) {}
 
     bool isValid() const {
         return getType() != RESOURCE_INVALID;
@@ -217,6 +237,11 @@ public:
 
     std::string toString() const;
 
+    template <typename H>
+    friend H AbslHashValue(H h, const ResourceId& resource) {
+        return H::combine(std::move(h), resource._fullHash);
+    }
+
 private:
     /**
      * The top 'resourceTypeBits' bits of '_fullHash' represent the resource type,
@@ -225,19 +250,22 @@ private:
      */
     uint64_t _fullHash;
 
-    static uint64_t fullHash(ResourceType type, uint64_t hashId);
+    static uint64_t fullHash(ResourceType type, uint64_t hashId) {
+        return (static_cast<uint64_t>(type) << (64 - resourceTypeBits)) +
+            (hashId & (std::numeric_limits<uint64_t>::max() >> resourceTypeBits));
+    }
 
-#ifdef MONGO_CONFIG_DEBUG_BUILD
-    // Keep the complete namespace name for debugging purposes (TODO: this will be
-    // removed once we are confident in the robustness of the lock manager).
-    std::string _nsCopy;
-#endif
+    static uint64_t hashStringData(StringData str) {
+        char hash[16];
+        MurmurHash3_x64_128(str.rawData(), str.size(), 0, hash);
+        return static_cast<size_t>(ConstDataView(hash).read<LittleEndian<std::uint64_t>>());
+    }
 };
 
 #ifndef MONGO_CONFIG_DEBUG_BUILD
 // Treat the resource ids as 64-bit integers in release mode in order to ensure we do
 // not spend too much time doing comparisons for hashing.
-static_assert(sizeof(ResourceId) == sizeof(uint64_t), "sizeof(ResourceId) == sizeof(uint64_t)");
+MONGO_STATIC_ASSERT(sizeof(ResourceId) == sizeof(uint64_t));
 #endif
 
 
@@ -253,26 +281,20 @@ extern const ResourceId resourceIdOplog;
 // are serialized (see SERVER-16092)
 extern const ResourceId resourceIdAdminDB;
 
-// Hardcoded resource id for ParallelBatchWriterMode. We use the same resource type
-// as resourceIdGlobal. This will also ensure the waits are reported as global, which
-// is appropriate. The lock will never be contended unless the parallel batch writers
-// must stop all other accesses globally. This resource must be locked before all other
-// resources (including resourceIdGlobal). Replication applier threads don't take this
-// lock.
-// TODO: Merge this with resourceIdGlobal
+// Global lock. Every server operation, which uses the Locker must acquire this lock at least
+// once. See comments in the header file (begin/endTransaction) for more information.
+extern const ResourceId resourceIdGlobal;
+
+// Hardcoded resource id for ParallelBatchWriterMode (PBWM). The lock will never be contended unless
+// the parallel batch writers must stop all other accesses globally. This resource must be locked
+// before all other resources (including resourceIdGlobal). Replication applier threads don't take
+// this lock.
 extern const ResourceId resourceIdParallelBatchWriterMode;
 
-// Everywhere that starts in-flight capped inserts which allocate capped collection RecordIds in
-// a way that could trigger hiding of newer records takes this lock in MODE_IX and holds it
-// until the end of their WriteUnitOfWork. The localDb resource is for capped collections in the
-// local database (including the oplog). The otherDb resource is for capped collections in any other
-// database.
-//
-// Threads that need a consistent view of the world can lock both of these in MODE_X to prevent
-// concurrent in-flight capped inserts. The otherDb resource must be acquired before the localDb
-// resource.
-extern const ResourceId resourceCappedInFlightForLocalDb;
-extern const ResourceId resourceCappedInFlightForOtherDb;
+// Hardcoded resource id for the ReplicationStateTransitionLock (RSTL). This lock is acquired in
+// mode X for any replication state transition and is acquired by all other reads and writes in mode
+// IX. This lock is acquired after the PBWM but before the resourceIdGlobal.
+extern const ResourceId resourceIdReplicationStateTransitionLock;
 
 /**
  * Interface on which granted lock requests will be notified. See the contract for the notify
@@ -331,78 +353,128 @@ struct LockRequest {
      */
     void initNew(Locker* locker, LockGrantNotification* notify);
 
-
+    // This is the Locker, which created this LockRequest. Pointer is not owned, just referenced.
+    // Must outlive the LockRequest.
     //
-    // These fields are maintained by the Locker class
-    //
-
-    // This is the Locker, which created this LockRequest. Pointer is not owned, just
-    // referenced. Must outlive the LockRequest.
+    // Written at construction time by Locker
+    // Read by LockManager on any thread
+    // No synchronization
     Locker* locker;
 
-    // Not owned, just referenced. If a request is in the WAITING or CONVERTING state, must
-    // live at least until LockManager::unlock is cancelled or the notification has been
-    // invoked.
+    // Notification to be invoked when the lock is granted. Pointer is not owned, just referenced.
+    // If a request is in the WAITING or CONVERTING state, must live at least until
+    // LockManager::unlock is cancelled or the notification has been invoked.
+    //
+    // Written at construction time by Locker
+    // Read by LockManager
+    // No synchronization
     LockGrantNotification* notify;
 
-
+    // If the request cannot be granted right away, whether to put it at the front or at the end of
+    // the queue. By default, requests are put at the back. If a request is requested to be put at
+    // the front, this effectively bypasses fairness. Default is FALSE.
     //
-    // These fields are maintained by both the LockManager and Locker class
-    //
-
-    // If the request cannot be granted right away, whether to put it at the front or at the
-    // end of the queue. By default, requests are put at the back. If a request is requested
-    // to be put at the front, this effectively bypasses fairness. Default is FALSE.
+    // Written at construction time by Locker
+    // Read by LockManager on any thread
+    // No synchronization
     bool enqueueAtFront;
 
     // When this request is granted and as long as it is on the granted queue, the particular
-    // resource's policy will be changed to "compatibleFirst". This means that even if there
-    // are pending requests on the conflict queue, if a compatible request comes in it will be
-    // granted immediately. This effectively turns off fairness.
+    // resource's policy will be changed to "compatibleFirst". This means that even if there are
+    // pending requests on the conflict queue, if a compatible request comes in it will be granted
+    // immediately. This effectively turns off fairness.
+    //
+    // Written at construction time by Locker
+    // Read by LockManager on any thread
+    // No synchronization
     bool compatibleFirst;
 
-    // When set, an attempt is made to execute this request using partitioned lockheads.
-    // This speeds up the common case where all requested locking modes are compatible with
-    // each other, at the cost of extra overhead for conflicting modes.
+    // When set, an attempt is made to execute this request using partitioned lockheads. This speeds
+    // up the common case where all requested locking modes are compatible with each other, at the
+    // cost of extra overhead for conflicting modes.
+    //
+    // Written at construction time by LockManager
+    // Read by LockManager on any thread
+    // No synchronization
     bool partitioned;
 
-    // How many times has LockManager::lock been called for this request. Locks are released
-    // when their recursive count drops to zero.
+    // How many times has LockManager::lock been called for this request. Locks are released when
+    // their recursive count drops to zero.
+    //
+    // Written by LockManager on Locker thread
+    // Read by LockManager on Locker thread
+    // Read by Locker on Locker thread
+    // No synchronization
     unsigned recursiveCount;
 
+    // Pointer to the lock to which this request belongs, or null if this request has not yet been
+    // assigned to a lock or if it belongs to the PartitionedLockHead for locker (in which case
+    // partitionedLock must be set). The LockHead should be alive as long as there are LockRequests
+    // on it, so it is safe to have this pointer hanging around.
     //
-    // These fields are owned and maintained by the LockManager class exclusively
-    //
-
-
-    // Pointer to the lock to which this request belongs, or null if this request has not yet
-    // been assigned to a lock or if it belongs to the PartitionedLockHead for locker. The
-    // LockHead should be alive as long as there are LockRequests on it, so it is safe to have
-    // this pointer hanging around.
+    // Written by LockManager on any thread
+    // Read by LockManager on any thread
+    // Protected by LockHead bucket's mutex
     LockHead* lock;
 
     // Pointer to the partitioned lock to which this request belongs, or null if it is not
-    // partitioned. Only one of 'lock' and 'partitionedLock' is non-NULL, and a request can
-    // only transition from 'partitionedLock' to 'lock', never the other way around.
+    // partitioned. Only one of 'lock' and 'partitionedLock' is non-NULL, and a request can only
+    // transition from 'partitionedLock' to 'lock', never the other way around.
+    //
+    // Written by LockManager on any thread
+    // Read by LockManager on any thread
+    // Protected by LockHead bucket's mutex
     PartitionedLockHead* partitionedLock;
 
-    // The reason intrusive linked list is used instead of the std::list class is to allow
-    // for entries to be removed from the middle of the list in O(1) time, if they are known
-    // instead of having to search for them and we cannot persist iterators, because the list
-    // can be modified while an iterator is held.
+    // The linked list chain on which this request hangs off the owning lock head. The reason
+    // intrusive linked list is used instead of the std::list class is to allow for entries to be
+    // removed from the middle of the list in O(1) time, if they are known instead of having to
+    // search for them and we cannot persist iterators, because the list can be modified while an
+    // iterator is held.
+    //
+    // Written by LockManager on any thread
+    // Read by LockManager on any thread
+    // Protected by LockHead bucket's mutex
     LockRequest* prev;
     LockRequest* next;
 
-    // Current status of this request.
+    // The current status of this request. Always starts at STATUS_NEW.
+    //
+    // Written by LockManager on any thread
+    // Read by LockManager on any thread
+    // Protected by LockHead bucket's mutex
     Status status;
 
-    // If not granted, the mode which has been requested for this lock. If granted, the mode
-    // in which it is currently granted.
+    // If this request is not granted, the mode which has been requested for this lock. If granted,
+    // the mode in which it is currently granted.
+    //
+    // Written by LockManager on any thread
+    // Read by LockManager on any thread
+    // Protected by LockHead bucket's mutex
+    // Read by Locker on Locker thread
+    // It is safe for the Locker to read this without taking the bucket mutex provided that the
+    // LockRequest status is not WAITING or CONVERTING.
     LockMode mode;
 
-    // This value is different from MODE_NONE only if a conversion is requested for a lock and
-    // that conversion cannot be immediately granted.
+    // This value is different from MODE_NONE only if a conversion is requested for a lock and that
+    // conversion cannot be immediately granted.
+    //
+    // Written by LockManager on any thread
+    // Read by LockManager on any thread
+    // Protected by LockHead bucket's mutex
     LockMode convertMode;
+
+    // This unsigned represents the number of pending unlocks for this LockRequest. It is greater
+    // than 0 when the LockRequest is participating in two-phase lock and unlock() is called on it.
+    // It can be greater than 1 if this lock is participating in two-phase-lock and has been
+    // converted to a different mode that also participates in two-phase-lock. unlock() may be
+    // called multiple times on the same resourceId within the same WriteUnitOfWork in this case, so
+    // the number of unlocks() to execute at the end of this WUOW is tracked with this unsigned.
+    //
+    // Written by Locker on Locker thread
+    // Read by Locker on Locker thread
+    // No synchronization
+    unsigned unlockPending = 0;
 };
 
 /**
@@ -411,13 +483,3 @@ struct LockRequest {
 const char* lockRequestStatusName(LockRequest::Status status);
 
 }  // namespace mongo
-
-
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<mongo::ResourceId> {
-    size_t operator()(const mongo::ResourceId& resource) const {
-        return resource;
-    }
-};
-MONGO_HASH_NAMESPACE_END

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,13 +30,13 @@
 #include "mongo/db/query/expression_index.h"
 
 #include <iostream>
+#include <unordered_set>
 
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/r2_region_coverer.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/expression_params.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/db/query/expression_index_knobs.h"
+#include "mongo/db/query/expression_index_knobs_gen.h"
 #include "third_party/s2/s2cellid.h"
 #include "third_party/s2/s2region.h"
 #include "third_party/s2/s2regioncoverer.h"
@@ -70,13 +71,12 @@ static std::string toCoveringString(const GeoHashConverter& hashConverter,
 std::vector<GeoHash> ExpressionMapping::get2dCovering(const R2Region& region,
                                                       const BSONObj& indexInfoObj,
                                                       int maxCoveringCells) {
-    GeoHashConverter::Parameters hashParams;
-    Status paramStatus = GeoHashConverter::parseParameters(indexInfoObj, &hashParams);
-    verify(paramStatus.isOK());  // We validated the parameters when creating the index
+    auto result = GeoHashConverter::createFromDoc(indexInfoObj);
+    verify(result.isOK());  // We validated the parameters when creating the index.
 
-    GeoHashConverter hashConverter(hashParams);
-    R2RegionCoverer coverer(&hashConverter);
-    coverer.setMaxLevel(hashConverter.getBits());
+    const auto bits = result.getValue()->getBits();
+    R2RegionCoverer coverer(std::move(result.getValue()));
+    coverer.setMaxLevel(bits);
     coverer.setMaxCells(maxCoveringCells);
 
     // TODO: Maybe slightly optimize by returning results in order
@@ -94,8 +94,8 @@ void ExpressionMapping::GeoHashsToIntervalsWithParents(
         geoHash.appendHashMin(&builder, "");
         geoHash.appendHashMax(&builder, "");
 
-        oilOut->intervals.push_back(
-            IndexBoundsBuilder::makeRangeInterval(builder.obj(), true, true));
+        oilOut->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+            builder.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
     }
 }
 
@@ -108,20 +108,17 @@ void ExpressionMapping::cover2d(const R2Region& region,
 }
 
 std::vector<S2CellId> ExpressionMapping::get2dsphereCovering(const S2Region& region) {
-    uassert(28739,
-            "Geo coarsest level must be in range [0,30]",
-            0 <= internalQueryS2GeoCoarsestLevel && internalQueryS2GeoCoarsestLevel <= 30);
-    uassert(28740,
-            "Geo finest level must be in range [0,30]",
-            0 <= internalQueryS2GeoFinestLevel && internalQueryS2GeoFinestLevel <= 30);
-    uassert(28741,
-            "Geo coarsest level must be less than or equal to finest",
-            internalQueryS2GeoCoarsestLevel <= internalQueryS2GeoFinestLevel);
+    auto minLevel = gInternalQueryS2GeoCoarsestLevel.load();
+    auto maxLevel = gInternalQueryS2GeoFinestLevel.load();
+
+    uassert(28739, "Geo coarsest level must be in range [0,30]", 0 <= minLevel && minLevel <= 30);
+    uassert(28740, "Geo finest level must be in range [0,30]", 0 <= maxLevel && maxLevel <= 30);
+    uassert(28741, "Geo coarsest level must be less than or equal to finest", minLevel <= maxLevel);
 
     S2RegionCoverer coverer;
-    coverer.set_min_level(internalQueryS2GeoCoarsestLevel);
-    coverer.set_max_level(internalQueryS2GeoFinestLevel);
-    coverer.set_max_cells(internalQueryS2GeoMaxCells);
+    coverer.set_min_level(minLevel);
+    coverer.set_max_level(maxLevel);
+    coverer.set_max_cells(gInternalQueryS2GeoMaxCells.load());
 
     std::vector<S2CellId> cover;
     coverer.GetCovering(region, &cover);
@@ -151,7 +148,8 @@ void S2CellIdsToIntervalsUnsorted(const std::vector<S2CellId>& intervalSet,
             b.append("start", start);
             b.append("end", end);
             invariant(start <= end);
-            oilOut->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(b.obj(), true, true));
+            oilOut->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+                b.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
         } else {
             // for backwards compatibility, use strings
             std::string start = interval.toString();
@@ -159,8 +157,8 @@ void S2CellIdsToIntervalsUnsorted(const std::vector<S2CellId>& intervalSet,
             end[start.size() - 1]++;
             b.append("start", start);
             b.append("end", end);
-            oilOut->intervals.push_back(
-                IndexBoundsBuilder::makeRangeInterval(b.obj(), true, false));
+            oilOut->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+                b.obj(), BoundInclusion::kIncludeStartKeyOnly));
         }
     }
 }
@@ -186,7 +184,7 @@ void ExpressionMapping::S2CellIdsToIntervalsWithParents(const std::vector<S2Cell
                                                         const S2IndexingParams& indexParams,
                                                         OrderedIntervalList* oilOut) {
     // There may be duplicates when going up parent cells if two cells share a parent
-    std::unordered_set<S2CellId> exactSet;
+    std::unordered_set<S2CellId> exactSet;  // NOLINT
     for (const S2CellId& interval : intervalSet) {
         S2CellId coveredCell = interval;
         // Look at the cells that cover us.  We want to look at every cell that contains the

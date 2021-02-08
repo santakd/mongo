@@ -9,6 +9,7 @@ import textwrap
 import distutils.sysconfig
 
 EnsureSConsVersion( 2, 0, 0 )
+EnsurePythonVersion(3, 0)
 
 if not os.sys.platform == "win32":
     print ("SConstruct is only supported for Windows, use build_posix for other platforms")
@@ -37,17 +38,11 @@ AddOption("--enable-snappy", dest="snappy", type="string", nargs=1, action="stor
 AddOption("--enable-tcmalloc", dest="tcmalloc", type="string", nargs=1, action="store",
           help="Use TCMalloc for memory allocation")
 
-AddOption("--enable-verbose", dest="verbose", action="store_true", default=False,
-          help="Configure WiredTiger to support the verbose configuration string to wiredtiger_open")
-
 AddOption("--enable-zlib", dest="zlib", type="string", nargs=1, action="store",
           help="Use zlib compression")
 
 AddOption("--prefix", dest="prefix", type="string", nargs=1, action="store", default="package",
           help="Install directory")
-
-AddOption("--with-berkeley-db", dest="bdb", type="string", nargs=1, action="store",
-          help="Berkeley DB install path, ie, /usr/local")
 
 # Get the swig binary from the command line option since SCONS cannot find it automatically
 #
@@ -66,16 +61,15 @@ var.Add('CPPPATH', 'C Preprocessor include path', [
     "#/.",
 ])
 
+var.Add('LIBPATH', 'Adds paths to the linker search path', [])
+
 var.Add('CFLAGS', 'C Compiler Flags', [
-    "/Z7", # Generate debugging symbols
+    "/W3", # Warning level 3
+    "/WX", # Warnings are fatal
     "/wd4090", # Ignore warning about mismatched const qualifiers
     "/wd4996", # Ignore deprecated functions
-    "/W3", # Warning level 3
-    #"/we4244", # Possible loss of data
-    "/we4013", # Error on undefined functions
-    #"/we4047", # Indirection differences in types
-    #"/we4024", # Differences in parameter types
-    #"/we4100", # Unreferenced local parameter
+    "/we4100", # Complain about unreferenced format parameter
+    "/Z7", # Generate debugging symbols
     "/TC", # Compile as C code
     #"/Od", # Disable optimization
     "/Ob1", # inline expansion
@@ -115,13 +109,12 @@ env['STATIC_AND_SHARED_OBJECTS_ARE_THE_SAME'] = 1
 useZlib = GetOption("zlib")
 useSnappy = GetOption("snappy")
 useLz4 = GetOption("lz4")
-useBdb = GetOption("bdb")
 useTcmalloc = GetOption("tcmalloc")
 wtlibs = []
 
 conf = Configure(env)
 if not conf.CheckCHeader('stdlib.h'):
-    print 'stdlib.h must be installed!'
+    print('stdlib.h must be installed!')
     Exit(1)
 
 if useZlib:
@@ -131,7 +124,7 @@ if useZlib:
         conf.env.Append(CPPDEFINES=["HAVE_BUILTIN_EXTENSION_ZLIB"])
         wtlibs.append("zlib")
     else:
-        print 'zlib.h must be installed!'
+        print('zlib.h must be installed!')
         Exit(1)
 
 if useSnappy:
@@ -141,7 +134,7 @@ if useSnappy:
         conf.env.Append(CPPDEFINES=['HAVE_BUILTIN_EXTENSION_SNAPPY'])
         wtlibs.append("snappy")
     else:
-        print 'snappy-c.h must be installed!'
+        print('snappy-c.h must be installed!')
         Exit(1)
 
 if useLz4:
@@ -151,14 +144,7 @@ if useLz4:
         conf.env.Append(CPPDEFINES=['HAVE_BUILTIN_EXTENSION_LZ4'])
         wtlibs.append("lz4")
     else:
-        print 'lz4.h must be installed!'
-        Exit(1)
-
-if useBdb:
-    conf.env.Append(CPPPATH=[useBdb+ "/include"])
-    conf.env.Append(LIBPATH=[useBdb+ "/lib"])
-    if not conf.CheckCHeader('db.h'):
-        print 'db.h must be installed!'
+        print('lz4.h must be installed!')
         Exit(1)
 
 if useTcmalloc:
@@ -167,8 +153,9 @@ if useTcmalloc:
     if conf.CheckCHeader('gperftools/tcmalloc.h'):
         wtlibs.append("libtcmalloc_minimal")
         conf.env.Append(CPPDEFINES=['HAVE_LIBTCMALLOC'])
+        conf.env.Append(CPPDEFINES=['HAVE_POSIX_MEMALIGN'])
     else:
-        print 'tcmalloc.h must be installed!'
+        print('tcmalloc.h must be installed!')
         Exit(1)
 
 env = conf.Finish()
@@ -184,9 +171,6 @@ if GetOption("diagnostic"):
 if GetOption("lang-python"):
     env.Append(LIBPATH=[distutils.sysconfig.PREFIX + r"\libs"])
     env.Append(CPPPATH=[distutils.sysconfig.get_python_inc()])
-
-if GetOption("verbose"):
-    env.Append(CPPDEFINES = ["HAVE_VERBOSE"])
 
 
 # Build WiredTiger.h file
@@ -207,12 +191,13 @@ if (VERSION_MAJOR == None or
     VERSION_MINOR == None or
     VERSION_PATCH == None or
     VERSION_STRING == None):
-    print "Failed to find version variables in " + version_file
+    print("Failed to find version variables in " + version_file)
     Exit(1)
 
 wiredtiger_includes = """
         #include <sys/types.h>
         #include <stdarg.h>
+        #include <stdbool.h>
         #include <stdint.h>
         #include <stdio.h>
     """
@@ -238,12 +223,29 @@ wtheader = env.Substfile(
 #
 # WiredTiger library
 #
-filelistfile = r'build_win\filelist.win'
-filelist = open(filelistfile)
-wtsources = [line.strip()
-             for line in filelist
-             if not line.startswith("#") and len(line) > 1]
-filelist.close()
+# Map WiredTiger build conditions: any conditions that appear in WiredTiger's
+# dist/filelist must appear here, and if the value is true, those files will be
+# included.
+#
+condition_map = {
+    'ARM64_HOST' : False,
+    'POSIX_HOST' : env['PLATFORM'] == 'posix',
+    'POWERPC_HOST' : False,
+    'WINDOWS_HOST' : env['PLATFORM'] == 'win32',
+    'X86_HOST' : True,
+    'ZSERIES_HOST' : False,
+}
+
+def filtered_filelist(f):
+    for line in f:
+        file_cond = line.split()
+        if line.startswith("#") or len(file_cond) == 0:
+            continue
+        if len(file_cond) == 1 or condition_map[file_cond[1]]:
+            yield file_cond[0]
+
+filelistfile = r'dist/filelist'
+wtsources = list(filtered_filelist(open(filelistfile)))
 
 if useZlib:
     wtsources.append("ext/compressors/zlib/zlib_compress.c")
@@ -275,10 +277,12 @@ env.Depends(wtdll, [filelistfile, version_file])
 Default(wtlib, wtdll)
 
 wtbin = env.Program("wt", [
+    "src/utilities/util_alter.c",
     "src/utilities/util_backup.c",
-    "src/utilities/util_cpyright.c",
     "src/utilities/util_compact.c",
+    "src/utilities/util_cpyright.c",
     "src/utilities/util_create.c",
+    "src/utilities/util_downgrade.c",
     "src/utilities/util_drop.c",
     "src/utilities/util_dump.c",
     "src/utilities/util_list.c",
@@ -292,6 +296,7 @@ wtbin = env.Program("wt", [
     "src/utilities/util_rename.c",
     "src/utilities/util_salvage.c",
     "src/utilities/util_stat.c",
+    "src/utilities/util_truncate.c",
     "src/utilities/util_upgrade.c",
     "src/utilities/util_verbose.c",
     "src/utilities/util_verify.c",
@@ -305,7 +310,7 @@ if GetOption("lang-python"):
     # Check that this version of python is 64-bit
     #
     if sys.maxsize < 2**32:
-        print "The Python Interpreter must be 64-bit in order to build the python bindings"
+        print("The Python Interpreter must be 64-bit in order to build the python bindings")
         Exit(1)
 
     pythonEnv = env.Clone()
@@ -316,21 +321,31 @@ if GetOption("lang-python"):
             "-nodefaultctor",
             "-nodefaultdtor",
             ])
+    # Ignore warnings in swig-generated code.
+    pythonEnv['CFLAGS'].remove("/WX")
+    pythonEnv['CFLAGS'].remove("/we4100")
 
     swiglib = pythonEnv.SharedLibrary('_wiredtiger',
                       [ 'lang\python\wiredtiger.i'],
                       SHLIBSUFFIX=".pyd",
                       LIBS=[wtlib] + wtlibs)
 
-    copySwig = pythonEnv.Command(
-        'lang/python/wiredtiger/__init__.py',
+    # Shuffle the wiredtiger __init__ into place.
+    copySwig1 = pythonEnv.Command(
+        'lang/python/wiredtiger/swig_wiredtiger.py',
         'lang/python/wiredtiger.py',
         Copy('$TARGET', '$SOURCE'))
-    pythonEnv.Depends(copySwig, swiglib)
+    pythonEnv.Depends(copySwig1, swiglib)
+
+    copySwig2 = pythonEnv.Command(
+        'lang/python/wiredtiger/__init__.py',
+        'lang/python/wiredtiger/init.py',
+        Copy('$TARGET', '$SOURCE'))
+    pythonEnv.Depends(copySwig2, swiglib)
 
     swiginstall = pythonEnv.Install('lang/python/wiredtiger/', swiglib)
 
-    Default(swiginstall, copySwig)
+    Default(swiginstall, copySwig1, copySwig2)
 
 # Shim library of functions to emulate POSIX on Windows
 shim = env.Library("window_shim",
@@ -340,21 +355,20 @@ shim = env.Library("window_shim",
 
 examples = [
     "ex_access",
-    "ex_all",
-    "ex_async",
+    # Temporarily disabled
+    # "ex_all",
     "ex_call_center",
-    "ex_config",
     "ex_config_parse",
     "ex_cursor",
     "ex_data_source",
     "ex_encrypt",
     "ex_extending",
+    "ex_file_system",
     "ex_hello",
     "ex_log",
     "ex_pack",
     "ex_process",
     "ex_schema",
-    "ex_scope",
     "ex_stat",
     "ex_thread",
     ]
@@ -362,7 +376,7 @@ examples = [
 # WiredTiger Smoke Test support
 # Runs each test in a custom temporary directory
 def run_smoke_test(x):
-    print "Running Smoke Test: " + x
+    print("Running Smoke Test: " + x)
 
     # Make temp dir
     temp_dir = tempfile.mkdtemp(prefix="wt_home")
@@ -389,87 +403,75 @@ def builder_smoke_test(target, source, env):
 env.Append(BUILDERS={'SmokeTest' : Builder(action = builder_smoke_test)})
 
 #Build the tests and setup the "scons test" target
+testutil = env.Library('testutil',
+            [
+                'test/utility/misc.c',
+                'test/utility/parse_opts.c'
+            ])
+env.Append(CPPPATH=["test/utility"])
 
-#Don't test bloom on Windows, its broken
 t = env.Program("t_bloom",
     "test/bloom/test_bloom.c",
-    LIBS=[wtlib] + wtlibs)
-#env.Alias("check", env.SmokeTest(t))
+    LIBS=[wtlib, shim, testutil] + wtlibs)
 Default(t)
 
-#env.Program("t_checkpoint",
-    #["test/checkpoint/checkpointer.c",
-    #"test/checkpoint/test_checkpoint.c",
-    #"test/checkpoint/workers.c"],
-    #LIBS=[wtlib])
+t = env.Program("t_checkpoint",
+    ["test/checkpoint/checkpointer.c",
+    "test/checkpoint/test_checkpoint.c",
+    "test/checkpoint/workers.c"],
+    LIBS=[wtlib, shim, testutil] + wtlibs)
+Default(t)
 
-t = env.Program("t_huge",
-    "test/huge/huge.c",
-    LIBS=[wtlib] + wtlibs)
-#env.Alias("check", env.SmokeTest(t))
+t = env.Program("t_cursor_order",
+    ["test/cursor_order/cursor_order.c",
+    "test/cursor_order/cursor_order_file.c",
+    "test/cursor_order/cursor_order_ops.c"],
+    LIBS=[wtlib, shim, testutil] + wtlibs)
 Default(t)
 
 t = env.Program("t_fops",
     ["test/fops/file.c",
     "test/fops/fops.c",
     "test/fops/t.c"],
-    LIBS=[wtlib, shim] + wtlibs)
-env.Append(CPPPATH=["test/utility"])
-env.Alias("check", env.SmokeTest(t))
+    LIBS=[wtlib, shim, testutil] + wtlibs)
 Default(t)
 
-if useBdb:
-    benv = env.Clone()
+t = env.Program("t_huge",
+    "test/huge/huge.c",
+    LIBS=[wtlib, shim, testutil] + wtlibs)
+Default(t)
 
-    benv.Append(CPPDEFINES=['BERKELEY_DB_PATH=\\"' + useBdb.replace("\\", "\\\\") + '\\"'])
-
-    t = benv.Program("t_format",
-        ["test/format/backup.c",
-        "test/format/bdb.c",
-        "test/format/bulk.c",
-        "test/format/compact.c",
-        "test/format/config.c",
-        "test/format/ops.c",
-        "test/format/salvage.c",
-        "test/format/t.c",
-        "test/format/util.c",
-        "test/format/wts.c"],
-         LIBS=[wtlib, shim, "libdb61"] + wtlibs)
-    env.Alias("test", env.SmokeTest(t))
-    Default(t)
-
-#env.Program("t_thread",
-    #["test/thread/file.c",
-    #"test/thread/rw.c",
-    #"test/thread/stats.c",
-    #"test/thread/t.c"],
-    #LIBS=[wtlib])
-
-#env.Program("t_salvage",
-    #["test/salvage/salvage.c"],
-    #LIBS=[wtlib])
+t = env.Program("t_manydbs",
+    "test/manydbs/manydbs.c",
+    LIBS=[wtlib, shim, testutil] + wtlibs)
+Default(t)
 
 t = env.Program("wtperf", [
     "bench/wtperf/config.c",
+    "bench/wtperf/idle_table_cycle.c",
     "bench/wtperf/misc.c",
     "bench/wtperf/track.c",
     "bench/wtperf/wtperf.c",
+    "bench/wtperf/wtperf_throttle.c",
     "bench/wtperf/wtperf_truncate.c",
     ],
-    LIBS=[wtlib, shim]  + wtlibs)
+    LIBS=[wtlib, shim, testutil] + wtlibs)
+Default(t)
+
+t = env.Program('wt2695_checksum', ['test/csuite/wt2695_checksum/main.c'],
+    LIBS=[wtlib, shim, testutil] + wtlibs)
+Default(t)
+
+t = env.Program('wt4117_checksum', ['test/csuite/wt4117_checksum/main.c'],
+    LIBS=[wtlib, shim, testutil] + wtlibs)
 Default(t)
 
 #Build the Examples
 for ex in examples:
-    if(ex in ['ex_all', 'ex_async', 'ex_thread', 'ex_encrypt']):
-        exp = env.Program(ex, "examples/c/" + ex + ".c", LIBS=[wtlib, shim] + wtlibs)
-        Default(exp)
+    exp = env.Program(ex, "examples/c/" + ex + ".c", LIBS=[wtlib, shim, testutil] + wtlibs)
+    Default(exp)
+    if not ex == 'ex_log':
         env.Alias("check", env.SmokeTest(exp))
-    else:
-        exp = env.Program(ex, "examples/c/" + ex + ".c", LIBS=[wtdll[1]] + wtlibs)
-        Default(exp)
-        if not ex == 'ex_log':
-            env.Alias("check", env.SmokeTest(exp))
 
 # Install Target
 #

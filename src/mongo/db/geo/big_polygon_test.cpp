@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,15 +29,15 @@
 
 #include "mongo/db/geo/big_polygon.h"
 
-#include "mongo/bson/util/builder.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
 using namespace mongo;
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 // Helper to build a vector of S2Point
@@ -247,9 +248,9 @@ TEST(BigSimplePolygon, BasicComplementWithHole) {
 
     // 4. BigPolygon contains the right half of holePoly
     // Everything *not* in a 40x40 square centered at [0,20]
-    BigSimplePolygon bigPoly40CompOffset(loop(points() << LatLng(20.0, 40.0) << LatLng(20.0, 0.0)
-                                                       << LatLng(-20.0, 0.0)
-                                                       << LatLng(-20.0, 40.0)));
+    BigSimplePolygon bigPoly40CompOffset(loop(points()
+                                              << LatLng(20.0, 40.0) << LatLng(20.0, 0.0)
+                                              << LatLng(-20.0, 0.0) << LatLng(-20.0, 40.0)));
     bigPoly40CompOffset.Invert();
     ASSERT_GREATER_THAN(bigPoly40CompOffset.GetArea(), 2 * M_PI);
     ASSERT_FALSE(bigPoly40CompOffset.Contains(holePoly));
@@ -299,9 +300,9 @@ TEST(BigSimplePolygon, BasicComplementWithHoleAndShell) {
 
     // 4. BigPolygon contains the right half of shellPoly
     // Everything *not* in a 40x40 square centered at [0,20]
-    BigSimplePolygon bigPoly40CompOffset(loop(points() << LatLng(20.0, 40.0) << LatLng(20.0, 0.0)
-                                                       << LatLng(-20.0, 0.0)
-                                                       << LatLng(-20.0, 40.0)));
+    BigSimplePolygon bigPoly40CompOffset(loop(points()
+                                              << LatLng(20.0, 40.0) << LatLng(20.0, 0.0)
+                                              << LatLng(-20.0, 0.0) << LatLng(-20.0, 40.0)));
     bigPoly40CompOffset.Invert();
     ASSERT_GREATER_THAN(bigPoly40CompOffset.GetArea(), 2 * M_PI);
     ASSERT_FALSE(bigPoly40CompOffset.Contains(shellPoly));
@@ -459,10 +460,12 @@ void checkConsistency(const BigSimplePolygon& bigPoly,
                       const BigSimplePolygon& expandedBigPoly,
                       const TShape& shape) {
     // Contain() => Intersects()
-    if (bigPoly.Contains(shape))
+    if (bigPoly.Contains(shape)) {
         ASSERT(bigPoly.Intersects(shape));
-    if (expandedBigPoly.Contains(shape))
+    }
+    if (expandedBigPoly.Contains(shape)) {
         ASSERT(expandedBigPoly.Intersects(shape));
+    }
     // Relation doesn't change
     ASSERT_EQUALS(bigPoly.Contains(shape), expandedBigPoly.Contains(shape));
     ASSERT_EQUALS(bigPoly.Intersects(shape), expandedBigPoly.Intersects(shape));
@@ -564,4 +567,4 @@ TEST(BigSimplePolygon, ShareEdgeContained) {
     checkConsistency(bigPoly, expandedBigPoly, line);
     checkConsistency(bigPoly, expandedBigPoly, collinearLine);
 }
-}
+}  // namespace

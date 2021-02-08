@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -34,19 +35,74 @@
 
 #include "mongo/bson/bsontypes.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
 namespace {
 
+const char kCursorsField[] = "cursors";
 const char kCursorField[] = "cursor";
 const char kIdField[] = "id";
 const char kNsField[] = "ns";
+const char kAtClusterTimeField[] = "atClusterTime";
 const char kBatchField[] = "nextBatch";
 const char kBatchFieldInitial[] = "firstBatch";
+const char kBatchDocSequenceField[] = "cursor.nextBatch";
+const char kBatchDocSequenceFieldInitial[] = "cursor.firstBatch";
+const char kPostBatchResumeTokenField[] = "postBatchResumeToken";
+const char kPartialResultsReturnedField[] = "partialResultsReturned";
 
 }  // namespace
+
+CursorResponseBuilder::CursorResponseBuilder(rpc::ReplyBuilderInterface* replyBuilder,
+                                             Options options = Options())
+    : _options(options), _replyBuilder(replyBuilder) {
+    if (_options.useDocumentSequences) {
+        _docSeqBuilder.emplace(_replyBuilder->getDocSequenceBuilder(
+            _options.isInitialResponse ? kBatchDocSequenceFieldInitial : kBatchDocSequenceField));
+    } else {
+        _bodyBuilder.emplace(_replyBuilder->getBodyBuilder());
+        _cursorObject.emplace(_bodyBuilder->subobjStart(kCursorField));
+        _batch.emplace(_cursorObject->subarrayStart(_options.isInitialResponse ? kBatchFieldInitial
+                                                                               : kBatchField));
+    }
+}
+
+void CursorResponseBuilder::done(CursorId cursorId, StringData cursorNamespace) {
+    invariant(_active);
+    if (_options.useDocumentSequences) {
+        _docSeqBuilder.reset();
+        _bodyBuilder.emplace(_replyBuilder->getBodyBuilder());
+        _cursorObject.emplace(_bodyBuilder->subobjStart(kCursorField));
+    } else {
+        _batch.reset();
+    }
+    if (!_postBatchResumeToken.isEmpty()) {
+        _cursorObject->append(kPostBatchResumeTokenField, _postBatchResumeToken);
+    }
+    if (_partialResultsReturned) {
+        _cursorObject->append(kPartialResultsReturnedField, true);
+    }
+    _cursorObject->append(kIdField, cursorId);
+    _cursorObject->append(kNsField, cursorNamespace);
+    if (_options.atClusterTime) {
+        _cursorObject->append(kAtClusterTimeField, _options.atClusterTime->asTimestamp());
+    }
+    _cursorObject.reset();
+
+    _bodyBuilder.reset();
+    _active = false;
+}
+
+void CursorResponseBuilder::abandon() {
+    invariant(_active);
+    _batch.reset();
+    _cursorObject.reset();
+    _bodyBuilder.reset();
+    _replyBuilder->reset();
+    _numDocs = 0;
+    _active = false;
+}
 
 void appendCursorResponseObject(long long cursorId,
                                 StringData cursorNamespace,
@@ -73,38 +129,48 @@ void appendGetMoreResponseObject(long long cursorId,
 CursorResponse::CursorResponse(NamespaceString nss,
                                CursorId cursorId,
                                std::vector<BSONObj> batch,
-                               boost::optional<long long> numReturnedSoFar)
+                               boost::optional<Timestamp> atClusterTime,
+                               boost::optional<long long> numReturnedSoFar,
+                               boost::optional<BSONObj> postBatchResumeToken,
+                               boost::optional<BSONObj> writeConcernError,
+                               bool partialResultsReturned)
     : _nss(std::move(nss)),
       _cursorId(cursorId),
       _batch(std::move(batch)),
-      _numReturnedSoFar(numReturnedSoFar) {}
+      _atClusterTime(std::move(atClusterTime)),
+      _numReturnedSoFar(numReturnedSoFar),
+      _postBatchResumeToken(std::move(postBatchResumeToken)),
+      _writeConcernError(std::move(writeConcernError)),
+      _partialResultsReturned(partialResultsReturned) {}
 
-#if defined(_MSC_VER) && _MSC_VER < 1900
-CursorResponse::CursorResponse(CursorResponse&& other)
-    : _nss(std::move(other._nss)),
-      _cursorId(std::move(other._cursorId)),
-      _batch(std::move(other._batch)),
-      _numReturnedSoFar(std::move(other._numReturnedSoFar)) {}
+std::vector<StatusWith<CursorResponse>> CursorResponse::parseFromBSONMany(
+    const BSONObj& cmdResponse) {
+    std::vector<StatusWith<CursorResponse>> cursors;
+    BSONElement cursorsElt = cmdResponse[kCursorsField];
 
-CursorResponse& CursorResponse::operator=(CursorResponse&& other) {
-    _nss = std::move(other._nss);
-    _cursorId = std::move(other._cursorId);
-    _batch = std::move(other._batch);
-    _numReturnedSoFar = std::move(other._numReturnedSoFar);
-    return *this;
+    // If there is not "cursors" array then treat it as a single cursor response
+    if (cursorsElt.type() != BSONType::Array) {
+        cursors.push_back(parseFromBSON(cmdResponse));
+    } else {
+        BSONObj cursorsObj = cursorsElt.embeddedObject();
+        for (BSONElement elt : cursorsObj) {
+            if (elt.type() != BSONType::Object) {
+                cursors.push_back({ErrorCodes::BadValue,
+                                   str::stream()
+                                       << "Cursors array element contains non-object element: "
+                                       << elt});
+            } else {
+                cursors.push_back(parseFromBSON(elt.Obj()));
+            }
+        }
+    }
+
+    return cursors;
 }
-#endif
 
 StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdResponse) {
     Status cmdStatus = getStatusFromCommandResult(cmdResponse);
     if (!cmdStatus.isOK()) {
-        if (ErrorCodes::isStaleShardingError(cmdStatus.code())) {
-            auto vWanted = ChunkVersion::fromBSON(cmdResponse, "vWanted");
-            auto vReceived = ChunkVersion::fromBSON(cmdResponse, "vReceived");
-            if (!vWanted.hasEqualEpoch(vReceived)) {
-                return Status(ErrorCodes::StaleEpoch, cmdStatus.reason());
-            }
-        }
         return cmdStatus;
     }
 
@@ -151,15 +217,62 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
     std::vector<BSONObj> batch;
     for (BSONElement elt : batchObj) {
         if (elt.type() != BSONType::Object) {
-            return {
-                ErrorCodes::BadValue,
-                str::stream() << "getMore response batch contains a non-object element: " << elt};
+            return {ErrorCodes::BadValue,
+                    str::stream() << "getMore response batch contains a non-object element: "
+                                  << elt};
         }
 
-        batch.push_back(elt.Obj().getOwned());
+        batch.push_back(elt.Obj());
     }
 
-    return {{NamespaceString(fullns), cursorId, batch}};
+    for (auto& doc : batch) {
+        doc.shareOwnershipWith(cmdResponse);
+    }
+
+    auto postBatchResumeTokenElem = cursorObj[kPostBatchResumeTokenField];
+    if (postBatchResumeTokenElem && postBatchResumeTokenElem.type() != BSONType::Object) {
+        return {ErrorCodes::BadValue,
+                str::stream() << kPostBatchResumeTokenField
+                              << " format is invalid; expected Object, but found: "
+                              << postBatchResumeTokenElem.type()};
+    }
+
+    auto atClusterTimeElem = cursorObj[kAtClusterTimeField];
+    if (atClusterTimeElem && atClusterTimeElem.type() != BSONType::bsonTimestamp) {
+        return {ErrorCodes::BadValue,
+                str::stream() << kAtClusterTimeField
+                              << " format is invalid; expected Timestamp, but found: "
+                              << atClusterTimeElem.type()};
+    }
+
+    auto partialResultsReturned = cursorObj[kPartialResultsReturnedField];
+
+    if (partialResultsReturned) {
+        if (partialResultsReturned.type() != BSONType::Bool) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << kPartialResultsReturnedField
+                                  << " format is invalid; expected Bool, but found: "
+                                  << partialResultsReturned.type()};
+        }
+    }
+
+    auto writeConcernError = cmdResponse["writeConcernError"];
+
+    if (writeConcernError && writeConcernError.type() != BSONType::Object) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "invalid writeConcernError format; expected object but found: "
+                              << writeConcernError.type()};
+    }
+
+    return {{NamespaceString(fullns),
+             cursorId,
+             std::move(batch),
+             atClusterTimeElem ? atClusterTimeElem.timestamp() : boost::optional<Timestamp>{},
+             boost::none,
+             postBatchResumeTokenElem ? postBatchResumeTokenElem.Obj().getOwned()
+                                      : boost::optional<BSONObj>{},
+             writeConcernError ? writeConcernError.Obj().getOwned() : boost::optional<BSONObj>{},
+             partialResultsReturned.trueValue()}};
 }
 
 void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
@@ -177,9 +290,25 @@ void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
     }
     batchBuilder.doneFast();
 
+    if (_postBatchResumeToken && !_postBatchResumeToken->isEmpty()) {
+        cursorBuilder.append(kPostBatchResumeTokenField, *_postBatchResumeToken);
+    }
+
+    if (_atClusterTime) {
+        cursorBuilder.append(kAtClusterTimeField, *_atClusterTime);
+    }
+
+    if (_partialResultsReturned) {
+        cursorBuilder.append(kPartialResultsReturnedField, true);
+    }
+
     cursorBuilder.doneFast();
 
     builder->append("ok", 1.0);
+
+    if (_writeConcernError) {
+        builder->append("writeConcernError", *_writeConcernError);
+    }
 }
 
 BSONObj CursorResponse::toBSON(CursorResponse::ResponseType responseType) const {

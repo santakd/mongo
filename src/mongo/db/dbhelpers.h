@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,19 +29,17 @@
 
 #pragma once
 
-#include <memory>
-#include <boost/filesystem/path.hpp>
-
-#include "mongo/db/db.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/update_result.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
 
 class Collection;
-class Cursor;
+class CollectionPtr;
+class Database;
 class OperationContext;
-struct KeyRange;
-struct WriteConcernOptions;
+class QueryRequest;
 
 /**
  * db helpers are helper functions and classes that let us easily manipulate the local
@@ -49,62 +48,54 @@ struct WriteConcernOptions;
  * all helpers assume locking is handled above them
  */
 struct Helpers {
-    class RemoveSaver;
-
-    /* ensure the specified index exists.
-
-       @param keyPattern key pattern, e.g., { ts : 1 }
-       @param name index name, e.g., "name_1"
-
-       This method can be a little (not much) cpu-slow, so you may wish to use
-         OCCASIONALLY ensureIndex(...);
-
-       Note: does nothing if collection does not yet exist.
-    */
-    static void ensureIndex(OperationContext* txn,
-                            Collection* collection,
-                            BSONObj keyPattern,
-                            bool unique,
-                            const char* name);
-
-    /* fetch a single object from collection ns that matches query.
-       set your db SavedContext first.
-
-       @param query - the query to perform.  note this is the low level portion of query so
-                      "orderby : ..." won't work.
-
-       @param requireIndex if true, assert if no index for the query.  a way to guard against
-       writing a slow query.
-
-       @return true if object found
-    */
-    static bool findOne(OperationContext* txn,
-                        Collection* collection,
+    /**
+     * Executes the given match expression ('query') and returns true if there is at least one
+     * one matching document. The first found matching document is returned via the 'result' output
+     * parameter.
+     *
+     * If 'requireIndex' is true, then this forces the query system to choose an indexed plan. An
+     * exception is thrown if no 'requireIndex' is set to true but no indexed plan exists.
+     *
+     * Performs the read successfully regardless of a replica set node's state, meaning that the
+     * node does not need to be primary or secondary.
+     */
+    static bool findOne(OperationContext* opCtx,
+                        const CollectionPtr& collection,
                         const BSONObj& query,
                         BSONObj& result,
                         bool requireIndex = false);
 
-    static RecordId findOne(OperationContext* txn,
-                            Collection* collection,
+    /**
+     * Similar to the 'findOne()' overload above, except returns the RecordId of the first matching
+     * document, or a null RecordId if no such document exists.
+     */
+    static RecordId findOne(OperationContext* opCtx,
+                            const CollectionPtr& collection,
                             const BSONObj& query,
+                            bool requireIndex);
+    static RecordId findOne(OperationContext* opCtx,
+                            const CollectionPtr& collection,
+                            std::unique_ptr<QueryRequest> qr,
                             bool requireIndex);
 
     /**
      * @param foundIndex if passed in will be set to 1 if ns and index found
      * @return true if object found
      */
-    static bool findById(OperationContext* txn,
+    static bool findById(OperationContext* opCtx,
                          Database* db,
-                         const char* ns,
+                         StringData ns,
                          BSONObj query,
                          BSONObj& result,
-                         bool* nsFound = 0,
-                         bool* indexFound = 0);
+                         bool* nsFound = nullptr,
+                         bool* indexFound = nullptr);
 
     /* TODO: should this move into Collection?
      * uasserts if no _id index.
      * @return null loc if not found */
-    static RecordId findById(OperationContext* txn, Collection* collection, const BSONObj& query);
+    static RecordId findById(OperationContext* opCtx,
+                             const CollectionPtr& collection,
+                             const BSONObj& query);
 
     /**
      * Get the first object generated from a forward natural-order scan on "ns".  Callers do not
@@ -115,27 +106,51 @@ struct Helpers {
      *
      * Returns false if there is no such object.
      */
-    static bool getSingleton(OperationContext* txn, const char* ns, BSONObj& result);
+    static bool getSingleton(OperationContext* opCtx, const char* ns, BSONObj& result);
 
     /**
      * Same as getSingleton, but with a reverse natural-order scan on "ns".
      */
-    static bool getLast(OperationContext* txn, const char* ns, BSONObj& result);
+    static bool getLast(OperationContext* opCtx, const char* ns, BSONObj& result);
 
     /**
      * Performs an upsert of "obj" into the collection "ns", with an empty update predicate.
      * Callers must have "ns" locked.
      */
-    static void putSingleton(OperationContext* txn, const char* ns, BSONObj obj);
+    static void putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj);
 
     /**
-     * you have to lock
+     * Callers are expected to hold the collection lock.
      * you do not have to have Context set
      * o has to have an _id field or will assert
      */
-    static void upsert(OperationContext* txn,
+    static UpdateResult upsert(OperationContext* opCtx,
+                               const std::string& ns,
+                               const BSONObj& o,
+                               bool fromMigrate = false);
+
+    /**
+     * Performs an upsert of 'updateMod' if we don't match the given 'filter'.
+     * Callers are expected to hold the collection lock.
+     * Note: Query yielding is turned off, so both read and writes are performed
+     * on the same storage snapshot.
+     */
+    static UpdateResult upsert(OperationContext* opCtx,
+                               const std::string& ns,
+                               const BSONObj& filter,
+                               const BSONObj& updateMod,
+                               bool fromMigrate = false);
+
+    /**
+     * Performs an update of 'updateMod' for the entry matching the given 'filter'.
+     * Callers are expected to hold the collection lock.
+     * Note: Query yielding is turned off, so both read and writes are performed
+     * on the same storage snapshot.
+     */
+    static void update(OperationContext* opCtx,
                        const std::string& ns,
-                       const BSONObj& o,
+                       const BSONObj& filter,
+                       const BSONObj& updateMod,
                        bool fromMigrate = false);
 
     // TODO: this should be somewhere else probably
@@ -153,83 +168,24 @@ struct Helpers {
     static BSONObj inferKeyPattern(const BSONObj& o);
 
     /**
-     * Takes a namespace range, specified by a min and max and qualified by an index pattern,
-     * and removes all the documents in that range found by iterating
-     * over the given index. Caller is responsible for insuring that min/max are
-     * compatible with the given keyPattern (e.g min={a:100} is compatible with
-     * keyPattern={a:1,b:1} since it can be extended to {a:100,b:minKey}, but
-     * min={b:100} is not compatible).
-     *
-     * Caller must hold a write lock on 'ns'
-     *
-     * Returns -1 when no usable index exists
-     *
-     * Does oplog the individual document deletions.
-     * // TODO: Refactor this mechanism, it is growing too large
-     */
-    static long long removeRange(OperationContext* txn,
-                                 const KeyRange& range,
-                                 bool maxInclusive,
-                                 const WriteConcernOptions& secondaryThrottle,
-                                 RemoveSaver* callback = NULL,
-                                 bool fromMigrate = false,
-                                 bool onlyRemoveOrphanedDocs = false);
-
-
-    // TODO: This will supersede Chunk::MaxObjectsPerChunk
-    static const long long kMaxDocsPerChunk;
-
-    /**
-     * Get sorted disklocs that belong to a range of a namespace defined over an index
-     * key pattern (KeyRange).
-     *
-     * @param chunk range of a namespace over an index key pattern.
-     * @param maxChunkSizeBytes max number of bytes that we will retrieve locs for, if the
-     * range is estimated larger (from avg doc stats) we will stop recording locs.
-     * @param locs set to record locs in
-     * @param estChunkSizeBytes chunk size estimated from doc count and avg doc size
-     * @param chunkTooBig whether the chunk was estimated larger than our maxChunkSizeBytes
-     * @param errmsg filled with textual description of error if this call return false
-     *
-     * @return NamespaceNotFound if the namespace doesn't exist
-     * @return IndexNotFound if the index pattern doesn't match any indexes
-     * @return InvalidLength if the estimated size exceeds maxChunkSizeBytes
-     */
-    static Status getLocsInRange(OperationContext* txn,
-                                 const KeyRange& range,
-                                 long long maxChunkSizeBytes,
-                                 std::set<RecordId>* locs,
-                                 long long* numDocs,
-                                 long long* estChunkSizeBytes);
-
-    /**
      * Remove all documents from a collection.
      * You do not need to set the database before calling.
      * Does not oplog the operation.
      */
-    static void emptyCollection(OperationContext* txn, const char* ns);
+    static void emptyCollection(OperationContext* opCtx, const NamespaceString& nss);
 
-    /**
-     * for saving deleted bson objects to a flat file
+    /*
+     * Finds the doc and then runs a no-op update by running an update using the doc just read. Used
+     * in order to force a conflict if a concurrent storage transaction writes to the doc we're
+     * reading.
+     * Callers must hold the collection lock in MODE_IX.
+     * Uasserts if no _id index.
+     * Returns true if object found
      */
-    class RemoveSaver {
-        MONGO_DISALLOW_COPYING(RemoveSaver);
-
-    public:
-        RemoveSaver(const std::string& type, const std::string& ns, const std::string& why);
-
-        /**
-         * Writes document to file. File is created lazily before writing the first document.
-         * Returns error status if the file could not be created or if there were errors writing
-         * to the file.
-         */
-        Status goingToDelete(const BSONObj& o);
-
-    private:
-        boost::filesystem::path _root;
-        boost::filesystem::path _file;
-        std::unique_ptr<std::ostream> _out;
-    };
+    static bool findByIdAndNoopUpdate(OperationContext* opCtx,
+                                      const CollectionPtr& collection,
+                                      const BSONObj& idQuery,
+                                      BSONObj& result);
 };
 
 }  // namespace mongo

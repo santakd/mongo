@@ -5,47 +5,54 @@
 //   - Inserts 10k documents and ensures they're evenly distributed
 //   - Verifies a $where query can be killed on multiple DBs
 //   - Tests fsync and fsync+lock permissions on sharded db
+(function() {
+'use strict';
 
-var s = new ShardingTest({shards: 2,
-                          mongos: 1,
-                          verbose:1});
+var s = new ShardingTest({shards: 2, mongos: 1});
+var dbForTest = s.getDB("test");
+var admin = s.getDB("admin");
+dbForTest.foo.drop();
 
-var db = s.getDB("test");   // db variable name is required due to startParallelShell()
 var numDocs = 10000;
-db.foo.drop();
 
 // shard test.foo and add a split point
 s.adminCommand({enablesharding: "test"});
-s.ensurePrimaryShard('test', 'shard0001');
-s.adminCommand({shardcollection : "test.foo", key: {_id: 1}});
-s.adminCommand({split : "test.foo", middle: {_id: numDocs/2}});
+s.ensurePrimaryShard('test', s.shard1.shardName);
+s.adminCommand({shardcollection: "test.foo", key: {_id: 1}});
+s.adminCommand({split: "test.foo", middle: {_id: numDocs / 2}});
 
 // move a chunk range to the non-primary shard
-s.adminCommand({moveChunk: "test.foo", find: {_id: 3},
-                to: s.getNonPrimaries("test")[0], _waitForDelete: true});
+s.adminCommand({
+    moveChunk: "test.foo",
+    find: {_id: 3},
+    to: s.getNonPrimaries("test")[0],
+    _waitForDelete: true
+});
 
 // restart balancer
 s.startBalancer();
 
 // insert 10k small documents into the sharded collection
-var bulk = db.foo.initializeUnorderedBulkOp();
-for (i = 0; i < numDocs; i++)
-    bulk.insert({ _id: i });
-assert.writeOK(bulk.execute());
+var bulk = dbForTest.foo.initializeUnorderedBulkOp();
+for (var i = 0; i < numDocs; i++) {
+    bulk.insert({_id: i});
+}
+assert.commandWorked(bulk.execute());
 
-var x = db.foo.stats();
+var x = dbForTest.foo.stats();
 
 // verify the colleciton has been sharded and documents are evenly distributed
 assert.eq("test.foo", x.ns, "namespace mismatch");
 assert(x.sharded, "collection is not sharded");
 assert.eq(numDocs, x.count, "total count");
-assert.eq(numDocs / 2, x.shards.shard0000.count, "count on shard0000");
-assert.eq(numDocs / 2, x.shards.shard0001.count, "count on shard0001");
+assert.eq(numDocs / 2, x.shards[s.shard0.shardName].count, "count on " + s.shard0.shardName);
+assert.eq(numDocs / 2, x.shards[s.shard1.shardName].count, "count on " + s.shard1.shardName);
 assert(x.totalIndexSize > 0);
+assert(x.size > 0);
 
 // insert one doc into a non-sharded collection
-db.bar.insert({x: 1});
-var x = db.bar.stats();
+dbForTest.bar.insert({x: 1});
+var x = dbForTest.bar.stats();
 assert.eq(1, x.count, "XXX1");
 assert.eq("test.bar", x.ns, "XXX2");
 assert(!x.sharded, "XXX3: " + tojson(x));
@@ -53,47 +60,48 @@ assert(!x.sharded, "XXX3: " + tojson(x));
 // fork shell and start querying the data
 var start = new Date();
 
-// TODO:  Still potential problem when our sampling of current ops misses when $where is active -
-// solution is to increase sleep time
-var whereKillSleepTime = 10000;
-var parallelCommand =
-    "db.foo.find(function() { " +
-    "    sleep( " + whereKillSleepTime + " ); " +
+var whereKillSleepTime = 1000;
+var parallelCommand = "db.foo.find(function() { " +
+    "    sleep(" + whereKillSleepTime + "); " +
     "    return false; " +
     "}).itcount(); ";
 
 // fork a parallel shell, but do not wait for it to start
 print("about to fork new shell at: " + Date());
-var awaitShell = startParallelShell(parallelCommand);
+var awaitShell = startParallelShell(parallelCommand, s.s.port);
 print("done forking shell at: " + Date());
 
 // Get all current $where operations
-function getMine(printInprog) {
-    var inprog = db.currentOp().inprog;
-    if (printInprog)
-        printjson(inprog);
+function getInProgWhereOps() {
+    let inProgressOps = admin.aggregate([{$currentOp: {'allUsers': true}}]);
+    let inProgressStr = '';
 
     // Find all the where queries
-    var mine = [];
-    for (var x=0; x<inprog.length; x++) {
-        if (inprog[x].query && inprog[x].query.filter && inprog[x].query.filter.$where) {
-            mine.push(inprog[x]);
+    var myProcs = [];
+    while (inProgressOps.hasNext()) {
+        let op = inProgressOps.next();
+        inProgressStr += tojson(op);
+        if (op.command && op.command.filter && op.command.filter.$where) {
+            myProcs.push(op);
         }
     }
 
-    return mine;
+    if (myProcs.length == 0) {
+        print('No $where operations found: ' + inProgressStr);
+    } else {
+        print('Found ' + myProcs.length + ' $where operations: ' + tojson(myProcs));
+    }
+
+    return myProcs;
 }
 
-var curOpState = 0; // 0 = not found, 1 = killed
+var curOpState = 0;  // 0 = not found, 1 = killed
 var killTime = null;
-var i = 0;
+var mine;
 
 assert.soon(function() {
     // Get all the current operations
-    mine = getMine(true);  // SERVER-8794: print all operations
-    // get curren tops, but only print out operations before we see a $where op has started
-    // mine = getMine(curOpState == 0 && i > 20);
-    i++;
+    mine = getInProgWhereOps();
 
     // Wait for the queries to start (one per shard, so 2 total)
     if (curOpState == 0 && mine.length == 2) {
@@ -101,7 +109,7 @@ assert.soon(function() {
         curOpState = 1;
         // kill all $where
         mine.forEach(function(z) {
-            printjson(db.getSisterDB("admin").killOp(z.opid));
+            printjson(dbForTest.getSiblingDB("admin").killOp(z.opid));
         });
         killTime = new Date();
     }
@@ -111,13 +119,12 @@ assert.soon(function() {
         curOpState = 2;
         return true;
     }
-
 }, "Couldn't kill the $where operations.", 2 * 60 * 1000);
 
 print("after loop: " + Date());
 assert(killTime, "timed out waiting too kill last mine:" + tojson(mine));
 
-assert.eq( 2 , curOpState , "failed killing" );
+assert.eq(2, curOpState, "failed killing");
 
 killTime = new Date().getTime() - killTime.getTime();
 print("killTime: " + killTime);
@@ -132,20 +139,17 @@ var end = new Date();
 print("elapsed: " + (end.getTime() - start.getTime()));
 
 // test fsync command on non-admin db
-x = db.runCommand("fsync");
-assert(!x.ok , "fsync on non-admin namespace should fail : " + tojson(x));
-assert(x.code == 13,
-       "fsync on non-admin succeeded, but should have failed: " + tojson(x));
+x = dbForTest.runCommand("fsync");
+assert(!x.ok, "fsync on non-admin namespace should fail : " + tojson(x));
+assert(x.code == 13, "fsync on non-admin succeeded, but should have failed: " + tojson(x));
 
 // test fsync on admin db
-x = db._adminCommand("fsync");
+x = dbForTest._adminCommand("fsync");
 assert(x.ok == 1, "fsync failed: " + tojson(x));
-if ( x.all.shard0000 > 0 ) {
-    assert(x.numFiles > 0, "fsync failed: " + tojson(x));
-}
 
 // test fsync+lock on admin db
-x = db._adminCommand({"fsync" :1, lock:true});
+x = dbForTest._adminCommand({"fsync": 1, lock: true});
 assert(!x.ok, "lock should fail: " + tojson(x));
 
 s.stop();
+})();

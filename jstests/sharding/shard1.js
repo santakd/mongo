@@ -1,47 +1,43 @@
 /**
-* this tests some of the ground work
-*/
+ * this tests some of the ground work
+ */
+(function() {
+'use strict';
 
-s = new ShardingTest({name: "shard1", shards: 2});
+load("jstests/sharding/libs/find_chunks_util.js");
 
-db = s.getDB( "test" );
-db.foo.insert( { num : 1 , name : "eliot" } );
-db.foo.insert( { num : 2 , name : "sara" } );
-db.foo.insert( { num : -1 , name : "joe" } );
-db.foo.ensureIndex( { num : 1 } );
-assert.eq( 3 , db.foo.find().length() , "A" );
+var s = new ShardingTest({shards: 2});
+var db = s.getDB("test");
 
-shardCommand = { shardcollection : "test.foo" , key : { num : 1 } };
+assert.commandWorked(db.foo.insert({num: 1, name: "eliot"}));
+assert.commandWorked(db.foo.insert({num: 2, name: "sara"}));
+assert.commandWorked(db.foo.insert({num: -1, name: "joe"}));
 
-assert.throws( function(){ s.adminCommand( shardCommand ); } );
+assert.commandWorked(db.foo.createIndex({num: 1}));
 
-s.adminCommand( { enablesharding : "test" } );
-s.ensurePrimaryShard('test', 'shard0001');
-assert.eq( 3 , db.foo.find().length() , "after partitioning count failed" );
+assert.eq(3, db.foo.find().length(), "A");
 
-s.adminCommand( shardCommand );
+const shardCommand = {
+    shardcollection: "test.foo",
+    key: {num: 1}
+};
 
-assert.throws( function(){ s.adminCommand({ shardCollection: 'test', key: { x: 1 }}); });
-assert.throws( function(){ s.adminCommand({ shardCollection: '.foo', key: { x: 1 }}); });
+assert.commandFailed(s.s0.adminCommand(shardCommand));
 
-var cconfig = s.config.collections.findOne( { _id : "test.foo" } );
-assert( cconfig , "why no collection entry for test.foo" )
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
+s.ensurePrimaryShard('test', s.shard1.shardName);
 
-delete cconfig.lastmod
-delete cconfig.dropped
-delete cconfig.lastmodEpoch
+assert.eq(3, db.foo.find().length(), "after partitioning count failed");
 
-assert.eq(cconfig,
-          { _id : "test.foo" , key : { num : 1 } , unique : false },
-          "Sharded content mismatch");
+assert.commandWorked(s.s0.adminCommand(shardCommand));
+assert.commandFailed(s.s0.adminCommand({shardCollection: 'test', key: {x: 1}}));
+assert.commandFailed(s.s0.adminCommand({shardCollection: '.foo', key: {x: 1}}));
 
-s.config.collections.find().forEach( printjson );
+assert(s.config.collections.findOne({_id: "test.foo"}), "No collection entry found for test.foo");
+s.config.collections.find().forEach(printjson);
 
-assert.eq( 1 , s.config.chunks.count() , "num chunks A");
-si = s.config.chunks.findOne();
-assert( si );
-assert.eq( si.ns , "test.foo" );
-
-assert.eq( 3 , db.foo.find().length() , "after sharding, no split count failed" );
+assert.eq(1, findChunksUtil.countChunksForNs(s.config, "test.foo"), "num chunks A");
+assert.eq(3, db.foo.find().length(), "after sharding, no split count failed");
 
 s.stop();
+})();

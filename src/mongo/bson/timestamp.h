@@ -1,28 +1,30 @@
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -34,33 +36,41 @@
 
 namespace mongo {
 
+class BSONObj;
+
 /**
  * Timestamp: A combination of a count of seconds since the POSIX epoch plus an ordinal value.
  */
 class Timestamp {
 public:
+    // Timestamp to signal that the storage engine should take unstable checkpoints.
+    static const Timestamp kAllowUnstableCheckpointsSentinel;
+
     // Maximum Timestamp value.
     static Timestamp max();
 
+    // Returns the minimum timestamp. Used in the context of selecting and ordering storage engine
+    // snapshots.
+    static Timestamp min() {
+        return Timestamp();
+    }
+
     /**
-     * DEPRECATED Constructor that builds a Timestamp from a Date_t by using the
-     * high-order 4 bytes of "date" for the "secs" field and the low-order 4 bytes
-     * for the "i" field.
+     * Constructor that builds a Timestamp from a Date_t by using the high-order 4 bytes of "date"
+     * for the "secs" field and the low-order 4 bytes for the "i" field.
      */
     explicit Timestamp(Date_t date) : Timestamp(date.toULL()) {}
 
     /**
-     * DEPRECATED Constructor that builds a Timestamp from a 64-bit unsigned integer by using
+     * Constructor that builds a Timestamp from a 64-bit unsigned integer by using
      * the high-order 4 bytes of "v" for the "secs" field and the low-order 4 bytes for the "i"
      * field.
      */
-    explicit Timestamp(unsigned long long v) : Timestamp(v >> 32, v) {}
+    explicit Timestamp(unsigned long long val) : Timestamp(val >> 32, val) {}
 
     Timestamp(Seconds s, unsigned increment) : Timestamp(s.count(), increment) {}
 
-    Timestamp(unsigned a, unsigned b) : i(b), secs(a) {
-        dassert(secs <= static_cast<unsigned>(std::numeric_limits<int>::max()));
-    }
+    Timestamp(unsigned a, unsigned b) : i(b), secs(a) {}
 
     Timestamp() = default;
 
@@ -86,8 +96,6 @@ public:
         return secs == 0;
     }
 
-    std::string toStringLong() const;
-
     std::string toStringPretty() const;
 
     std::string toString() const;
@@ -111,9 +119,26 @@ public:
         return tie() >= r.tie();
     }
 
+    Timestamp operator+(unsigned long long inc) const {
+        return Timestamp(asULL() + inc);
+    }
+
+    Timestamp operator-(unsigned long long inc) const {
+        return Timestamp(asULL() - inc);
+    }
+
     // Append the BSON representation of this Timestamp to the given BufBuilder with the given
     // name. This lives here because Timestamp manages its own serialization format.
-    void append(BufBuilder& builder, const StringData& fieldName) const;
+
+    template <class Builder>
+    void append(Builder& builder, const StringData& fieldName) const {
+        // No endian conversions needed, since we store in-memory representation
+        // in little endian format, regardless of target endian.
+        builder.appendNum(static_cast<char>(bsonTimestamp));
+        builder.appendStr(fieldName);
+        builder.appendNum(asULL());
+    }
+    BSONObj toBSON() const;
 
 private:
     std::tuple<unsigned, unsigned> tie() const {

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,25 +31,25 @@
 
 #include "mongo/db/exec/near.h"
 
+#include <memory>
+
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
-NearStage::NearStage(OperationContext* txn,
+NearStage::NearStage(ExpressionContext* expCtx,
                      const char* typeName,
                      StageType type,
                      WorkingSet* workingSet,
-                     Collection* collection)
-    : PlanStage(typeName, txn),
+                     const CollectionPtr& collection,
+                     const IndexDescriptor* indexDescriptor)
+    : RequiresIndexStage(typeName, expCtx, collection, indexDescriptor, workingSet),
       _workingSet(workingSet),
-      _collection(collection),
       _searchState(SearchState_Initializing),
       _nextIntervalStats(nullptr),
       _stageType(type),
@@ -57,19 +58,17 @@ NearStage::NearStage(OperationContext* txn,
 NearStage::~NearStage() {}
 
 NearStage::CoveredInterval::CoveredInterval(PlanStage* covering,
-                                            bool dedupCovering,
                                             double minDistance,
                                             double maxDistance,
                                             bool inclusiveMax)
     : covering(covering),
-      dedupCovering(dedupCovering),
       minDistance(minDistance),
       maxDistance(maxDistance),
       inclusiveMax(inclusiveMax) {}
 
 
 PlanStage::StageState NearStage::initNext(WorkingSetID* out) {
-    PlanStage::StageState state = initialize(getOpCtx(), _workingSet, _collection, out);
+    PlanStage::StageState state = initialize(opCtx(), _workingSet, out);
     if (state == PlanStage::IS_EOF) {
         _searchState = SearchState_Buffering;
         return PlanStage::NEED_TIME;
@@ -81,14 +80,8 @@ PlanStage::StageState NearStage::initNext(WorkingSetID* out) {
     return state;
 }
 
-PlanStage::StageState NearStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState NearStage::doWork(WorkingSetID* out) {
     WorkingSetID toReturn = WorkingSet::INVALID_ID;
-    Status error = Status::OK();
     PlanStage::StageState nextState = PlanStage::NEED_TIME;
 
     //
@@ -98,7 +91,7 @@ PlanStage::StageState NearStage::work(WorkingSetID* out) {
     if (SearchState_Initializing == _searchState) {
         nextState = initNext(&toReturn);
     } else if (SearchState_Buffering == _searchState) {
-        nextState = bufferNext(&toReturn, &error);
+        nextState = bufferNext(&toReturn);
     } else if (SearchState_Advancing == _searchState) {
         nextState = advanceNext(&toReturn);
     } else {
@@ -110,16 +103,10 @@ PlanStage::StageState NearStage::work(WorkingSetID* out) {
     // Handle the results
     //
 
-    if (PlanStage::FAILURE == nextState) {
-        *out = WorkingSetCommon::allocateStatusMember(_workingSet, error);
-    } else if (PlanStage::ADVANCED == nextState) {
+    if (PlanStage::ADVANCED == nextState) {
         *out = toReturn;
-        ++_commonStats.advanced;
     } else if (PlanStage::NEED_YIELD == nextState) {
         *out = toReturn;
-        ++_commonStats.needYield;
-    } else if (PlanStage::NEED_TIME == nextState) {
-        ++_commonStats.needTime;
     } else if (PlanStage::IS_EOF == nextState) {
         _commonStats.isEOF = true;
     }
@@ -143,28 +130,21 @@ struct NearStage::SearchResult {
 };
 
 // Set "toReturn" when NEED_YIELD.
-PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn, Status* error) {
+PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn) {
     //
     // Try to retrieve the next covered member
     //
 
     if (!_nextInterval) {
-        StatusWith<CoveredInterval*> intervalStatus =
-            nextInterval(getOpCtx(), _workingSet, _collection);
-        if (!intervalStatus.isOK()) {
-            _searchState = SearchState_Finished;
-            *error = intervalStatus.getStatus();
-            return PlanStage::FAILURE;
-        }
-
-        if (NULL == intervalStatus.getValue()) {
+        auto interval = nextInterval(opCtx(), _workingSet, collection());
+        if (!interval) {
             _searchState = SearchState_Finished;
             return PlanStage::IS_EOF;
         }
 
         // CoveredInterval and its child stage are owned by _childrenIntervals
-        _childrenIntervals.push_back(intervalStatus.getValue());
-        _nextInterval = _childrenIntervals.back();
+        _childrenIntervals.push_back(std::move(interval));
+        _nextInterval = _childrenIntervals.back().get();
         _specificStats.intervalStats.emplace_back();
         _nextIntervalStats = &_specificStats.intervalStats.back();
         _nextIntervalStats->minDistanceAllowed = _nextInterval->minDistance;
@@ -178,9 +158,6 @@ PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn, Status* erro
     if (PlanStage::IS_EOF == intervalState) {
         _searchState = SearchState_Advancing;
         return PlanStage::NEED_TIME;
-    } else if (PlanStage::FAILURE == intervalState) {
-        *error = WorkingSetCommon::getMemberStatus(*_workingSet->get(nextMemberID));
-        return intervalState;
     } else if (PlanStage::NEED_YIELD == intervalState) {
         *toReturn = nextMemberID;
         return intervalState;
@@ -195,8 +172,8 @@ PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn, Status* erro
     WorkingSetMember* nextMember = _workingSet->get(nextMemberID);
 
     // The child stage may not dedup so we must dedup them ourselves.
-    if (_nextInterval->dedupCovering && nextMember->hasLoc()) {
-        if (_seenDocuments.end() != _seenDocuments.find(nextMember->loc)) {
+    if (nextMember->hasRecordId()) {
+        if (_seenDocuments.end() != _seenDocuments.find(nextMember->recordId)) {
             _workingSet->free(nextMemberID);
             return PlanStage::NEED_TIME;
         }
@@ -204,25 +181,17 @@ PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn, Status* erro
 
     ++_nextIntervalStats->numResultsBuffered;
 
-    StatusWith<double> distanceStatus = computeDistance(nextMember);
-
-    if (!distanceStatus.isOK()) {
-        _searchState = SearchState_Finished;
-        *error = distanceStatus.getStatus();
-        return PlanStage::FAILURE;
-    }
-
     // If the member's distance is in the current distance interval, add it to our buffered
     // results.
-    double memberDistance = distanceStatus.getValue();
+    auto memberDistance = computeDistance(nextMember);
 
     // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we yield.
     nextMember->makeObjOwnedIfNeeded();
     _resultBuffer.push(SearchResult(nextMemberID, memberDistance));
 
-    // Store the member's RecordId, if available, for quick invalidation
-    if (nextMember->hasLoc()) {
-        _seenDocuments.insert(std::make_pair(nextMember->loc, nextMemberID));
+    // Store the member's RecordId, if available, for deduping.
+    if (nextMember->hasRecordId()) {
+        _seenDocuments.insert(std::make_pair(nextMember->recordId, nextMemberID));
     }
 
     return PlanStage::NEED_TIME;
@@ -244,8 +213,8 @@ PlanStage::StageState NearStage::advanceNext(WorkingSetID* toReturn) {
         // Throw out all documents with memberDistance < minDistance
         if (memberDistance < _nextInterval->minDistance) {
             WorkingSetMember* member = _workingSet->get(result.resultID);
-            if (member->hasLoc()) {
-                _seenDocuments.erase(member->loc);
+            if (member->hasRecordId()) {
+                _seenDocuments.erase(member->recordId);
             }
             _resultBuffer.pop();
             _workingSet->free(result.resultID);
@@ -274,12 +243,13 @@ PlanStage::StageState NearStage::advanceNext(WorkingSetID* toReturn) {
     // The next document in _resultBuffer is in the search interval, so we can return it.
     _resultBuffer.pop();
 
-    // If we're returning something, take it out of our RecordId -> WSID map so that future
-    // calls to invalidate don't cause us to take action for a RecordId we're done with.
     *toReturn = resultID;
+
+    // If we're returning something, take it out of our RecordId -> WSID map. This keeps
+    // '_seenDocuments' in sync with '_resultBuffer'.
     WorkingSetMember* member = _workingSet->get(*toReturn);
-    if (member->hasLoc()) {
-        _seenDocuments.erase(member->loc);
+    if (member->hasRecordId()) {
+        _seenDocuments.erase(member->recordId);
     }
 
     // This value is used by nextInterval() to determine the size of the next interval.
@@ -292,25 +262,8 @@ bool NearStage::isEOF() {
     return SearchState_Finished == _searchState;
 }
 
-void NearStage::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    // If a result is in _resultBuffer and has a RecordId it will be in _seenDocuments as
-    // well. It's safe to return the result w/o the RecordId, so just fetch the result.
-    unordered_map<RecordId, WorkingSetID, RecordId::Hasher>::iterator seenIt =
-        _seenDocuments.find(dl);
-
-    if (seenIt != _seenDocuments.end()) {
-        WorkingSetMember* member = _workingSet->get(seenIt->second);
-        verify(member->hasLoc());
-        WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
-        verify(!member->hasLoc());
-
-        // Don't keep it around in the seen map since there's no valid RecordId anymore
-        _seenDocuments.erase(seenIt);
-    }
-}
-
 unique_ptr<PlanStageStats> NearStage::getStats() {
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, _stageType);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, _stageType);
     ret->specific.reset(_specificStats.clone());
     for (size_t i = 0; i < _childrenIntervals.size(); ++i) {
         ret->children.emplace_back(_childrenIntervals[i]->covering->getStats());

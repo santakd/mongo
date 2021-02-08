@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,11 +32,14 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj_comparator_interface.h"
 #include "mongo/db/hasher.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
+class CollatorInterface;
 struct TwoDIndexingParams;
 struct S2IndexingParams;
 
@@ -56,16 +60,25 @@ public:
     // 2d
     //
 
-    static void get2DKeys(const BSONObj& obj,
+    static void get2DKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                          const BSONObj& obj,
                           const TwoDIndexingParams& params,
-                          BSONObjSet* keys,
-                          std::vector<BSONObj>* locs);
+                          KeyStringSet* keys,
+                          KeyString::Version keyStringVersion,
+                          Ordering ordering,
+                          boost::optional<RecordId> id = boost::none);
 
     //
     // FTS
     //
 
-    static void getFTSKeys(const BSONObj& obj, const fts::FTSSpec& ftsSpec, BSONObjSet* keys);
+    static void getFTSKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                           const BSONObj& obj,
+                           const fts::FTSSpec& ftsSpec,
+                           KeyStringSet* keys,
+                           KeyString::Version keyStringVersion,
+                           Ordering ordering,
+                           boost::optional<RecordId> id = boost::none);
 
     //
     // Hash
@@ -74,12 +87,18 @@ public:
     /**
      * Generates keys for hash access method.
      */
-    static void getHashKeys(const BSONObj& obj,
-                            const std::string& hashedField,
+    static void getHashKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                            const BSONObj& obj,
+                            const BSONObj& keyPattern,
                             HashSeed seed,
                             int hashVersion,
                             bool isSparse,
-                            BSONObjSet* keys);
+                            const CollatorInterface* collator,
+                            KeyStringSet* keys,
+                            KeyString::Version keyStringVersion,
+                            Ordering ordering,
+                            bool ignoreArraysAlongPath,
+                            boost::optional<RecordId> id = boost::none);
 
     /**
      * Hashing function used by both getHashKeys and the cursors we create.
@@ -95,11 +114,15 @@ public:
     /**
      * Generates keys for haystack access method.
      */
-    static void getHaystackKeys(const BSONObj& obj,
+    static void getHaystackKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                const BSONObj& obj,
                                 const std::string& geoField,
                                 const std::vector<std::string>& otherFields,
                                 double bucketSize,
-                                BSONObjSet* keys);
+                                KeyStringSet* keys,
+                                KeyString::Version keyStringVersion,
+                                Ordering ordering,
+                                boost::optional<RecordId> id = boost::none);
 
     /**
      * Returns a hash of a BSON element.
@@ -120,10 +143,15 @@ public:
     /**
      * Generates keys for S2 access method.
      */
-    static void getS2Keys(const BSONObj& obj,
+    static void getS2Keys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                          const BSONObj& obj,
                           const BSONObj& keyPattern,
                           const S2IndexingParams& params,
-                          BSONObjSet* keys);
+                          KeyStringSet* keys,
+                          MultikeyPaths* multikeyPaths,
+                          KeyString::Version keyStringVersion,
+                          Ordering ordering,
+                          boost::optional<RecordId> id = boost::none);
 };
 
 }  // namespace mongo

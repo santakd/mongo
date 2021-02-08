@@ -1,14 +1,20 @@
-// Test NamespaceDetails::cappedTruncateAfter via 'captrunc' command
+// Test NamespaceDetails::cappedTruncateAfter via "captrunc" command
+//
+// @tags: [
+//   # This test attempts to perform read operations on a capped collection after truncating
+//   # documents using the captrunc command. The former operations may be routed to a secondary in
+//   # the replica set, whereas the latter must be routed to the primary.
+//   assumes_read_preference_unchanged,
+//   requires_capped,
+//   requires_fastcount,
+//   requires_non_retryable_commands,
+//   uses_testing_only_commands,
+// ]
+(function() {
+var coll = db.capped6;
 
 Random.setRandomSeed();
-
-db.capped6.drop();
-db._dbCommand( { create: "capped6", capped: true, size: 1000, $nExtents: 11, autoIndexId: false } );
-tzz = db.capped6;
-
-function debug( x ) {
-//    print( x );
-}
+var maxDocuments = Random.randInt(400) + 100;
 
 /**
  * Check that documents in the collection are in order according to the value
@@ -16,94 +22,92 @@ function debug( x ) {
  * document(s) is/are deleted when space is needed for the newest document.  The
  * check is performed in both forward and reverse directions.
  */
-function checkOrder( i ) {
-    res = tzz.find().sort( { $natural: -1 } );
-    assert( res.hasNext(), "A" );
+function checkOrder(i, valueArray) {
+    res = coll.find().sort({$natural: -1});
+    assert(res.hasNext(), "A");
     var j = i;
-    while( res.hasNext() ) {
-        try {
-            assert.eq( val[ j-- ].a, res.next().a, "B" );
-        } catch( e ) {
-            debug( "capped6 err " + j );
-            throw e;
-        }
+    while (res.hasNext()) {
+        assert.eq(valueArray[j--].a, res.next().a, "B");
     }
-    res = tzz.find().sort( { $natural: 1 } );
-    assert( res.hasNext(), "C" );
-    while( res.hasNext() )
-        assert.eq( val[ ++j ].a, res.next().a, "D" );
-    assert.eq( j, i, "E" );
+
+    res = coll.find().sort({$natural: 1});
+    assert(res.hasNext(), "C");
+    while (res.hasNext()) {
+        assert.eq(valueArray[++j].a, res.next().a, "D");
+    }
+    assert.eq(j, i, "E");
 }
 
-var val = new Array( 500 );
-var c = "";
-for( i = 0; i < 500; ++i, c += "-" ) {
-    // The a values are strings of increasing length.
-    val[ i ] = { a: c };
+/*
+ * Prepare the values to insert and create the capped collection.
+ */
+function prepareCollection(shouldReverse) {
+    coll.drop();
+    assert.commandWorked(db.createCollection("capped6", {capped: true, size: 1000}));
+    var valueArray = new Array(maxDocuments);
+    var c = "";
+    for (i = 0; i < maxDocuments; ++i, c += "-") {
+        // The a values are strings of increasing length.
+        valueArray[i] = {a: c};
+    }
+    if (shouldReverse) {
+        valueArray.reverse();
+    }
+    return valueArray;
 }
-
-var oldMax = Random.randInt( 500 );
-var max = 0;
 
 /**
- * Insert new documents until there are 'oldMax' documents in the collection,
- * then remove a random number of documents (often all but one) via one or more
- * 'captrunc' requests.
+ * 1. When this function is called the first time, insert new documents until 'maxDocuments'
+ *    number of documents have been inserted. Note that the collection may not have
+ *    'maxDocuments' number of documents since it is a capped collection.
+ * 2. Remove all but one documents via one or more "captrunc" requests.
+ * 3. For each subsequent call to this function, keep track of the removed documents using
+ *    'valueArrayIndexes' and re-insert the removed documents each time this function is
+ *    called.
  */
-function doTest() {
-    for( var i = max; i < oldMax; ++i ) {
-        tzz.insert( val[ i ] );
+function runCapTrunc(valueArray, valueArrayCurIndex, n, inc) {
+    // If n <= 0, no documents are removed by captrunc.
+    assert.gt(n, 0);
+    assert.gte(valueArray.length, maxDocuments);
+    for (var i = valueArrayCurIndex; i < maxDocuments; ++i) {
+        assert.commandWorked(coll.insert(valueArray[i]));
     }
-    max = oldMax;
-    count = tzz.count();
+    count = coll.count();
 
-    var min = 1;
-    if ( Random.rand() > 0.3 ) {
-        min = Random.randInt( count ) + 1;
-    }
+    // The index corresponding to the last document in the collection.
+    valueArrayCurIndex = maxDocuments - 1;
 
-    // Iteratively remove a random number of documents until we have no more
-    // than 'min' documents.
-    while( count > min ) {
-        // 'n' is the number of documents to remove - we must account for the
-        // possibility that 'inc' will be true, and avoid removing all documents
-        // from the collection in that case, as removing all documents is not
-        // allowed by 'captrunc'
-        var n = Random.randInt( count - min - 1 ); // 0 <= x <= count - min - 1
-        var inc = Random.rand() > 0.5;
-        debug( count + " " + n + " " + inc );
-        assert.commandWorked( db.runCommand( { captrunc:"capped6", n:n, inc:inc } ) );
-        if ( inc ) {
-            n += 1;
-        }
-        count -= n;
-        max -= n;
-        // Validate the remaining documents.
-        checkOrder( max - 1 );
+    // Number of times to call "captrunc" so that (count - 1) documents are removed
+    // and at least 1 document is left in the array.
+    var iterations = Math.floor((count - 1) / (n + inc));
+
+    for (i = 0; i < iterations; ++i) {
+        assert.commandWorked(db.runCommand({captrunc: "capped6", n: n, inc: inc}));
+        count -= (n + inc);
+        valueArrayCurIndex -= (n + inc);
+        checkOrder(valueArrayCurIndex, valueArray);
     }
+    // We return the index of the next document that should be inserted into the capped
+    // collection, which would be the document after valueArrayCurIndex.
+    return valueArrayCurIndex + 1;
 }
 
-// Repeatedly add up to 'oldMax' documents and then truncate the newest
+function doTest(shouldReverse) {
+    var valueArray = prepareCollection(shouldReverse);
+    var valueArrayIndex = 0;
+    valueArrayIndex = runCapTrunc(valueArray, valueArrayIndex, 1, false);
+    valueArrayIndex = runCapTrunc(valueArray, valueArrayIndex, 1, true);
+    valueArrayIndex = runCapTrunc(valueArray, valueArrayIndex, 16, true);
+    valueArrayIndex = runCapTrunc(valueArray, valueArrayIndex, 16, false);
+    valueArrayIndex = runCapTrunc(valueArray, valueArrayIndex, maxDocuments - 2, true);
+    valueArrayIndex = runCapTrunc(valueArray, valueArrayIndex, maxDocuments - 2, false);
+}
+
+// Repeatedly add up to 'maxDocuments' documents and then truncate the newest
 // documents.  Newer documents take up more space than older documents.
-for( var i = 0; i < 10; ++i ) {
-    doTest();
-}
-
-// reverse order of values
-var val = new Array( 500 );
-
-var c = "";
-for( i = 499; i >= 0; --i, c += "-" ) {
-    val[ i ] = { a: c };
-}
-db.capped6.drop();
-db._dbCommand( { create: "capped6", capped: true, size: 1000, $nExtents: 11, autoIndexId: false } );
-tzz = db.capped6;
+doTest(false);
 
 // Same test as above, but now the newer documents take less space than the
 // older documents instead of more.
-for( var i = 0; i < 10; ++i ) {
-    doTest();
-}
-
-tzz.drop();
+doTest(true);
+})();

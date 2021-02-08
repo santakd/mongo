@@ -10,21 +10,22 @@
  *
  * This workload was designed to reproduce SERVER-18304.
  */
+
+// For isMongod.
+load('jstests/concurrency/fsm_workload_helpers/server_types.js');
+
 var $config = (function() {
-
-    var data =  {
-        numDocs: 1000,
-
+    var data = {
         // Use the workload name as the database name, since the workload name is assumed to be
         // unique.
         uniqueDBName: 'findAndModify_remove_queue',
 
         newDocForInsert: function newDocForInsert(i) {
-            return { _id: i, rand: Random.rand() };
+            return {_id: i, rand: Random.rand()};
         },
 
-        getIndexSpec: function getIndexSpec() {
-            return { rand: 1 };
+        getIndexSpecs: function getIndexSpecs() {
+            return [{rand: 1}];
         },
 
         opName: 'removed',
@@ -33,11 +34,11 @@ var $config = (function() {
             // Use a separate database to avoid conflicts with other FSM workloads.
             var ownedDB = db.getSiblingDB(db.getName() + this.uniqueDBName);
 
-            var updateDoc = { $push: {} };
+            var updateDoc = {$push: {}};
             updateDoc.$push[this.opName] = id;
 
-            var res = ownedDB[collName].update({ _id: this.tid }, updateDoc, { upsert: true });
-            assertAlways.writeOK(res);
+            var res = ownedDB[collName].update({_id: this.tid}, updateDoc, {upsert: true});
+            assertAlways.commandWorked(res);
 
             assertAlways.contains(res.nMatched, [0, 1], tojson(res));
             if (res.nMatched === 0) {
@@ -45,8 +46,7 @@ var $config = (function() {
                     assertAlways.eq(0, res.nModified, tojson(res));
                 }
                 assertAlways.eq(1, res.nUpserted, tojson(res));
-            }
-            else {
+            } else {
                 if (ownedDB.getMongo().writeMode() === 'commands') {
                     assertAlways.eq(1, res.nModified, tojson(res));
                 }
@@ -56,53 +56,67 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         function remove(db, collName) {
-            var res = db.runCommand({
-                findAndModify: db[collName].getName(),
-                query: {},
-                sort: { rand: -1 },
-                remove: true
-            });
+            var res = db.runCommand(
+                {findAndModify: db[collName].getName(), query: {}, sort: {rand: -1}, remove: true});
             assertAlways.commandWorked(res);
 
             var doc = res.value;
+            if (isMongod(db)) {
+                // Storage engines should automatically retry the operation, and thus should never
+                // return null.
+                assertWhenOwnColl.neq(
+                    doc, null, 'findAndModify should have found and removed a matching document');
+            }
             if (doc !== null) {
-                this.saveDocId.call(this, db, collName, doc._id);
+                this.saveDocId(db, collName, doc._id);
             }
         }
 
-        return {
-            remove: remove
-        };
-
+        return {remove: remove};
     })();
 
-    var transitions = {
-        remove: { remove: 1 }
-    };
+    var transitions = {remove: {remove: 1}};
 
     function setup(db, collName, cluster) {
+        // Each thread should remove exactly one document per iteration.
+        this.numDocs = this.iterations * this.threadCount;
+
         var bulk = db[collName].initializeUnorderedBulkOp();
         for (var i = 0; i < this.numDocs; ++i) {
             var doc = this.newDocForInsert(i);
             // Require that documents inserted by this workload use _id values that can be compared
             // using the default JS comparator.
-            assertAlways.neq(typeof doc._id, 'object', 'default comparator of' +
-                             ' Array.prototype.sort() is not well-ordered for JS objects');
+            assertAlways.neq(typeof doc._id,
+                             'object',
+                             'default comparator of' +
+                                 ' Array.prototype.sort() is not well-ordered for JS objects');
             bulk.insert(doc);
         }
         var res = bulk.execute();
-        assertAlways.writeOK(res);
+        assertAlways.commandWorked(res);
         assertAlways.eq(this.numDocs, res.nInserted);
 
-        assertAlways.commandWorked(db[collName].ensureIndex(this.getIndexSpec()));
+        this.getIndexSpecs().forEach(function createIndex(indexSpec) {
+            assertAlways.commandWorked(db[collName].createIndex(indexSpec));
+        });
     }
 
     function teardown(db, collName, cluster) {
         var ownedDB = db.getSiblingDB(db.getName() + this.uniqueDBName);
 
-        assertWhenOwnColl(function() {
+        if (this.opName === 'removed') {
+            if (isMongod(db)) {
+                // Each findAndModify should be internally retried until it removes exactly one
+                // document. Since this.numDocs == this.iterations * this.threadCount, there should
+                // not be any documents remaining.
+                assertWhenOwnColl.eq(db[collName].find().itcount(),
+                                     0,
+                                     'Expected all documents to have been removed');
+            }
+        }
+
+        assertWhenOwnColl(() => {
             var docs = ownedDB[collName].find().toArray();
             var ids = [];
 
@@ -111,7 +125,7 @@ var $config = (function() {
             }
 
             checkForDuplicateIds(ids, this.opName);
-        }.bind(this));
+        });
 
         var res = ownedDB.dropDatabase();
         assertAlways.commandWorked(res);
@@ -129,9 +143,8 @@ var $config = (function() {
                     break;
                 }
 
-                var msg = 'threads ' + tojson(smallest.indices) +
-                          ' claim to have ' + opName +
-                          ' a document with _id = ' + tojson(smallest.value);
+                var msg = 'threads ' + tojson(smallest.indices) + ' claim to have ' + opName +
+                    ' a document with _id = ' + tojson(smallest.value);
                 assertWhenOwnColl.eq(1, smallest.indices.length, msg);
 
                 indices[smallest.indices[0]]++;
@@ -153,8 +166,7 @@ var $config = (function() {
                     smallestValueIsSet = true;
                     smallestValue = value;
                     smallestIndices = [i];
-                }
-                else if (value === smallestValue) {
+                } else if (value === smallestValue) {
                     smallestIndices.push(i);
                 }
             }
@@ -162,14 +174,13 @@ var $config = (function() {
             if (!smallestValueIsSet) {
                 return null;
             }
-            return { value: smallestValue, indices: smallestIndices };
+            return {value: smallestValue, indices: smallestIndices};
         }
     }
 
-    var threadCount = 10;
     return {
-        threadCount: threadCount,
-        iterations: Math.floor(data.numDocs / threadCount),
+        threadCount: 10,
+        iterations: 100,
         data: data,
         startState: 'remove',
         states: states,
@@ -177,5 +188,4 @@ var $config = (function() {
         setup: setup,
         teardown: teardown
     };
-
 })();

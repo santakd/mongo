@@ -1,202 +1,231 @@
-// ephemeral_for_test_record_store.h
-
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include <boost/shared_array.hpp>
+#include <atomic>
 #include <map>
 
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/storage/capped_callback.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_radix_store.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_visibility_manager.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
+namespace ephemeral_for_test {
 
 /**
  * A RecordStore that stores all data in-memory.
- *
- * @param cappedMaxSize - required if isCapped. limit uses dataSize() in this impl.
  */
-class EphemeralForTestRecordStore : public RecordStore {
+class RecordStore final : public ::mongo::RecordStore {
 public:
-    explicit EphemeralForTestRecordStore(StringData ns,
-                                         std::shared_ptr<void>* dataInOut,
-                                         bool isCapped = false,
-                                         int64_t cappedMaxSize = -1,
-                                         int64_t cappedMaxDocs = -1,
-                                         CappedCallback* cappedCallback = nullptr);
+    explicit RecordStore(StringData ns,
+                         StringData ident,
+                         bool isCapped = false,
+                         int64_t cappedMaxSize = -1,
+                         int64_t cappedMaxDocs = -1,
+                         CappedCallback* cappedCallback = nullptr,
+                         VisibilityManager* visibilityManager = nullptr);
+    ~RecordStore() = default;
 
     virtual const char* name() const;
+    virtual bool isClustered() const {
+        return false;
+    }
+    virtual long long dataSize(OperationContext* opCtx) const;
+    virtual long long numRecords(OperationContext* opCtx) const;
+    virtual bool isCapped() const;
+    virtual void setCappedCallback(CappedCallback*);
+    virtual int64_t storageSize(OperationContext* opCtx,
+                                BSONObjBuilder* extraInfo = nullptr,
+                                int infoLevel = 0) const;
 
-    virtual RecordData dataFor(OperationContext* txn, const RecordId& loc) const;
+    virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const;
 
-    virtual bool findRecord(OperationContext* txn, const RecordId& loc, RecordData* rd) const;
+    virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl);
 
-    virtual void deleteRecord(OperationContext* txn, const RecordId& dl);
+    virtual Status insertRecords(OperationContext* opCtx,
+                                 std::vector<Record>* inOutRecords,
+                                 const std::vector<Timestamp>& timestamps);
 
-    virtual StatusWith<RecordId> insertRecord(OperationContext* txn,
-                                              const char* data,
-                                              int len,
-                                              bool enforceQuota);
-
-    virtual StatusWith<RecordId> insertRecord(OperationContext* txn,
-                                              const DocWriter* doc,
-                                              bool enforceQuota);
-
-    virtual StatusWith<RecordId> updateRecord(OperationContext* txn,
-                                              const RecordId& oldLocation,
-                                              const char* data,
-                                              int len,
-                                              bool enforceQuota,
-                                              UpdateNotifier* notifier);
+    virtual Status updateRecord(OperationContext* opCtx,
+                                const RecordId& oldLocation,
+                                const char* data,
+                                int len);
 
     virtual bool updateWithDamagesSupported() const;
 
-    virtual StatusWith<RecordData> updateWithDamages(OperationContext* txn,
+    virtual StatusWith<RecordData> updateWithDamages(OperationContext* opCtx,
                                                      const RecordId& loc,
                                                      const RecordData& oldRec,
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages);
 
-    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
+    Status oplogDiskLocRegister(OperationContext* opCtx,
+                                const Timestamp& opTime,
+                                bool orderedCommit) override;
+
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward) const final;
 
-    virtual Status truncate(OperationContext* txn);
+    virtual Status truncate(OperationContext* opCtx);
+    StatusWith<int64_t> truncateWithoutUpdatingCount(RecoveryUnit* ru);
 
-    virtual void temp_cappedTruncateAfter(OperationContext* txn, RecordId end, bool inclusive);
+    virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive);
 
-    virtual Status validate(OperationContext* txn,
-                            bool full,
-                            bool scanData,
-                            ValidateAdaptor* adaptor,
-                            ValidateResults* results,
-                            BSONObjBuilder* output);
-
-    virtual void appendCustomStats(OperationContext* txn,
+    virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
                                    double scale) const;
 
-    virtual Status touch(OperationContext* txn, BSONObjBuilder* output) const;
-
-    virtual void increaseStorageSize(OperationContext* txn, int size, bool enforceQuota);
-
-    virtual int64_t storageSize(OperationContext* txn,
-                                BSONObjBuilder* extraInfo = NULL,
-                                int infoLevel = 0) const;
-
-    virtual long long dataSize(OperationContext* txn) const {
-        return _data->dataSize;
-    }
-
-    virtual long long numRecords(OperationContext* txn) const {
-        return _data->records.size();
-    }
-
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* txn,
+    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
                                                      const RecordId& startingPosition) const;
 
-    virtual void updateStatsAfterRepair(OperationContext* txn,
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override;
+
+    virtual void updateStatsAfterRepair(OperationContext* opCtx,
                                         long long numRecords,
-                                        long long dataSize) {
-        invariant(_data->records.size() == size_t(numRecords));
-        _data->dataSize = dataSize;
-    }
-
-protected:
-    struct EphemeralForTestRecord {
-        EphemeralForTestRecord() : size(0) {}
-        EphemeralForTestRecord(int size) : size(size), data(new char[size]) {}
-
-        RecordData toRecordData() const {
-            return RecordData(data.get(), size);
-        }
-
-        int size;
-        boost::shared_array<char> data;
-    };
-
-    virtual const EphemeralForTestRecord* recordFor(const RecordId& loc) const;
-    virtual EphemeralForTestRecord* recordFor(const RecordId& loc);
-
-public:
-    //
-    // Not in RecordStore interface
-    //
-
-    typedef std::map<RecordId, EphemeralForTestRecord> Records;
-
-    bool isCapped() const {
-        return _isCapped;
-    }
-    void setCappedCallback(CappedCallback* cb) {
-        _cappedCallback = cb;
-    }
-    bool cappedMaxDocs() const {
-        invariant(_isCapped);
-        return _cappedMaxDocs;
-    }
-    bool cappedMaxSize() const {
-        invariant(_isCapped);
-        return _cappedMaxSize;
-    }
+                                        long long dataSize);
 
 private:
-    class InsertChange;
-    class RemoveChange;
-    class TruncateChange;
+    friend class VisibilityManagerChange;
 
-    class Cursor;
-    class ReverseCursor;
+    void _initHighestIdIfNeeded(OperationContext* opCtx);
 
-    StatusWith<RecordId> extractAndCheckLocForOplog(const char* data, int len) const;
+    /**
+     * This gets the next (guaranteed) unique record id.
+     */
+    int64_t _nextRecordId(OperationContext* opCtx);
 
-    RecordId allocateLoc();
-    bool cappedAndNeedDelete(OperationContext* txn) const;
-    void cappedDeleteAsNeeded(OperationContext* txn);
+    /**
+     *  Two helper functions for deleting excess records in capped record stores.
+     *  The caller should not have an active SizeAdjuster.
+     */
+    bool _cappedAndNeedDelete(OperationContext* opCtx, StringStore* workingCopy);
+    void _cappedDeleteAsNeeded(OperationContext* opCtx, StringStore* workingCopy);
 
-    // TODO figure out a proper solution to metadata
     const bool _isCapped;
     const int64_t _cappedMaxSize;
     const int64_t _cappedMaxDocs;
+
+    StringData _ident;
+
+    std::string _prefix;
+    std::string _postfix;
+
+    mutable Mutex _cappedCallbackMutex =
+        MONGO_MAKE_LATCH("RecordStore::_cappedCallbackMutex");  // Guards _cappedCallback
     CappedCallback* _cappedCallback;
 
-    // This is the "persistent" data.
-    struct Data {
-        Data(bool isOplog) : dataSize(0), nextId(1), isOplog(isOplog) {}
+    mutable Mutex _cappedDeleterMutex = MONGO_MAKE_LATCH("RecordStore::_cappedDeleterMutex");
 
-        int64_t dataSize;
-        Records records;
-        int64_t nextId;
-        const bool isOplog;
+    mutable Mutex _initHighestIdMutex = MONGO_MAKE_LATCH("RecordStore::_initHighestIdMutex");
+    AtomicWord<long long> _highestRecordId{0};
+    AtomicWord<long long> _numRecords{0};
+    AtomicWord<long long> _dataSize{0};
+
+    std::string generateKey(const uint8_t* key, size_t key_len) const;
+
+    bool _isOplog;
+    VisibilityManager* _visibilityManager;
+
+    /**
+     * Automatically adjust the record count and data size based on the size in change of the
+     * underlying radix store during the life time of the SizeAdjuster.
+     */
+    friend class SizeAdjuster;
+    class SizeAdjuster {
+    public:
+        SizeAdjuster(OperationContext* opCtx, RecordStore* rs);
+        ~SizeAdjuster();
+
+    private:
+        OperationContext* const _opCtx;
+        RecordStore* const _rs;
+        const StringStore* _workingCopy;
+        const int64_t _origNumRecords;
+        const int64_t _origDataSize;
     };
 
-    Data* const _data;
+    class Cursor final : public SeekableRecordCursor {
+        OperationContext* opCtx;
+        const RecordStore& _rs;
+        StringStore::const_iterator it;
+        boost::optional<std::string> _savedPosition;
+        bool _needFirstSeek = true;
+        bool _lastMoveWasRestore = false;
+        VisibilityManager* _visibilityManager;
+        RecordId _oplogVisibility;
+
+    public:
+        Cursor(OperationContext* opCtx,
+               const RecordStore& rs,
+               VisibilityManager* visibilityManager);
+        boost::optional<Record> next() final;
+        boost::optional<Record> seekExact(const RecordId& id) final override;
+        void save() final;
+        void saveUnpositioned() final override;
+        bool restore() final;
+        void detachFromOperationContext() final;
+        void reattachToOperationContext(OperationContext* opCtx) final;
+
+    private:
+        bool inPrefix(const std::string& key_string);
+    };
+
+    class ReverseCursor final : public SeekableRecordCursor {
+        OperationContext* opCtx;
+        const RecordStore& _rs;
+        StringStore::const_reverse_iterator it;
+        boost::optional<std::string> _savedPosition;
+        bool _needFirstSeek = true;
+        bool _lastMoveWasRestore = false;
+        VisibilityManager* _visibilityManager;
+
+    public:
+        ReverseCursor(OperationContext* opCtx,
+                      const RecordStore& rs,
+                      VisibilityManager* visibilityManager);
+        boost::optional<Record> next() final;
+        boost::optional<Record> seekExact(const RecordId& id) final override;
+        void save() final;
+        void saveUnpositioned() final override;
+        bool restore() final;
+        void detachFromOperationContext() final;
+        void reattachToOperationContext(OperationContext* opCtx) final;
+
+    private:
+        bool inPrefix(const std::string& key_string);
+    };
 };
 
+}  // namespace ephemeral_for_test
 }  // namespace mongo

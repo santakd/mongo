@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2015 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -30,6 +30,8 @@
  * wiredtiger.i
  *	The SWIG interface file defining the wiredtiger python API.
  */
+%include <pybuffer.i>
+
 %define DOCSTRING
 "Python wrappers around the WiredTiger C API
 
@@ -40,6 +42,7 @@ This provides an API similar to the C API, with the following modifications:
   - Statistics cursors behave a little differently and are best handled using the C-like functions
   - C Constants starting with WT_STAT_DSRC are instead exposed under wiredtiger.stat.dsrc
   - C Constants starting with WT_STAT_CONN are instead exposed under wiredtiger.stat.conn
+  - C Constants starting with WT_STAT_SESSION are instead exposed under wiredtiger.stat.session
 "
 %enddef
 
@@ -59,17 +62,9 @@ from packing import pack, unpack
 %typemap(in, numinputs=0) WT_SESSION ** (WT_SESSION *temp = NULL) {
 	$1 = &temp;
 }
-%typemap(in, numinputs=0) WT_ASYNC_OP ** (WT_ASYNC_OP *temp = NULL) {
-	$1 = &temp;
-}
 %typemap(in, numinputs=0) WT_CURSOR ** (WT_CURSOR *temp = NULL) {
 	$1 = &temp;
 }
-
-%typemap(in) WT_ASYNC_CALLBACK * (PyObject *callback_obj = NULL) %{
-	callback_obj = $input;
-	$1 = &pyApiAsyncCallback;
-%}
 
 %typemap(in, numinputs=0) WT_EVENT_HANDLER * %{
 	$1 = &pyApiEventHandler;
@@ -95,33 +90,6 @@ from packing import pack, unpack
 		}
 	}
 }
-%typemap(argout) WT_ASYNC_OP ** {
-	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1),
-	    SWIGTYPE_p___wt_async_op, 0);
-	if (*$1 != NULL) {
-		PY_CALLBACK *pcb;
-
-		(*$1)->c.flags |= WT_CURSTD_RAW;
-		PyObject_SetAttrString($result, "is_column",
-		    PyBool_FromLong(strcmp((*$1)->key_format, "r") == 0));
-		PyObject_SetAttrString($result, "key_format",
-		    PyString_InternFromString((*$1)->key_format));
-		PyObject_SetAttrString($result, "value_format",
-		    PyString_InternFromString((*$1)->value_format));
-
-		if (__wt_calloc_def((WT_ASYNC_OP_IMPL *)(*$1), 1, &pcb) != 0)
-			SWIG_exception_fail(SWIG_MemoryError, "WT calloc failed");
-		else {
-			pcb->pyobj = $result;
-			Py_XINCREF(pcb->pyobj);
-			/* XXX Is there a way to avoid SWIG's numbering? */
-			pcb->pyasynccb = callback_obj5;
-			Py_XINCREF(pcb->pyasynccb);
-			(*$1)->c.lang_private = pcb;
-		}
-	}
-}
-
 %typemap(argout) WT_CURSOR ** {
 	$result = SWIG_NewPointerObj(SWIG_as_voidptr(*$1),
 	    SWIGTYPE_p___wt_cursor, 0);
@@ -151,6 +119,129 @@ from packing import pack, unpack
 	}
 }
 
+%typemap(in,numinputs=1) (WT_MODIFY *entries, int *nentriesp) (WT_MODIFY *mod, int nentries) {
+	nentries = (int) PyLong_AsLong($input);
+	if (__wt_calloc_def(NULL, (size_t)nentries, &mod) != 0)
+		SWIG_exception_fail(SWIG_MemoryError, "WT calloc failed");
+	$1 = mod;
+	$2 = &nentries;
+}
+
+%typemap(argout) (WT_MODIFY *entries, int *nentriesp) {
+	int i;
+
+	$result = PyList_New(*$2);
+	for (i = 0; i < *$2; i++) {
+		PyObject *o = SWIG_NewPointerObj(Py_None, SWIGTYPE_p___wt_modify, 0);
+		PyObject_SetAttrString(o, "data", PyBytes_FromStringAndSize(
+		    $1[i].data.data, $1[i].data.size));
+		PyObject_SetAttrString(o, "offset",
+		    PyInt_FromLong($1[i].offset));
+		PyObject_SetAttrString(o, "size",
+		    PyInt_FromLong($1[i].size));
+		PyList_SetItem($result, i, o);
+	}
+}
+
+%typemap(argout) (WT_MODIFY *entries_string, int *nentriesp) {
+	int i;
+
+	$result = PyList_New(*$2);
+	for (i = 0; i < *$2; i++) {
+		PyObject *o = SWIG_NewPointerObj(Py_None, SWIGTYPE_p___wt_modify, 0);
+		PyObject_SetAttrString(o, "data", PyUnicode_FromStringAndSize(
+		    $1[i].data.data, $1[i].data.size));
+		PyObject_SetAttrString(o, "offset",
+		    PyInt_FromLong($1[i].offset));
+		PyObject_SetAttrString(o, "size",
+		    PyInt_FromLong($1[i].size));
+		PyList_SetItem($result, i, o);
+	}
+ }
+
+%typemap(in) const WT_ITEM * (WT_ITEM val) {
+	if (unpackBytesOrString($input, &val.data, &val.size) != 0)
+		SWIG_exception_fail(SWIG_AttributeError,
+		    "bad string value for WT_ITEM");
+	$1 = &val;
+}
+
+%typemap(freearg) (WT_MODIFY *, int *nentriesp) {
+	__wt_free(NULL, $1);
+}
+
+%typemap(in) WT_MODIFY * (int len, WT_MODIFY *modarray, int i) {
+	len = PyList_Size($input);
+	/*
+	 * We allocate an extra cleared WT_MODIFY struct, the first
+	 * entry will be used solely to transmit the array length to
+	 * the call site.
+	 */
+	if (__wt_calloc_def(NULL, (size_t)len + 1, &modarray) != 0)
+		SWIG_exception_fail(SWIG_MemoryError, "WT calloc failed");
+	modarray[0].size = (size_t)len;
+	for (i = 1; i <= len; i++) {
+		PyObject *dataobj, *modobj, *offsetobj, *sizeobj;
+		void *datadata;
+		long offset, size;
+		size_t datasize;
+
+		if ((modobj = PySequence_GetItem($input, i - 1)) == NULL) {
+			freeModifyArray(modarray);
+			SWIG_exception_fail(SWIG_IndexError,
+			    "Modify sequence failed");
+		}
+
+		WT_GETATTR(dataobj, modobj, "data");
+		if (unpackBytesOrString(dataobj, &datadata, &datasize) != 0) {
+			Py_DECREF(dataobj);
+			Py_DECREF(modobj);
+			freeModifyArray(modarray);
+			SWIG_exception_fail(SWIG_AttributeError,
+			    "Modify.data bad value");
+		}
+		if (datasize != 0 &&
+		    __wt_malloc(NULL, datasize, &modarray[i].data.data) != 0) {
+			Py_DECREF(dataobj);
+			Py_DECREF(modobj);
+			freeModifyArray(modarray);
+			SWIG_exception_fail(SWIG_AttributeError,
+			    "Modify.data failed malloc");
+		}
+		memcpy(modarray[i].data.data, datadata, datasize);
+		modarray[i].data.size = datasize;
+		Py_DECREF(dataobj);
+
+		WT_GETATTR(offsetobj, modobj, "offset");
+		if ((offset = PyInt_AsLong(offsetobj)) < 0) {
+			Py_DECREF(offsetobj);
+			Py_DECREF(modobj);
+			freeModifyArray(modarray);
+			SWIG_exception_fail(SWIG_RuntimeError,
+			    "Modify.offset bad value");
+		}
+		modarray[i].offset = offset;
+		Py_DECREF(offsetobj);
+
+		WT_GETATTR(sizeobj, modobj, "size");
+		if ((size = PyInt_AsLong(sizeobj)) < 0) {
+			Py_DECREF(sizeobj);
+			Py_DECREF(modobj);
+			freeModifyArray(modarray);
+			SWIG_exception_fail(SWIG_RuntimeError,
+			    "Modify.size bad value");
+		}
+		modarray[i].size = size;
+		Py_DECREF(sizeobj);
+		Py_DECREF(modobj);
+	}
+	$1 = modarray;
+}
+
+%typemap(freearg) WT_MODIFY * {
+	freeModifyArray($1);
+}
+
 /* 64 bit typemaps. */
 %typemap(in) uint64_t {
 	$1 = PyLong_AsUnsignedLongLong($input);
@@ -158,6 +249,9 @@ from packing import pack, unpack
 %typemap(out) uint64_t {
 	$result = PyLong_FromUnsignedLongLong($1);
 }
+
+/* Internal _set_key, _set_value methods take a 'bytes' object as parameter. */
+%pybuffer_binary(unsigned char *data, int);
 
 /* Throw away references after close. */
 %define DESTRUCTOR(class, method)
@@ -236,14 +330,21 @@ DESTRUCTOR(__wt_session, close)
  * asttribute to None, and free the PY_CALLBACK.
  */
 typedef struct {
-	PyObject *pyobj;	/* the python Session/Cursor/AsyncOp object */
-	PyObject *pyasynccb;	/* the callback to use for AsyncOp */
+	PyObject *pyobj;	/* the python Session/Cursor object */
 } PY_CALLBACK;
 
 static PyObject *wtError;
 
 static int sessionFreeHandler(WT_SESSION *session_arg);
 static int cursorFreeHandler(WT_CURSOR *cursor_arg);
+static int unpackBytesOrString(PyObject *obj, void **data, size_t *size);
+
+#define WT_GETATTR(var, parent, name)					\
+	do if ((var = PyObject_GetAttrString(parent, name)) == NULL) {	\
+		Py_DECREF(parent);					\
+		SWIG_exception_fail(SWIG_AttributeError,		\
+		    "Modify." #name " get failed");			\
+	} while(0)
 %}
 
 %init %{
@@ -262,6 +363,15 @@ static int cursorFreeHandler(WT_CURSOR *cursor_arg);
 %pythoncode %{
 WiredTigerError = _wiredtiger.WiredTigerError
 
+# Python3 has no explicit long type, recnos work as ints
+import sys
+if sys.version_info >= (3, 0, 0):
+	def _wt_recno(i):
+		return i
+else:
+	def _wt_recno(i):
+		return long(i)
+
 ## @cond DISABLE
 # Implements the iterable contract
 class IterableCursor:
@@ -271,19 +381,20 @@ class IterableCursor:
 	def __iter__(self):
 		return self
 
-	def next(self):
+	def __next__(self):
 		if self.cursor.next() == WT_NOTFOUND:
 			raise StopIteration
 		return self.cursor.get_keys() + self.cursor.get_values()
+
+	def next(self):
+		return self.__next__()
 ## @endcond
 
-# An abstract class, which must be subclassed with notify() overridden.
-class AsyncCallback:
-	def __init__(self):
-		raise NotImplementedError
+def wiredtiger_calc_modify(session, oldv, newv, maxdiff, nmod):
+	return _wiredtiger_calc_modify(session, oldv, newv, maxdiff, nmod)
 
-	def notify(self, op, op_ret, flags):
-		raise NotImplementedError
+def wiredtiger_calc_modify_string(session, oldv, newv, maxdiff, nmod):
+	return _wiredtiger_calc_modify_string(session, oldv, newv, maxdiff, nmod)
 
 %}
 
@@ -332,7 +443,6 @@ class AsyncCallback:
 %enddef
 
 SELFHELPER(struct __wt_connection, connection)
-SELFHELPER(struct __wt_async_op, op)
 SELFHELPER(struct __wt_session, session)
 SELFHELPER(struct __wt_cursor, cursor)
 
@@ -357,24 +467,8 @@ do {
 		SWIG_ERROR_IF_NOT_SET(result);
 }
 
-/* Async operations can return EBUSY when no ops are available. */
-%define EBUSY_OK(m)
-%exception m {
-retry:
-	$action
-	if (result != 0 && result != EBUSY)
-		SWIG_ERROR_IF_NOT_SET(result);
-	else if (result == EBUSY) {
-		SWIG_PYTHON_THREAD_BEGIN_ALLOW;
-		__wt_sleep(0, 10000);
-		SWIG_PYTHON_THREAD_END_ALLOW;
-		goto retry;
-	}
-}
-%enddef
-
-/* Any API that returns an enum type uses this. */
-%define ENUM_OK(m)
+/* An API that returns a value that shouldn't be checked uses this. */
+%define ANY_OK(m)
 %exception m {
 	$action
 }
@@ -407,13 +501,14 @@ retry:
 }
 %enddef
 
-EBUSY_OK(__wt_connection::async_new_op)
-ENUM_OK(__wt_async_op::get_type)
 NOTFOUND_OK(__wt_cursor::next)
 NOTFOUND_OK(__wt_cursor::prev)
 NOTFOUND_OK(__wt_cursor::remove)
 NOTFOUND_OK(__wt_cursor::search)
 NOTFOUND_OK(__wt_cursor::update)
+NOTFOUND_OK(__wt_cursor::_modify)
+ANY_OK(__wt_modify::__wt_modify)
+ANY_OK(__wt_modify::~__wt_modify)
 
 COMPARE_OK(__wt_cursor::_compare)
 COMPARE_OK(__wt_cursor::_equals)
@@ -423,8 +518,6 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %exception __wt_connection::get_home;
 %exception __wt_connection::is_new;
 %exception __wt_connection::search_near;
-%exception __wt_async_op::_set_key;
-%exception __wt_async_op::_set_value;
 %exception __wt_cursor::_set_key;
 %exception __wt_cursor::_set_key_str;
 %exception __wt_cursor::_set_value;
@@ -432,15 +525,6 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %exception wiredtiger_strerror;
 %exception wiredtiger_version;
 %exception diagnostic_build;
-%exception verbose_build;
-
-/* WT_ASYNC_OP customization. */
-/* First, replace the varargs get / set methods with Python equivalents. */
-%ignore __wt_async_op::get_key;
-%ignore __wt_async_op::get_value;
-%ignore __wt_async_op::set_key;
-%ignore __wt_async_op::set_value;
-%immutable __wt_async_op::connection;
 
 /* WT_CURSOR customization. */
 /* First, replace the varargs get / set methods with Python equivalents. */
@@ -448,6 +532,11 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %ignore __wt_cursor::get_value;
 %ignore __wt_cursor::set_key;
 %ignore __wt_cursor::set_value;
+%ignore __wt_cursor::modify(WT_CURSOR *, WT_MODIFY *, int);
+%rename (modify) __wt_cursor::_modify;
+%ignore __wt_modify::data;
+%ignore __wt_modify::offset;
+%ignore __wt_modify::size;
 
 /* Next, override methods that return integers via arguments. */
 %ignore __wt_cursor::compare(WT_CURSOR *, WT_CURSOR *, int *);
@@ -463,16 +552,29 @@ OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
 
 /* Handle binary data returns from get_key/value -- avoid cstring.i: it creates a list of returns. */
 %typemap(in,numinputs=0) (char **datap, int *sizep) (char *data, int size) { $1 = &data; $2 = &size; }
+%typemap(in,numinputs=0) (char **charp, int *sizep) (char *data, int size) { $1 = &data; $2 = &size; }
 %typemap(frearg) (char **datap, int *sizep) "";
+%typemap(argout) (char **charp, int *sizep) {
+	if (*$1)
+		$result = PyUnicode_FromStringAndSize(*$1, *$2);
+}
+
 %typemap(argout) (char **datap, int *sizep) {
 	if (*$1)
-		$result = SWIG_FromCharPtrAndSize(*$1, *$2);
-}
+		$result = PyBytes_FromStringAndSize(*$1, *$2);
+ }
 
 /* Handle record number returns from get_recno */
 %typemap(in,numinputs=0) (uint64_t *recnop) (uint64_t recno) { $1 = &recno; }
 %typemap(frearg) (uint64_t *recnop) "";
 %typemap(argout) (uint64_t *recnop) { $result = PyLong_FromUnsignedLongLong(*$1); }
+
+/* Handle returned hexadecimal timestamps. */
+%typemap(in,numinputs=0) (char *hex_timestamp) (char tsbuf[WT_TS_HEX_STRING_SIZE]) { $1 = tsbuf; }
+%typemap(argout) (char *hex_timestamp) {
+	if (*$1)
+		$result = SWIG_FromCharPtr($1);
+}
 
 %{
 typedef int int_void;
@@ -480,150 +582,9 @@ typedef int int_void;
 typedef int int_void;
 %typemap(out) int_void { $result = VOID_Object; }
 
-%extend __wt_async_op {
-	/* Get / set keys and values */
-	void _set_key(char *data, int size) {
-		WT_ITEM k;
-		k.data = data;
-		k.size = (uint32_t)size;
-		$self->set_key($self, &k);
-	}
-
-	int_void _set_recno(uint64_t recno) {
-		WT_ITEM k;
-		uint8_t recno_buf[20];
-		size_t size;
-		int ret;
-		if ((ret = wiredtiger_struct_size(NULL,
-		    &size, "r", recno)) != 0 ||
-		    (ret = wiredtiger_struct_pack(NULL,
-		    recno_buf, sizeof (recno_buf), "r", recno)) != 0)
-			return (ret);
-
-		k.data = recno_buf;
-		k.size = (uint32_t)size;
-		$self->set_key($self, &k);
-		return (ret);
-	}
-
-	void _set_value(char *data, int size) {
-		WT_ITEM v;
-		v.data = data;
-		v.size = (uint32_t)size;
-		$self->set_value($self, &v);
-	}
-
-	/* Don't return values, just throw exceptions on failure. */
-	int_void _get_key(char **datap, int *sizep) {
-		WT_ITEM k;
-		int ret = $self->get_key($self, &k);
-		if (ret == 0) {
-			*datap = (char *)k.data;
-			*sizep = (int)k.size;
-		}
-		return (ret);
-	}
-
-	int_void _get_recno(uint64_t *recnop) {
-		WT_ITEM k;
-		int ret = $self->get_key($self, &k);
-		if (ret == 0)
-			ret = wiredtiger_struct_unpack(NULL,
-			    k.data, k.size, "q", recnop);
-		return (ret);
-	}
-
-	int_void _get_value(char **datap, int *sizep) {
-		WT_ITEM v;
-		int ret = $self->get_value($self, &v);
-		if (ret == 0) {
-			*datap = (char *)v.data;
-			*sizep = (int)v.size;
-		}
-		return (ret);
-	}
-
-	int _freecb() {
-		return (cursorFreeHandler($self));
-	}
-
-%pythoncode %{
-	def get_key(self):
-		'''get_key(self) -> object
-		
-		@copydoc WT_ASYNC_OP::get_key
-		Returns only the first column.'''
-		k = self.get_keys()
-		if len(k) == 1:
-			return k[0]
-		return k
-
-	def get_keys(self):
-		'''get_keys(self) -> (object, ...)
-		
-		@copydoc WT_ASYNC_OP::get_key'''
-		if self.is_column:
-			return [self._get_recno(),]
-		else:
-			return unpack(self.key_format, self._get_key())
-
-	def get_value(self):
-		'''get_value(self) -> object
-		
-		@copydoc WT_ASYNC_OP::get_value
-		Returns only the first column.'''
-		v = self.get_values()
-		if len(v) == 1:
-			return v[0]
-		return v
-
-	def get_values(self):
-		'''get_values(self) -> (object, ...)
-		
-		@copydoc WT_ASYNC_OP::get_value'''
-		return unpack(self.value_format, self._get_value())
-
-	def set_key(self, *args):
-		'''set_key(self) -> None
-		
-		@copydoc WT_ASYNC_OP::set_key'''
-		if len(args) == 1 and type(args[0]) == tuple:
-			args = args[0]
-		if self.is_column:
-			self._set_recno(long(args[0]))
-		else:
-			# Keep the Python string pinned
-			self._key = pack(self.key_format, *args)
-			self._set_key(self._key)
-
-	def set_value(self, *args):
-		'''set_value(self) -> None
-		
-		@copydoc WT_ASYNC_OP::set_value'''
-		if len(args) == 1 and type(args[0]) == tuple:
-			args = args[0]
-		# Keep the Python string pinned
-		self._value = pack(self.value_format, *args)
-		self._set_value(self._value)
-
-	def __getitem__(self, key):
-		'''Python convenience for searching'''
-		self.set_key(key)
-		if self.search() != 0:
-			raise KeyError
-		return self.get_value()
-
-	def __setitem__(self, key, value):
-		'''Python convenience for inserting'''
-		self.set_key(key)
-		self.set_key(value)
-		self.insert()
-%}
-};
-
 %extend __wt_cursor {
 	/* Get / set keys and values */
-	void _set_key(char *data, int size) {
+	void _set_key(unsigned char *data, int size) {
 		WT_ITEM k;
 		k.data = data;
 		k.size = (uint32_t)size;
@@ -652,7 +613,7 @@ typedef int int_void;
 		return (ret);
 	}
 
-	void _set_value(char *data, int size) {
+	void _set_value(unsigned char *data, int size) {
 		WT_ITEM v;
 		v.data = data;
 		v.size = (uint32_t)size;
@@ -675,11 +636,11 @@ typedef int int_void;
 		return (ret);
 	}
 
-	int_void _get_json_key(char **datap, int *sizep) {
+	int_void _get_json_key(char **charp, int *sizep) {
 		const char *k;
 		int ret = $self->get_key($self, &k);
 		if (ret == 0) {
-			*datap = (char *)k;
+			*charp = (char *)k;
 			*sizep = strlen(k);
 		}
 		return (ret);
@@ -704,11 +665,11 @@ typedef int int_void;
 		return (ret);
 	}
 
-	int_void _get_json_value(char **datap, int *sizep) {
+	int_void _get_json_value(char **charp, int *sizep) {
 		const char *k;
 		int ret = $self->get_value($self, &k);
 		if (ret == 0) {
-			*datap = (char *)k;
+			*charp = (char *)k;
 			*sizep = strlen(k);
 		}
 		return (ret);
@@ -772,6 +733,15 @@ typedef int int_void;
 		return (cursorFreeHandler($self));
 	}
 
+	/*
+	 * modify: the size of the array was put into the first element by the
+	 * typemap.
+	 */
+	int _modify(WT_MODIFY *list) {
+		int count = (int)list[0].size;
+		return (self->modify(self, &list[1], count));
+	}
+
 %pythoncode %{
 	def get_key(self):
 		'''get_key(self) -> object
@@ -820,7 +790,7 @@ typedef int int_void;
 		if len(args) == 1 and type(args[0]) == tuple:
 			args = args[0]
 		if self.is_column:
-			self._set_recno(long(args[0]))
+			self._set_recno(_wt_recno(args[0]))
 		elif self.is_json:
 			self._set_key_str(args[0])
 		else:
@@ -870,6 +840,24 @@ typedef int int_void;
 %}
 };
 
+/*
+ * Support for WT_CURSOR.modify.  The WT_MODIFY object is known to
+ * SWIG, but its attributes are regular Python attributes.
+ * We extract the attributes at the call site to WT_CURSOR.modify
+ * so we don't have to deal with managing Python objects references.
+ */
+%extend __wt_modify {
+%pythoncode %{
+	def __init__(self, data = '', offset = 0, size = 0):
+		self.data = data
+		self.offset = offset
+		self.size = size
+
+	def __repr__(self):
+		return 'Modify(\'%s\', %d, %d)' % (self.data, self.offset, self.size)
+%}
+};
+
 %extend __wt_session {
 	int _log_printf(const char *msg) {
 		return self->log_printf(self, "%s", msg);
@@ -894,17 +882,9 @@ int diagnostic_build() {
 	return 0;
 #endif
 }
-
-int verbose_build() {
-#ifdef HAVE_VERBOSE
-	return 1;
-#else
-	return 0;
-#endif
-}
 %}
+
 int diagnostic_build();
-int verbose_build();
 
 /* Remove / rename parts of the C API that we don't want in Python. */
 %immutable __wt_cursor::session;
@@ -912,13 +892,7 @@ int verbose_build();
 %ignore __wt_cursor::key_format;
 %ignore __wt_cursor::value_format;
 %immutable __wt_session::connection;
-%immutable __wt_async_op::connection;
-%immutable __wt_async_op::uri;
-%immutable __wt_async_op::config;
-%ignore __wt_async_op::key_format;
-%ignore __wt_async_op::value_format;
 
-%ignore __wt_async_callback;
 %ignore __wt_collator;
 %ignore __wt_compressor;
 %ignore __wt_config_item;
@@ -943,21 +917,82 @@ OVERRIDE_METHOD(__wt_session, WT_SESSION, log_printf, (self, msg))
 %ignore wiredtiger_struct_size;
 %ignore wiredtiger_struct_unpack;
 
+%ignore wiredtiger_calc_modify;
 %ignore wiredtiger_extension_init;
 %ignore wiredtiger_extension_terminate;
+
 
 /* Convert 'int *' to output args for wiredtiger_version */
 %apply int *OUTPUT { int * };
 
-%rename(AsyncOp) __wt_async_op;
 %rename(Cursor) __wt_cursor;
+%rename(Modify) __wt_modify;
 %rename(Session) __wt_session;
 %rename(Connection) __wt_connection;
 
 %include "wiredtiger.h"
 
-/* Add event handler support. */
+/*
+ * The original wiredtiger_calc_modify was ignored, now we define our own.
+ * Python needs to know whether to return a bytes object or a string.
+ * Part of the smarts to do that is the output typemap, which matches on
+ * the naming of the parameter: entries vs. entries_string
+ */
+extern int _wiredtiger_calc_modify(WT_SESSION *session,
+    const WT_ITEM *oldv, const WT_ITEM *newv,
+    size_t maxdiff, WT_MODIFY *entries, int *nentriesp);
+extern int _wiredtiger_calc_modify_string(WT_SESSION *session,
+    const WT_ITEM *oldv, const WT_ITEM *newv,
+    size_t maxdiff, WT_MODIFY *entries_string, int *nentriesp);
 %{
+int _wiredtiger_calc_modify(WT_SESSION *session,
+    const WT_ITEM *oldv, const WT_ITEM *newv,
+    size_t maxdiff, WT_MODIFY *entries, int *nentriesp)
+{
+	return (wiredtiger_calc_modify(
+	    session, oldv, newv, maxdiff, entries, nentriesp));
+}
+
+int _wiredtiger_calc_modify_string(WT_SESSION *session,
+    const WT_ITEM *oldv, const WT_ITEM *newv,
+    size_t maxdiff, WT_MODIFY *entries_string, int *nentriesp)
+{
+	return (wiredtiger_calc_modify(
+	    session, oldv, newv, maxdiff, entries_string, nentriesp));
+}
+
+/* Add event handler support. */
+
+static void
+freeModifyArray(WT_MODIFY *modarray)
+{
+	size_t i, len;
+
+	len = modarray[0].size;
+	for (i = 1; i <= len; i++)
+		__wt_free(NULL, modarray[i].data.data);
+	__wt_free(NULL, modarray);
+}
+
+static int unpackBytesOrString(PyObject *obj, void **datap, size_t *sizep)
+{
+	void *data;
+	Py_ssize_t sz;
+
+	if (PyBytes_AsStringAndSize(obj, &data, &sz) < 0) {
+#if PY_VERSION_HEX >= 0x03000000
+		PyErr_Clear();
+		if ((data = PyUnicode_AsUTF8AndSize(obj, &sz)) != 0)
+			*sizep = strlen((char *)data) + 1;
+		else
+#endif
+			return (-1);
+	}
+	*datap = data;
+	*sizep = sz;
+	return (0);
+}
+
 /* Write to and flush the stream. */
 static int
 writeToPythonStream(const char *streamname, const char *message)
@@ -974,7 +1009,7 @@ writeToPythonStream(const char *streamname, const char *message)
 	written = NULL;
 	arglist = arglist2 = NULL;
 	msglen = strlen(message);
-	msg = malloc(msglen + 2);
+	WT_RET(__wt_malloc(NULL, msglen + 2, &msg));
 	strcpy(msg, message);
 	strcpy(&msg[msglen], "\n");
 
@@ -1010,8 +1045,7 @@ err:	Py_XDECREF(arglist2);
 	/* Release python Global Interpreter Lock */
 	SWIG_PYTHON_THREAD_END_BLOCK;
 
-	if (msg)
-		free(msg);
+	__wt_free(NULL, msg);
 	return (ret);
 }
 
@@ -1049,7 +1083,6 @@ pythonClose(PY_CALLBACK *pcb)
 		ret = EINVAL;  /* any non-zero value will do. */
 	}
 	Py_XDECREF(pcb->pyobj);
-	Py_XDECREF(pcb->pyasynccb);
 
 	SWIG_PYTHON_THREAD_END_BLOCK;
 
@@ -1087,7 +1120,7 @@ cursorCloseHandler(WT_CURSOR *cursor)
 	cursor->lang_private = NULL;
 	if (pcb != NULL)
 		ret = pythonClose(pcb);
-	__wt_free((WT_SESSION_IMPL *)cursor->session, pcb);
+	__wt_free(CUR2S(cursor), pcb);
 
 	return (ret);
 }
@@ -1114,7 +1147,7 @@ cursorFreeHandler(WT_CURSOR *cursor)
 
 	pcb = (PY_CALLBACK *)cursor->lang_private;
 	cursor->lang_private = NULL;
-	__wt_free((WT_SESSION_IMPL *)cursor->session, pcb);
+	__wt_free(CUR2S(cursor), pcb);
 	return (0);
 }
 
@@ -1138,70 +1171,6 @@ static WT_EVENT_HANDLER pyApiEventHandler = {
 };
 %}
 
-/* Add async callback support. */
-%{
-
-static int
-pythonAsyncCallback(WT_ASYNC_CALLBACK *cb, WT_ASYNC_OP *asyncop, int opret,
-    uint32_t flags)
-{
-	int ret, t_ret;
-	PY_CALLBACK *pcb;
-	PyObject *arglist, *notify_method, *pyresult;
-	WT_ASYNC_OP_IMPL *op;
-	WT_SESSION_IMPL *session;
-
-	/*
-	 * Ensure the global interpreter lock is held since we'll be
-	 * making Python calls now.
-	 */
-	SWIG_PYTHON_THREAD_BEGIN_BLOCK;
-
-	op = (WT_ASYNC_OP_IMPL *)asyncop;
-	session = O2S(op);
-	pcb = (PY_CALLBACK *)asyncop->c.lang_private;
-	asyncop->c.lang_private = NULL;
-	ret = 0;
-
-	if (pcb->pyasynccb == NULL)
-		goto err;
-	if ((arglist = Py_BuildValue("(Oii)", pcb->pyobj,
-	    opret, flags)) == NULL)
-		goto err;
-	if ((notify_method = PyObject_GetAttrString(pcb->pyasynccb,
-	    "notify")) == NULL)
-		goto err;
-
-	pyresult = PyEval_CallObject(notify_method, arglist);
-	if (pyresult == NULL || !PyArg_Parse(pyresult, "i", &ret))
-		goto err;
-
-	if (0) {
-		if (ret == 0)
-			ret = EINVAL;
-err:		__wt_err(session, ret, "python async callback error");
-	}
-	Py_XDECREF(pyresult);
-	Py_XDECREF(notify_method);
-	Py_XDECREF(arglist);
-
-	SWIG_PYTHON_THREAD_END_BLOCK;
-
-	if (pcb != NULL) {
-		if ((t_ret = pythonClose(pcb) != 0) && ret == 0)
-			ret = t_ret;
-	}
-	__wt_free(session, pcb);
-
-	if (ret == 0 && (opret == 0 || opret == WT_NOTFOUND))
-		return (0);
-	else
-		return (1);
-}
-
-static WT_ASYNC_CALLBACK pyApiAsyncCallback = { pythonAsyncCallback };
-%}
-
 %pythoncode %{
 class stat:
 	'''keys for statistics cursors'''
@@ -1214,12 +1183,17 @@ class stat:
 		'''keys for cursors on data source statistics'''
 		pass
 
+	class session:
+		'''keys for cursors on session statistics'''
+		pass
+
 ## @}
 
 import sys
 # All names starting with 'WT_STAT_DSRC_' are renamed to
 # the wiredtiger.stat.dsrc class, those starting with 'WT_STAT_CONN' are
-# renamed to wiredtiger.stat.conn class.
+# renamed to the wiredtiger.stat.conn class. All names starting with 'WT_STAT_SESSION'
+# are renamed to the wiredtiger.stat.session class.
 def _rename_with_prefix(prefix, toclass):
 	curmodule = sys.modules[__name__]
 	for name in dir(curmodule):
@@ -1230,6 +1204,6 @@ def _rename_with_prefix(prefix, toclass):
 
 _rename_with_prefix('WT_STAT_CONN_', stat.conn)
 _rename_with_prefix('WT_STAT_DSRC_', stat.dsrc)
+_rename_with_prefix('WT_STAT_SESSION_', stat.session)
 del _rename_with_prefix
 %}
-

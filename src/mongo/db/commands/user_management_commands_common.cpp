@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,11 +27,9 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/commands/user_management_commands.h"
+#include "mongo/db/commands/user_management_commands_common.h"
 
 #include <string>
 #include <vector>
@@ -44,21 +43,22 @@
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
+#include "mongo/db/commands/user_management_commands_gen.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/sequence_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace auth {
 
-void redactPasswordData(mutablebson::Element parent) {
-    namespace mmb = mutablebson;
-    const StringData pwdFieldName("pwd", StringData::LiteralTag());
-    for (mmb::Element pwdElement = mmb::findFirstChildNamed(parent, pwdFieldName); pwdElement.ok();
-         pwdElement = mmb::findElementNamed(pwdElement.rightSibling(), pwdFieldName)) {
-        pwdElement.setValueString("xxx");
+std::vector<RoleName> resolveRoleNames(const std::vector<RoleNameOrString>& possibleRoles,
+                                       StringData dbname) {
+    // De-duplicate as we resolve names by using a set.
+    stdx::unordered_set<RoleName> roles;
+    for (const auto& possibleRole : possibleRoles) {
+        roles.insert(possibleRole.getRoleName(dbname));
     }
+    return std::vector<RoleName>(roles.cbegin(), roles.cend());
 }
 
 Status checkAuthorizedToGrantRoles(AuthorizationSession* authzSession,
@@ -110,425 +110,289 @@ Status checkAuthorizedToRevokePrivileges(AuthorizationSession* authzSession,
     return Status::OK();
 }
 
-Status checkAuthForCreateUserCommand(ClientBasic* client,
-                                     const std::string& dbname,
-                                     const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    auth::CreateOrUpdateUserArgs args;
-    Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, "createUser", dbname, &args);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    if (!authzSession->isAuthorizedForActionsOnResource(
-            ResourcePattern::forDatabaseName(args.userName.getDB()), ActionType::createUser)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream()
-                          << "Not authorized to create users on db: " << args.userName.getDB());
-    }
-
-    return checkAuthorizedToGrantRoles(authzSession, args.roles);
-}
-
-Status checkAuthForUpdateUserCommand(ClientBasic* client,
-                                     const std::string& dbname,
-                                     const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    auth::CreateOrUpdateUserArgs args;
-    Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, "updateUser", dbname, &args);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    if (args.hasHashedPassword) {
-        if (!authzSession->isAuthorizedToChangeOwnPasswordAsUser(args.userName) &&
-            !authzSession->isAuthorizedForActionsOnResource(
-                ResourcePattern::forDatabaseName(args.userName.getDB()),
-                ActionType::changePassword)) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "Not authorized to change password of user: "
-                                        << args.userName.getFullName());
+Status checkAuthorizedToSetRestrictions(AuthorizationSession* authzSession,
+                                        bool hasAuthRestriction,
+                                        StringData dbname) {
+    if (hasAuthRestriction) {
+        if (!authzSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forDatabaseName(dbname),
+                ActionType::setAuthenticationRestriction)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
-    }
-
-    if (args.hasCustomData) {
-        if (!authzSession->isAuthorizedToChangeOwnCustomDataAsUser(args.userName) &&
-            !authzSession->isAuthorizedForActionsOnResource(
-                ResourcePattern::forDatabaseName(args.userName.getDB()),
-                ActionType::changeCustomData)) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "Not authorized to change customData of user: "
-                                        << args.userName.getFullName());
-        }
-    }
-
-    if (args.hasRoles) {
-        // You don't know what roles you might be revoking, so require the ability to
-        // revoke any role in the system.
-        if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forAnyNormalResource(),
-                                                            ActionType::revokeRole)) {
-            return Status(ErrorCodes::Unauthorized,
-                          "In order to use updateUser to set roles array, must be "
-                          "authorized to revoke any role in the system");
-        }
-
-        return checkAuthorizedToGrantRoles(authzSession, args.roles);
     }
 
     return Status::OK();
 }
 
-Status checkAuthForGrantRolesToUserCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    std::vector<RoleName> roles;
-    std::string unusedUserNameString;
-    BSONObj unusedWriteConcern;
-    Status status = auth::parseRolePossessionManipulationCommands(
-        cmdObj, "grantRolesToUser", dbname, &unusedUserNameString, &roles, &unusedWriteConcern);
-    if (!status.isOK()) {
-        return status;
-    }
+void checkAuthForTypedCommand(Client* client, const CreateUserCommand& request) {
+    const auto& dbname = request.getDbName();
+    auto* as = AuthorizationSession::get(client);
 
-    return checkAuthorizedToGrantRoles(authzSession, roles);
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to create users on db: " << dbname,
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                 ActionType::createUser));
+
+    auto resolvedRoles = resolveRoleNames(request.getRoles(), dbname);
+    uassertStatusOK(checkAuthorizedToGrantRoles(as, resolvedRoles));
+
+    uassertStatusOK(checkAuthorizedToSetRestrictions(
+        as, request.getAuthenticationRestrictions() != boost::none, dbname));
 }
 
-Status checkAuthForCreateRoleCommand(ClientBasic* client,
-                                     const std::string& dbname,
-                                     const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    auth::CreateOrUpdateRoleArgs args;
-    Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj, "createRole", dbname, &args);
-    if (!status.isOK()) {
-        return status;
+void checkAuthForTypedCommand(Client* client, const UpdateUserCommand& request) {
+    const auto& dbname = request.getDbName();
+    auto* as = AuthorizationSession::get(client);
+
+    UserName userName(request.getCommandParameter(), dbname);
+    uassert(
+        ErrorCodes::Unauthorized,
+        str::stream() << "Not authorized to change password of user: " << userName.getFullName(),
+        (request.getPwd() == boost::none) || as->isAuthorizedToChangeOwnPasswordAsUser(userName) ||
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                 ActionType::changePassword));
+
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to change customData of user: "
+                          << userName.getFullName(),
+            (request.getCustomData() == boost::none) ||
+                as->isAuthorizedToChangeOwnCustomDataAsUser(userName) ||
+                as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                     ActionType::changeCustomData));
+
+    if (auto possibleRoles = request.getRoles()) {
+        // You don't know what roles you might be revoking, so require the ability to
+        // revoke any role in the system.
+        uassert(ErrorCodes::Unauthorized,
+                "In order to use updateUser to set roles array, must be "
+                "authorized to revoke any role in the system",
+                as->isAuthorizedForActionsOnResource(ResourcePattern::forAnyNormalResource(),
+                                                     ActionType::revokeRole));
+
+        auto resolvedRoles = resolveRoleNames(possibleRoles.get(), dbname);
+        uassertStatusOK(checkAuthorizedToGrantRoles(as, resolvedRoles));
     }
 
-    if (!authzSession->isAuthorizedForActionsOnResource(
-            ResourcePattern::forDatabaseName(args.roleName.getDB()), ActionType::createRole)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream()
-                          << "Not authorized to create roles on db: " << args.roleName.getDB());
-    }
-
-    status = checkAuthorizedToGrantRoles(authzSession, args.roles);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return checkAuthorizedToGrantPrivileges(authzSession, args.privileges);
+    uassertStatusOK(checkAuthorizedToSetRestrictions(
+        as, request.getAuthenticationRestrictions() != boost::none, dbname));
 }
 
-Status checkAuthForUpdateRoleCommand(ClientBasic* client,
-                                     const std::string& dbname,
-                                     const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    auth::CreateOrUpdateRoleArgs args;
-    Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj, "updateRole", dbname, &args);
-    if (!status.isOK()) {
-        return status;
-    }
+void checkAuthForTypedCommand(Client* client, const GrantRolesToUserCommand& request) {
+    auto roles = resolveRoleNames(request.getRoles(), request.getDbName());
+    auto* as = AuthorizationSession::get(client);
+    uassertStatusOK(checkAuthorizedToGrantRoles(as, roles));
+}
+
+void checkAuthForTypedCommand(Client* client, const CreateRoleCommand& request) {
+    auto* as = AuthorizationSession::get(client);
+    const auto& dbname = request.getDbName();
+    RoleName roleName(request.getCommandParameter(), dbname);
+
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to create roles on db: " << dbname,
+            as->isAuthorizedToCreateRole(roleName));
+
+    uassertStatusOK(checkAuthorizedToGrantRoles(as, resolveRoleNames(request.getRoles(), dbname)));
+    uassertStatusOK(checkAuthorizedToGrantPrivileges(as, request.getPrivileges()));
+    uassertStatusOK(checkAuthorizedToSetRestrictions(
+        as, request.getAuthenticationRestrictions() != boost::none, dbname));
+}
+
+void checkAuthForTypedCommand(Client* client, const UpdateRoleCommand& request) {
+    auto* as = AuthorizationSession::get(client);
+    const auto& dbname = request.getDbName();
 
     // You don't know what roles or privileges you might be revoking, so require the ability
     // to revoke any role (or privilege) in the system.
-    if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forAnyNormalResource(),
-                                                        ActionType::revokeRole)) {
-        return Status(ErrorCodes::Unauthorized,
-                      "updateRole command required the ability to revoke any role in the "
-                      "system");
-    }
+    uassert(ErrorCodes::Unauthorized,
+            "updateRole command required the ability to revoke any role in the system",
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forAnyNormalResource(),
+                                                 ActionType::revokeRole));
 
-    status = checkAuthorizedToGrantRoles(authzSession, args.roles);
-    if (!status.isOK()) {
-        return status;
+    if (auto roles = request.getRoles()) {
+        auto resolvedRoles = resolveRoleNames(roles.get(), dbname);
+        uassertStatusOK(checkAuthorizedToGrantRoles(as, resolvedRoles));
     }
-
-    return checkAuthorizedToGrantPrivileges(authzSession, args.privileges);
+    if (auto privs = request.getPrivileges()) {
+        uassertStatusOK(checkAuthorizedToGrantPrivileges(as, privs.get()));
+    }
+    uassertStatusOK(checkAuthorizedToSetRestrictions(
+        as, request.getAuthenticationRestrictions() != boost::none, dbname));
 }
 
-Status checkAuthForGrantRolesToRoleCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    std::vector<RoleName> roles;
-    std::string unusedUserNameString;
-    BSONObj unusedWriteConcern;
-    Status status = auth::parseRolePossessionManipulationCommands(
-        cmdObj, "grantRolesToRole", dbname, &unusedUserNameString, &roles, &unusedWriteConcern);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return checkAuthorizedToGrantRoles(authzSession, roles);
+void checkAuthForTypedCommand(Client* client, const GrantRolesToRoleCommand& request) {
+    auto rolesToRemove = resolveRoleNames(request.getRoles(), request.getDbName());
+    auto* as = AuthorizationSession::get(client);
+    uassertStatusOK(checkAuthorizedToGrantRoles(as, rolesToRemove));
 }
 
-Status checkAuthForGrantPrivilegesToRoleCommand(ClientBasic* client,
-                                                const std::string& dbname,
-                                                const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    PrivilegeVector privileges;
-    RoleName unusedRoleName;
-    BSONObj unusedWriteConcern;
-    Status status = auth::parseAndValidateRolePrivilegeManipulationCommands(
-        cmdObj, "grantPrivilegesToRole", dbname, &unusedRoleName, &privileges, &unusedWriteConcern);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return checkAuthorizedToGrantPrivileges(authzSession, privileges);
+void checkAuthForTypedCommand(Client* client, const GrantPrivilegesToRoleCommand& request) {
+    auto* as = AuthorizationSession::get(client);
+    uassertStatusOK(checkAuthorizedToGrantPrivileges(as, request.getPrivileges()));
 }
 
-Status checkAuthForDropUserCommand(ClientBasic* client,
-                                   const std::string& dbname,
-                                   const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    UserName userName;
-    BSONObj unusedWriteConcern;
-    Status status =
-        auth::parseAndValidateDropUserCommand(cmdObj, dbname, &userName, &unusedWriteConcern);
-    if (!status.isOK()) {
-        return status;
-    }
+void checkAuthForTypedCommand(Client* client, const DropUserCommand& request) {
+    auto* as = AuthorizationSession::get(client);
+    UserName userName(request.getCommandParameter(), request.getDbName());
 
-    if (!authzSession->isAuthorizedForActionsOnResource(
-            ResourcePattern::forDatabaseName(userName.getDB()), ActionType::dropUser)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to drop users from the " << userName.getDB()
-                                    << " database");
-    }
-    return Status::OK();
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to drop users from the " << userName.getDB()
+                          << " database",
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(userName.getDB()),
+                                                 ActionType::dropUser));
 }
 
-Status checkAuthForDropRoleCommand(ClientBasic* client,
-                                   const std::string& dbname,
-                                   const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    RoleName roleName;
-    BSONObj unusedWriteConcern;
-    Status status = auth::parseDropRoleCommand(cmdObj, dbname, &roleName, &unusedWriteConcern);
-    if (!status.isOK()) {
-        return status;
-    }
+void checkAuthForTypedCommand(Client* client, const DropRoleCommand& request) {
+    const auto& dbname = request.getDbName();
+    auto* as = AuthorizationSession::get(client);
 
-    if (!authzSession->isAuthorizedForActionsOnResource(
-            ResourcePattern::forDatabaseName(roleName.getDB()), ActionType::dropRole)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to drop roles from the " << roleName.getDB()
-                                    << " database");
-    }
-    return Status::OK();
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to drop roles from the " << dbname << " database",
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                 ActionType::dropRole));
 }
 
-Status checkAuthForDropAllUsersFromDatabaseCommand(ClientBasic* client, const std::string& dbname) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
-                                                        ActionType::dropUser)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to drop users from the " << dbname
-                                    << " database");
-    }
-    return Status::OK();
+void checkAuthForTypedCommand(Client* client, const DropAllUsersFromDatabaseCommand& request) {
+    const auto& dbname = request.getDbName();
+    auto* as = AuthorizationSession::get(client);
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to drop users from the " << dbname << " database",
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                 ActionType::dropUser));
 }
 
-Status checkAuthForRevokeRolesFromUserCommand(ClientBasic* client,
-                                              const std::string& dbname,
-                                              const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    std::vector<RoleName> roles;
-    std::string unusedUserNameString;
-    BSONObj unusedWriteConcern;
-    Status status = auth::parseRolePossessionManipulationCommands(
-        cmdObj, "revokeRolesFromUser", dbname, &unusedUserNameString, &roles, &unusedWriteConcern);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return checkAuthorizedToRevokeRoles(authzSession, roles);
+void checkAuthForTypedCommand(Client* client, const RevokeRolesFromUserCommand& request) {
+    auto roles = resolveRoleNames(request.getRoles(), request.getDbName());
+    auto* as = AuthorizationSession::get(client);
+    uassertStatusOK(checkAuthorizedToRevokeRoles(as, roles));
 }
 
-Status checkAuthForRevokeRolesFromRoleCommand(ClientBasic* client,
-                                              const std::string& dbname,
-                                              const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    std::vector<RoleName> roles;
-    std::string unusedUserNameString;
-    BSONObj unusedWriteConcern;
-    Status status = auth::parseRolePossessionManipulationCommands(
-        cmdObj, "revokeRolesFromRole", dbname, &unusedUserNameString, &roles, &unusedWriteConcern);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return checkAuthorizedToRevokeRoles(authzSession, roles);
+void checkAuthForTypedCommand(Client* client, const RevokeRolesFromRoleCommand& request) {
+    auto rolesToRemove = resolveRoleNames(request.getRoles(), request.getDbName());
+    auto* as = AuthorizationSession::get(client);
+    uassertStatusOK(checkAuthorizedToRevokeRoles(as, rolesToRemove));
 }
 
-Status checkAuthForUsersInfoCommand(ClientBasic* client,
-                                    const std::string& dbname,
-                                    const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    auth::UsersInfoArgs args;
-    Status status = auth::parseUsersInfoCommand(cmdObj, dbname, &args);
-    if (!status.isOK()) {
-        return status;
-    }
+void checkAuthForTypedCommand(Client* client, const UsersInfoCommand& request) {
+    const auto& dbname = request.getDbName();
+    const auto& arg = request.getCommandParameter();
+    auto* as = AuthorizationSession::get(client);
 
-    if (args.allForDB) {
-        if (!authzSession->isAuthorizedForActionsOnResource(
-                ResourcePattern::forDatabaseName(dbname), ActionType::viewUser)) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "Not authorized to view users from the " << dbname
-                                        << " database");
-        }
+    if (arg.isAllOnCurrentDB()) {
+        uassert(ErrorCodes::Unauthorized,
+                str::stream() << "Not authorized to view users from the " << dbname << " database",
+                as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                     ActionType::viewUser));
+    } else if (arg.isAllForAllDBs()) {
+        uassert(ErrorCodes::Unauthorized,
+                str::stream() << "Not authorized to view users from all databases",
+                as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                     ActionType::viewUser));
     } else {
-        for (size_t i = 0; i < args.userNames.size(); ++i) {
-            if (authzSession->lookupUser(args.userNames[i])) {
-                continue;  // Can always view users you are logged in as
+        invariant(arg.isExact());
+        for (const auto& userName : arg.getElements(dbname)) {
+            if (as->lookupUser(userName)) {
+                // Can always view users you are logged in as.
+                continue;
             }
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(args.userNames[i].getDB()),
-                    ActionType::viewUser)) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to view users from the " << dbname
-                                            << " database");
-            }
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to view users from the " << dbname
+                                  << " database",
+                    as->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forDatabaseName(userName.getDB()), ActionType::viewUser));
         }
     }
-    return Status::OK();
 }
 
-Status checkAuthForRevokePrivilegesFromRoleCommand(ClientBasic* client,
-                                                   const std::string& dbname,
-                                                   const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    PrivilegeVector privileges;
-    RoleName unusedRoleName;
-    BSONObj unusedWriteConcern;
-    Status status =
-        auth::parseAndValidateRolePrivilegeManipulationCommands(cmdObj,
-                                                                "revokePrivilegesFromRole",
-                                                                dbname,
-                                                                &unusedRoleName,
-                                                                &privileges,
-                                                                &unusedWriteConcern);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return checkAuthorizedToRevokePrivileges(authzSession, privileges);
+void checkAuthForTypedCommand(Client* client, const RevokePrivilegesFromRoleCommand& request) {
+    auto* as = AuthorizationSession::get(client);
+    uassertStatusOK(checkAuthorizedToRevokePrivileges(as, request.getPrivileges()));
 }
 
-Status checkAuthForDropAllRolesFromDatabaseCommand(ClientBasic* client, const std::string& dbname) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
-                                                        ActionType::dropRole)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to drop roles from the " << dbname
-                                    << " database");
-    }
-    return Status::OK();
+void checkAuthForTypedCommand(Client* client, const DropAllRolesFromDatabaseCommand& request) {
+    const auto& dbname = request.getDbName();
+    auto* as = AuthorizationSession::get(client);
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to drop roles from the " << dbname << " database",
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                 ActionType::dropRole));
 }
 
-Status checkAuthForRolesInfoCommand(ClientBasic* client,
-                                    const std::string& dbname,
-                                    const BSONObj& cmdObj) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    auth::RolesInfoArgs args;
-    Status status = auth::parseRolesInfoCommand(cmdObj, dbname, &args);
-    if (!status.isOK()) {
-        return status;
-    }
+void checkAuthForTypedCommand(Client* client, const RolesInfoCommand& request) {
+    const auto& dbname = request.getDbName();
+    const auto& arg = request.getCommandParameter();
+    auto* as = AuthorizationSession::get(client);
 
-    if (args.allForDB) {
-        if (!authzSession->isAuthorizedForActionsOnResource(
-                ResourcePattern::forDatabaseName(dbname), ActionType::viewRole)) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "Not authorized to view roles from the " << dbname
-                                        << " database");
-        }
+    invariant(!arg.isAllForAllDBs());
+    if (arg.isAllOnCurrentDB()) {
+        uassert(ErrorCodes::Unauthorized,
+                str::stream() << "Not authorized to view roles from the " << dbname << " database",
+                as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
+                                                     ActionType::viewRole));
     } else {
-        for (size_t i = 0; i < args.roleNames.size(); ++i) {
-            if (authzSession->isAuthenticatedAsUserWithRole(args.roleNames[i])) {
+        invariant(arg.isExact());
+        auto roles = arg.getElements(dbname);
+        for (const auto& role : roles) {
+            if (as->isAuthenticatedAsUserWithRole(role)) {
                 continue;  // Can always see roles that you are a member of
             }
 
-            if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(args.roleNames[i].getDB()),
-                    ActionType::viewRole)) {
-                return Status(ErrorCodes::Unauthorized,
-                              str::stream() << "Not authorized to view roles from the "
-                                            << args.roleNames[i].getDB() << " database");
-            }
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to view roles from the " << role.getDB()
+                                  << " database",
+                    as->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forDatabaseName(role.getDB()), ActionType::viewRole));
         }
     }
-
-    return Status::OK();
 }
 
-Status checkAuthForInvalidateUserCacheCommand(ClientBasic* client) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                        ActionType::invalidateUserCache)) {
-        return Status(ErrorCodes::Unauthorized, "Not authorized to invalidate user cache");
-    }
-    return Status::OK();
+void checkAuthForTypedCommand(Client* client, const InvalidateUserCacheCommand& request) {
+    auto* as = AuthorizationSession::get(client);
+    uassert(ErrorCodes::Unauthorized,
+            "Not authorized to invalidate user cache",
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                 ActionType::invalidateUserCache));
 }
 
-Status checkAuthForGetUserCacheGenerationCommand(ClientBasic* client) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                        ActionType::internal)) {
-        return Status(ErrorCodes::Unauthorized, "Not authorized to get cache generation");
-    }
-    return Status::OK();
+void checkAuthForTypedCommand(Client* client, const GetUserCacheGenerationCommand& request) {
+    auto* as = AuthorizationSession::get(client);
+    uassert(ErrorCodes::Unauthorized,
+            "Not authorized to get cache generation",
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                 ActionType::internal));
 }
 
-Status checkAuthForMergeAuthzCollectionsCommand(ClientBasic* client, const BSONObj& cmdObj) {
-    auth::MergeAuthzCollectionsArgs args;
-    Status status = auth::parseMergeAuthzCollectionsCommand(cmdObj, &args);
-    if (!status.isOK()) {
-        return status;
-    }
+void checkAuthForTypedCommand(Client* client, const MergeAuthzCollectionsCommand& request) {
+    auto* as = AuthorizationSession::get(client);
 
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
     ActionSet actions;
     actions.addAction(ActionType::createUser);
     actions.addAction(ActionType::createRole);
     actions.addAction(ActionType::grantRole);
     actions.addAction(ActionType::revokeRole);
-    if (args.drop) {
+    if (request.getDrop()) {
         actions.addAction(ActionType::dropUser);
         actions.addAction(ActionType::dropRole);
     }
-    if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forAnyNormalResource(),
-                                                        actions)) {
-        return Status(ErrorCodes::Unauthorized,
-                      "Not authorized to update user/role data using _mergeAuthzCollections"
-                      " command");
-    }
-    if (!args.usersCollName.empty() &&
-        !authzSession->isAuthorizedForActionsOnResource(
-            ResourcePattern::forExactNamespace(NamespaceString(args.usersCollName)),
-            ActionType::find)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to read " << args.usersCollName);
-    }
-    if (!args.rolesCollName.empty() &&
-        !authzSession->isAuthorizedForActionsOnResource(
-            ResourcePattern::forExactNamespace(NamespaceString(args.rolesCollName)),
-            ActionType::find)) {
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to read " << args.rolesCollName);
-    }
-    return Status::OK();
-}
+    uassert(ErrorCodes::Unauthorized,
+            "Not authorized to update user/role data using _mergeAuthzCollections a command",
+            as->isAuthorizedForActionsOnResource(ResourcePattern::forAnyNormalResource(), actions));
 
-Status checkAuthForAuthSchemaUpgradeCommand(ClientBasic* client) {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                        ActionType::authSchemaUpgrade)) {
-        return Status(ErrorCodes::Unauthorized, "Not authorized to run authSchemaUpgrade command.");
-    }
-    return Status::OK();
+    auto tempUsersColl = request.getTempUsersCollection();
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to read " << tempUsersColl,
+            tempUsersColl.empty() ||
+                as->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forExactNamespace(NamespaceString(tempUsersColl)),
+                    ActionType::find));
+
+    auto tempRolesColl = request.getTempRolesCollection();
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to read " << tempRolesColl,
+            tempRolesColl.empty() ||
+                as->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forExactNamespace(NamespaceString(tempRolesColl)),
+                    ActionType::find));
 }
 
 }  // namespace auth

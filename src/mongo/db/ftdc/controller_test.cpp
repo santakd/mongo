@@ -1,35 +1,37 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem.hpp>
 #include <iostream>
+#include <memory>
 
 #include "mongo/base/data_type_validated.h"
 #include "mongo/base/init.h"
@@ -49,31 +51,45 @@
 
 namespace mongo {
 
+class FTDCControllerTest : public FTDCTest {};
+
 class FTDCMetricsCollectorMockTee : public FTDCCollectorInterface {
 public:
     ~FTDCMetricsCollectorMockTee() {
         ASSERT_TRUE(_state == State::kStarted);
     }
 
-    void collect(OperationContext* txn, BSONObjBuilder& builder) final {
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) final {
         _state = State::kStarted;
+
+        stdx::unique_lock<Latch> lck(_mutex);
+
         ++_counter;
 
+        // Generate document to return for collector
         generateDocument(builder, _counter);
 
+        // Generate an entire document as if the FTDCCollector generates it
         {
             BSONObjBuilder b2;
-            BSONObjBuilder subObjBuilder(b2.subobjStart(name()));
 
-            subObjBuilder.appendDate(kFTDCCollectStartField,
-                                     getGlobalServiceContext()->getClockSource()->now());
+            b2.appendDate(kFTDCCollectStartField,
+                          getGlobalServiceContext()->getPreciseClockSource()->now());
 
-            generateDocument(subObjBuilder, _counter);
+            {
+                BSONObjBuilder subObjBuilder(b2.subobjStart(name()));
 
-            subObjBuilder.appendDate(kFTDCCollectEndField,
-                                     getGlobalServiceContext()->getClockSource()->now());
+                subObjBuilder.appendDate(kFTDCCollectStartField,
+                                         getGlobalServiceContext()->getPreciseClockSource()->now());
 
-            subObjBuilder.done();
+                generateDocument(subObjBuilder, _counter);
+
+                subObjBuilder.appendDate(kFTDCCollectEndField,
+                                         getGlobalServiceContext()->getPreciseClockSource()->now());
+            }
+
+            b2.appendDate(kFTDCCollectEndField,
+                          getGlobalServiceContext()->getPreciseClockSource()->now());
 
             _docs.emplace_back(b2.obj());
         }
@@ -94,7 +110,7 @@ public:
     }
 
     void wait() {
-        stdx::unique_lock<stdx::mutex> lck(_mutex);
+        stdx::unique_lock<Latch> lck(_mutex);
         while (_counter < _wait) {
             _condvar.wait(lck);
         }
@@ -106,8 +122,8 @@ public:
 
 private:
     /**
-    * Private enum to ensure caller uses class correctly.
-    */
+     * Private enum to ensure caller uses class correctly.
+     */
     enum class State {
         kNotStarted,
         kStarted,
@@ -120,7 +136,7 @@ private:
 
     std::vector<BSONObj> _docs;
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("FTDCMetricsCollectorMockTee::_mutex");
     stdx::condition_variable _condvar;
     std::uint32_t _wait{0};
 };
@@ -129,7 +145,7 @@ class FTDCMetricsCollectorMock2 : public FTDCMetricsCollectorMockTee {
 public:
     void generateDocument(BSONObjBuilder& builder, std::uint32_t counter) final {
         builder.append("name", "joe");
-        builder.append("key1", (counter * 37));
+        builder.append("key1", static_cast<int32_t>(counter * 37));
         builder.append("key2", static_cast<double>(counter * static_cast<int>(log10f(counter))));
     }
 };
@@ -144,7 +160,7 @@ public:
 };
 
 // Test a run of the controller and the data it logs to log file
-TEST(FTDCControllerTest, TestFull) {
+TEST_F(FTDCControllerTest, TestFull) {
     unittest::TempDir tempdir("metrics_testpath");
     boost::filesystem::path dir(tempdir.path());
 
@@ -158,8 +174,8 @@ TEST(FTDCControllerTest, TestFull) {
 
     FTDCController c(dir, config);
 
-    auto c1 = std::unique_ptr<FTDCMetricsCollectorMock2>(new FTDCMetricsCollectorMock2());
-    auto c2 = std::unique_ptr<FTDCMetricsCollectorMockRotate>(new FTDCMetricsCollectorMockRotate());
+    auto c1 = std::make_unique<FTDCMetricsCollectorMock2>();
+    auto c2 = std::make_unique<FTDCMetricsCollectorMockRotate>();
 
     auto c1Ptr = c1.get();
     auto c2Ptr = c2.get();
@@ -183,8 +199,7 @@ TEST(FTDCControllerTest, TestFull) {
     auto docsRotate = c2Ptr->getDocs();
     ASSERT_EQUALS(docsRotate.size(), 1UL);
 
-    std::vector<BSONObj> allDocs;
-    allDocs.insert(allDocs.end(), docsRotate.begin(), docsRotate.end());
+    std::vector<BSONObj> allDocs(docsRotate.begin(), docsRotate.end());
     allDocs.insert(allDocs.end(), docsPeriodic.begin(), docsPeriodic.end());
 
     auto files = scanDirectory(dir);
@@ -193,7 +208,79 @@ TEST(FTDCControllerTest, TestFull) {
 
     auto alog = files[0];
 
-    ValidateDocumentList(alog, allDocs);
+    ValidateDocumentList(alog, allDocs, FTDCValidationMode::kStrict);
+}
+
+// Test we can start and stop the controller in quick succession, make sure it succeeds without
+// assert or fault
+TEST_F(FTDCControllerTest, TestStartStop) {
+    unittest::TempDir tempdir("metrics_testpath");
+    boost::filesystem::path dir(tempdir.path());
+
+    createDirectoryClean(dir);
+
+    FTDCConfig config;
+    config.enabled = false;
+    config.period = Milliseconds(1);
+    config.maxFileSizeBytes = FTDCConfig::kMaxFileSizeBytesDefault;
+    config.maxDirectorySizeBytes = FTDCConfig::kMaxDirectorySizeBytesDefault;
+
+    FTDCController c(dir, config);
+
+    c.start();
+
+    c.stop();
+}
+
+// Test we can start the controller as disabled, the directory is empty, and then we can succesfully
+// enable it
+TEST_F(FTDCControllerTest, TestStartAsDisabled) {
+    unittest::TempDir tempdir("metrics_testpath");
+    boost::filesystem::path dir(tempdir.path());
+
+    createDirectoryClean(dir);
+
+    FTDCConfig config;
+    config.enabled = false;
+    config.period = Milliseconds(1);
+    config.maxFileSizeBytes = FTDCConfig::kMaxFileSizeBytesDefault;
+    config.maxDirectorySizeBytes = FTDCConfig::kMaxDirectorySizeBytesDefault;
+
+    auto c1 = std::make_unique<FTDCMetricsCollectorMock2>();
+
+    auto c1Ptr = c1.get();
+
+    FTDCController c(dir, config);
+
+    c.addPeriodicCollector(std::move(c1));
+
+    c.start();
+
+    auto files0 = scanDirectory(dir);
+
+    ASSERT_EQUALS(files0.size(), 0UL);
+
+    ASSERT_OK(c.setEnabled(true));
+
+    c1Ptr->setSignalOnCount(50);
+
+    // Wait for 50 samples to have occured
+    c1Ptr->wait();
+
+    c.stop();
+
+    auto docsPeriodic = c1Ptr->getDocs();
+    ASSERT_GREATER_THAN_OR_EQUALS(docsPeriodic.size(), 50UL);
+
+    std::vector<BSONObj> allDocs(docsPeriodic.begin(), docsPeriodic.end());
+
+    auto files = scanDirectory(dir);
+
+    ASSERT_EQUALS(files.size(), 1UL);
+
+    auto alog = files[0];
+
+    ValidateDocumentList(alog, allDocs, FTDCValidationMode::kStrict);
 }
 
 }  // namespace mongo

@@ -3,45 +3,77 @@
 (function() {
 "use strict";
 
-var exceededTimeLimitCode = 50;
-var writeConcernFailedCode = 64;
-var replTest = new ReplSetTest({ nodes: 3 });
+load("jstests/libs/write_concern_util.js");
+
+var replTest = new ReplSetTest({nodes: 3});
 replTest.startSet();
 replTest.initiate();
-replTest.stop(0); // Make sure that there are only 2 nodes up so w:3 writes will always time out
 var primary = replTest.getPrimary();
 var testDB = primary.getDB('test');
+const collName = 'foo';
+var testColl = testDB.getCollection(collName);
+
+// Insert a document and implicitly create the collection.
+let resetCollection = function(w) {
+    assert.commandWorked(
+        testColl.insert({_id: 0}, {writeConcern: {w: w, wtimeout: replTest.kDefaultTimeoutMS}}));
+    assert.eq(1, testColl.find().itcount());
+};
+
+resetCollection(3);
+
+// Make sure that there are only 2 nodes up so w:3 writes will always time out
+replTest.stop(2);
 
 // Test wtimeout
-var res = testDB.runCommand({insert: 'foo',
-                             documents: [{a:1}],
-                             writeConcern: {w: 3, wtimeout: 1000}});
-assert.commandWorked(res); // Commands with write concern errors still report success.
-assert.eq(writeConcernFailedCode, res.writeConcernError.code);
+var res = testDB.runCommand(
+    {insert: collName, documents: [{a: 1}], writeConcern: {w: 3, wtimeout: 1000}});
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
+assert.eq(ErrorCodes.WriteConcernFailed, res.writeConcernError.code);
 
 // Test maxTimeMS timeout
-res = testDB.runCommand({insert: 'foo',
-                         documents: [{a:1}],
-                         writeConcern: {w: 3},
-                         maxTimeMS: 1000});
-assert.commandWorked(res); // Commands with write concern errors still report success.
-assert.eq(exceededTimeLimitCode, res.writeConcernError.code);
+res = testDB.runCommand(
+    {insert: collName, documents: [{a: 1}], writeConcern: {w: 3}, maxTimeMS: 1000});
+assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
 
 // Test with wtimeout < maxTimeMS
-res = testDB.runCommand({insert: 'foo',
-                         documents: [{a:1}],
-                         writeConcern: {w: 3, wtimeout: 1000},
-                         maxTimeMS: 10 * 1000});
-assert.commandWorked(res); // Commands with write concern errors still report success.
-assert.eq(writeConcernFailedCode, res.writeConcernError.code);
+res = testDB.runCommand({
+    insert: collName,
+    documents: [{a: 1}],
+    writeConcern: {w: 3, wtimeout: 1000},
+    maxTimeMS: 10 * 1000
+});
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
+assert.eq(ErrorCodes.WriteConcernFailed, res.writeConcernError.code);
 
 // Test with wtimeout > maxTimeMS
-res = testDB.runCommand({insert: 'foo',
-                         documents: [{a:1}],
-                         writeConcern: {w: 3, wtimeout: 10* 1000},
-                         maxTimeMS: 1000});
-assert.commandWorked(res); // Commands with write concern errors still report success.
-assert.eq(exceededTimeLimitCode, res.writeConcernError.code);
-replTest.stopSet();
+res = testDB.runCommand({
+    insert: collName,
+    documents: [{a: 1}],
+    writeConcern: {w: 3, wtimeout: 10 * 1000},
+    maxTimeMS: 1000
+});
+assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
 
+// dropDatabase respects the 'w' field when it is stronger than the default of majority.
+res = testDB.runCommand({dropDatabase: 1, writeConcern: {w: 3, wtimeout: 1000}});
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
+assert.eq(ErrorCodes.WriteConcernFailed, res.writeConcernError.code);
+
+resetCollection(2);
+
+// Pause the oplog fetcher on secondary so that commit point doesn't advance, meaning that a dropped
+// database on the primary will remain in 'drop-pending' state. As there isn't anything in the oplog
+// buffer at this time, it is safe to pause the oplog fetcher.
+var secondary = replTest.getSecondary();
+jsTestLog("Pausing the oplog fetcher on the secondary node.");
+stopServerReplication(secondary);
+
+// dropDatabase defaults to 'majority' when a weaker 'w' field is provided, but respects
+// 'wtimeout'.
+res = testDB.runCommand({dropDatabase: 1, writeConcern: {w: 1, wtimeout: 1000}});
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
+
+restartServerReplication(secondary);
+replTest.stopSet();
 })();

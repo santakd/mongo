@@ -1,36 +1,40 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/dbtests/mock/mock_replica_set.h"
 
 #include "mongo/db/repl/member_state.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/util/map_util.h"
+#include "mongo/util/invariant.h"
 
 #include <sstream>
 
@@ -41,18 +45,28 @@ namespace mongo {
 using std::string;
 using std::vector;
 
-MockReplicaSet::MockReplicaSet(const string& setName, size_t nodes) : _setName(setName) {
+MockReplicaSet::MockReplicaSet(const string& setName,
+                               size_t nodes,
+                               bool hasPrimary,
+                               bool dollarPrefixHosts)
+    : _setName(setName) {
+    invariant(nodes > 0);
     BSONObjBuilder configBuilder;
     configBuilder.append("_id", setName);
     configBuilder.append("version", 1);
+    configBuilder.append("protocolVersion", 1);
 
     BSONArrayBuilder membersBuilder(configBuilder.subarrayStart("members"));
+    // If e.g. setName="rs" and dollarPrefixHosts=true, make hostnames like "$rs0:27017,$rs1:27017".
     for (size_t n = 0; n < nodes; n++) {
         std::stringstream str;
-        str << "$" << setName << n << ":27017";
+        if (dollarPrefixHosts) {
+            str << "$";
+        }
+        str << setName << n << ":27017";
         const string hostName(str.str());
 
-        if (n == 0) {
+        if (n == 0 && hasPrimary) {
             _primaryHost = hostName;
         }
 
@@ -65,8 +79,12 @@ MockReplicaSet::MockReplicaSet(const string& setName, size_t nodes) : _setName(s
     }
     membersBuilder.done();
 
-    ReplicaSetConfig replConfig;
-    fassert(28566, replConfig.initialize(configBuilder.obj()));
+    ReplSetConfig replConfig;
+    try {
+        replConfig = ReplSetConfig::parse(configBuilder.obj());
+    } catch (const DBException&) {
+        fassertFailed(28566);
+    }
     fassert(28573, replConfig.validate());
     setConfig(replConfig);
 }
@@ -100,6 +118,10 @@ string MockReplicaSet::getConnectionString() const {
     return str.str();
 }
 
+MongoURI MockReplicaSet::getURI() const {
+    return invariant(MongoURI::parse(getConnectionString()));
+}
+
 vector<HostAndPort> MockReplicaSet::getHosts() const {
     vector<HostAndPort> list;
 
@@ -110,15 +132,21 @@ vector<HostAndPort> MockReplicaSet::getHosts() const {
     return list;
 }
 
+bool MockReplicaSet::hasPrimary() const {
+    return !_primaryHost.empty();
+}
+
 string MockReplicaSet::getPrimary() const {
     return _primaryHost;
 }
 
 void MockReplicaSet::setPrimary(const string& hostAndPort) {
-    const MemberConfig* config = _replConfig.findMemberByHostAndPort(HostAndPort(hostAndPort));
-    fassert(16578, config);
+    if (!hostAndPort.empty()) {
+        const MemberConfig* config = _replConfig.findMemberByHostAndPort(HostAndPort(hostAndPort));
+        fassert(16578, config);
 
-    fassert(16579, !config->isHidden() && config->getPriority() > 0 && !config->isArbiter());
+        fassert(16579, !config->isHidden() && config->getPriority() > 0 && !config->isArbiter());
+    }
 
     _primaryHost = hostAndPort;
 
@@ -129,10 +157,10 @@ void MockReplicaSet::setPrimary(const string& hostAndPort) {
 vector<string> MockReplicaSet::getSecondaries() const {
     vector<string> secondaries;
 
-    for (ReplicaSetConfig::MemberIterator member = _replConfig.membersBegin();
+    for (ReplSetConfig::MemberIterator member = _replConfig.membersBegin();
          member != _replConfig.membersEnd();
          ++member) {
-        if (member->getHostAndPort() != HostAndPort(_primaryHost)) {
+        if (_primaryHost.empty() || member->getHostAndPort() != HostAndPort(_primaryHost)) {
             secondaries.push_back(member->getHostAndPort().toString());
         }
     }
@@ -141,14 +169,15 @@ vector<string> MockReplicaSet::getSecondaries() const {
 }
 
 MockRemoteDBServer* MockReplicaSet::getNode(const string& hostAndPort) {
-    return mapFindWithDefault(_nodeMap, hostAndPort, static_cast<MockRemoteDBServer*>(NULL));
+    auto iter = _nodeMap.find(hostAndPort);
+    return iter == _nodeMap.end() ? nullptr : iter->second;
 }
 
-repl::ReplicaSetConfig MockReplicaSet::getReplConfig() const {
+repl::ReplSetConfig MockReplicaSet::getReplConfig() const {
     return _replConfig;
 }
 
-void MockReplicaSet::setConfig(const repl::ReplicaSetConfig& newConfig) {
+void MockReplicaSet::setConfig(const repl::ReplSetConfig& newConfig) {
     _replConfig = newConfig;
     mockIsMasterCmd();
     mockReplSetGetStatusCmd();
@@ -193,7 +222,9 @@ void MockReplicaSet::mockIsMasterCmd() {
             {
                 // TODO: add passives & arbiters
                 vector<string> hostList;
-                hostList.push_back(getPrimary());
+                if (hasPrimary()) {
+                    hostList.push_back(getPrimary());
+                }
 
                 const vector<string> secondaries = getSecondaries();
                 for (vector<string>::const_iterator secIter = secondaries.begin();
@@ -205,7 +236,9 @@ void MockReplicaSet::mockIsMasterCmd() {
                 builder.append("hosts", hostList);
             }
 
-            builder.append("primary", getPrimary());
+            if (hasPrimary()) {
+                builder.append("primary", getPrimary());
+            }
 
             if (member->isArbiter()) {
                 builder.append("arbiterOnly", true);
@@ -215,9 +248,9 @@ void MockReplicaSet::mockIsMasterCmd() {
                 builder.append("passive", true);
             }
 
-            if (member->getSlaveDelay().count()) {
-                builder.appendIntOrLL("slaveDelay",
-                                      durationCount<Seconds>(member->getSlaveDelay()));
+            if (member->getSecondaryDelay().count()) {
+                builder.appendIntOrLL("secondaryDelaySecs",
+                                      durationCount<Seconds>(member->getSecondaryDelay()));
             }
 
             if (member->isHidden()) {
@@ -228,8 +261,8 @@ void MockReplicaSet::mockIsMasterCmd() {
                 builder.append("buildIndexes", false);
             }
 
-            const ReplicaSetTagConfig tagConfig = _replConfig.getTagConfig();
-            if (member->hasTags(tagConfig)) {
+            const ReplSetTagConfig tagConfig = _replConfig.getTagConfig();
+            if (member->hasTags()) {
                 BSONObjBuilder tagBuilder;
                 for (MemberConfig::TagIterator tag = member->tagsBegin(); tag != member->tagsEnd();
                      ++tag) {
@@ -247,7 +280,9 @@ void MockReplicaSet::mockIsMasterCmd() {
         builder.append("me", hostAndPort);
         builder.append("ok", true);
 
+        // DBClientBase::isMaster() sends "ismaster", but ReplicaSetMonitor sends "isMaster".
         nodeIter->second->setCommandReply("ismaster", builder.done());
+        nodeIter->second->setCommandReply("isMaster", builder.done());
     }
 }
 
@@ -282,7 +317,7 @@ void MockReplicaSet::mockReplSetGetStatusCmd() {
             hostsField.push_back(selfStatBuilder.obj());
         }
 
-        for (ReplicaSetConfig::MemberIterator member = _replConfig.membersBegin();
+        for (ReplSetConfig::MemberIterator member = _replConfig.membersBegin();
              member != _replConfig.membersEnd();
              ++member) {
             MockRemoteDBServer* hostNode = getNode(member->getHostAndPort().toString());
@@ -304,12 +339,14 @@ void MockReplicaSet::mockReplSetGetStatusCmd() {
             hostsField.push_back(hostMemberBuilder.obj());
         }
 
-        sort(hostsField.begin(), hostsField.end());
+        std::sort(hostsField.begin(),
+                  hostsField.end(),
+                  SimpleBSONObjComparator::kInstance.makeLessThan());
 
         // TODO: syncingTo
 
         fullStatBuilder.append("set", _setName);
-        fullStatBuilder.appendTimeT("date", time(0));
+        fullStatBuilder.appendTimeT("date", time(nullptr));
         fullStatBuilder.append("myState", getState(node->getServerAddress()));
         fullStatBuilder.append("members", hostsField);
         fullStatBuilder.append("ok", true);
@@ -317,4 +354,4 @@ void MockReplicaSet::mockReplSetGetStatusCmd() {
         node->setCommandReply("replSetGetStatus", fullStatBuilder.done());
     }
 }
-}
+}  // namespace mongo

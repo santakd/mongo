@@ -1,78 +1,96 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/mozjs/mongo.h"
 
-#include "mongo/client/dbclientinterface.h"
+#include <memory>
+
+#include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_rs.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/native_sasl_client_session.h"
-#include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/client/sasl_client_session.h"
+#include "mongo/client/replica_set_monitor.h"
+#include "mongo/db/logical_session_id.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/mozjs/cursor.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/session.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/quick_exit.h"
 
 namespace mongo {
 namespace mozjs {
 
 const JSFunctionSpec MongoBase::methods[] = {
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(auth, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        copyDatabaseWithSCRAM, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorFromId, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        cursorHandleFromId, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(find, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        getClientRPCProtocols, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        getServerRPCProtocols, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(insert, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(logout, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(remove, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(runCommand, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        runCommandWithMetadata, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        setClientRPCProtocols, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(update, MongoLocalInfo, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(auth, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(close, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorFromId, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorHandleFromId, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(find, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(generateDataKey, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getDataKeyCollection, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(encrypt, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(decrypt, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getClientRPCProtocols, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getServerRPCProtocols, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(insert, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isReplicaSetConnection, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_markNodeAsFailed, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(logout, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(remove, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(runCommand, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(runCommandWithMetadata, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(setClientRPCProtocols, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(update, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getMinWireVersion, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getMaxWireVersion, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isReplicaSetMember, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isMongos, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getApiParameters, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_startSession, MongoExternalInfo),
     JS_FS_END,
 };
 
 const char* const MongoBase::className = "Mongo";
+
+EncryptedDBClientCallback* encryptedDBClientCallback = nullptr;
 
 const JSFunctionSpec MongoExternalInfo::freeFunctions[4] = {
     MONGO_ATTACH_JS_FUNCTION(_forgetReplSet),
@@ -82,36 +100,148 @@ const JSFunctionSpec MongoExternalInfo::freeFunctions[4] = {
 };
 
 namespace {
-DBClientBase* getConnection(JS::CallArgs& args) {
-    return static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()))
-        ->get();
+
+const std::shared_ptr<DBClientBase>& getConnectionRef(JS::CallArgs& args) {
+    auto ret =
+        static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
+    uassert(
+        ErrorCodes::BadValue, "Trying to get connection for closed Mongo object", *ret != nullptr);
+    return *ret;
 }
 
-void setCursor(JS::HandleObject target,
+DBClientBase* getConnection(JS::CallArgs& args) {
+    return getConnectionRef(args).get();
+}
+
+bool isUnacknowledged(const BSONObj& cmdObj) {
+    auto wc = cmdObj["writeConcern"];
+    return wc && wc["w"].isNumber() && wc["w"].safeNumberLong() == 0;
+}
+
+void returnOk(JSContext* cx, JS::CallArgs& args) {
+    ValueReader(cx, args.rval()).fromBSON(BSON("ok" << 1), nullptr, false);
+}
+
+void runFireAndForgetCommand(const std::shared_ptr<DBClientBase>& conn,
+                             const std::string& database,
+                             BSONObj body,
+                             const BSONObj& extraFields = {}) {
+    auto request = OpMsgRequest::fromDBAndBody(database, body, extraFields);
+    conn->runFireAndForgetCommand(request);
+}
+
+void setCursor(MozJSImplScope* scope,
+               JS::HandleObject target,
                std::unique_ptr<DBClientCursor> cursor,
                JS::CallArgs& args) {
     auto client =
         static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
 
     // Copy the client shared pointer to up the refcount
-    JS_SetPrivate(target, new CursorInfo::CursorHolder(std::move(cursor), *client));
+    JS_SetPrivate(target, scope->trackedNew<CursorInfo::CursorHolder>(std::move(cursor), *client));
 }
 
-void setCursorHandle(JS::HandleObject target, long long cursorId, JS::CallArgs& args) {
+void setCursorHandle(MozJSImplScope* scope,
+                     JS::HandleObject target,
+                     NamespaceString ns,
+                     long long cursorId,
+                     JS::CallArgs& args) {
     auto client =
         static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
 
     // Copy the client shared pointer to up the refcount.
-    JS_SetPrivate(target, new CursorHandleInfo::CursorTracker(cursorId, *client));
+    JS_SetPrivate(
+        target,
+        scope->trackedNew<CursorHandleInfo::CursorTracker>(std::move(ns), cursorId, *client));
 }
+
+void setHiddenMongo(JSContext* cx, JS::HandleValue value, JS::CallArgs& args) {
+    ObjectWrapper o(cx, args.rval());
+    if (!o.hasField(InternedString::_mongo)) {
+        o.defineProperty(InternedString::_mongo, value, JSPROP_READONLY | JSPROP_PERMANENT);
+    }
+}
+
+void setHiddenMongo(JSContext* cx, JS::CallArgs& args) {
+    setHiddenMongo(cx, args.thisv(), args);
+}
+
+void setHiddenMongo(JSContext* cx,
+                    std::shared_ptr<DBClientBase> resPtr,
+                    DBClientBase* origConn,
+                    JS::CallArgs& args) {
+    ObjectWrapper o(cx, args.rval());
+    // If the connection that ran the command is the same as conn, then we set a hidden "_mongo"
+    // property on the returned object that is just "this" Mongo object.
+    if (resPtr.get() == origConn) {
+        setHiddenMongo(cx, args.thisv(), args);
+    } else {
+        JS::RootedObject newMongo(cx);
+
+        auto scope = getScope(cx);
+        scope->getProto<MongoExternalInfo>().newObject(&newMongo);
+
+        auto host = resPtr->getServerAddress();
+        JS_SetPrivate(newMongo,
+                      scope->trackedNew<std::shared_ptr<DBClientBase>>(std::move(resPtr)));
+
+        ObjectWrapper from(cx, args.thisv());
+        ObjectWrapper to(cx, newMongo);
+        for (const auto& k :
+             {InternedString::slaveOk, InternedString::defaultDB, InternedString::authenticated}) {
+            JS::RootedValue tmpValue(cx);
+            from.getValue(k, &tmpValue);
+            to.setValue(k, tmpValue);
+        }
+
+        // 'newMongo' is a direct connection to an individual server. Its "host" property therefore
+        // reports the stringified HostAndPort of the underlying DBClientConnection.
+        to.setString(InternedString::host, host);
+
+        JS::RootedValue value(cx);
+        value.setObjectOrNull(newMongo);
+        setHiddenMongo(cx, value, args);
+    }
+}
+
+EncryptionCallbacks* getEncryptionCallbacks(DBClientBase* conn) {
+    auto callbackPtr = dynamic_cast<EncryptionCallbacks*>(conn);
+    uassert(31083,
+            "Field Level Encryption must be used in enterprise mode with the correct parameters",
+            callbackPtr != nullptr);
+    return callbackPtr;
+}
+
 }  // namespace
 
-void MongoBase::finalize(JSFreeOp* fop, JSObject* obj) {
+void MongoBase::finalize(js::FreeOp* fop, JSObject* obj) {
     auto conn = static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(obj));
 
     if (conn) {
-        delete conn;
+        getScope(fop)->trackedDelete(conn);
     }
+}
+
+void MongoBase::trace(JSTracer* trc, JSObject* obj) {
+    auto conn = static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(obj));
+    if (!conn) {
+        return;
+    }
+    auto callbackPtr = dynamic_cast<EncryptionCallbacks*>(conn->get());
+    if (callbackPtr != nullptr) {
+        callbackPtr->trace(trc);
+    }
+}
+
+void MongoBase::Functions::close::call(JSContext* cx, JS::CallArgs args) {
+    getConnection(args);
+
+    auto thisv = args.thisv().toObjectOrNull();
+    auto conn = static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(thisv));
+
+    conn->reset();
+
+    args.rval().setUndefined();
 }
 
 void MongoBase::Functions::runCommand::call(JSContext* cx, JS::CallArgs args) {
@@ -127,56 +257,74 @@ void MongoBase::Functions::runCommand::call(JSContext* cx, JS::CallArgs args) {
     if (!args.get(2).isNumber())
         uasserted(ErrorCodes::BadValue, "the options parameter to runCommand must be a number");
 
-    auto conn = getConnection(args);
+    const auto& conn = getConnectionRef(args);
 
     std::string database = ValueWriter(cx, args.get(0)).toString();
 
     BSONObj cmdObj = ValueWriter(cx, args.get(1)).toBSON();
 
+    if (isUnacknowledged(cmdObj)) {
+        runFireAndForgetCommand(conn, database, cmdObj);
+        setHiddenMongo(cx, args);
+        returnOk(cx, args);
+        return;
+    }
+
     int queryOptions = ValueWriter(cx, args.get(2)).toInt32();
     BSONObj cmdRes;
-    conn->runCommand(database, cmdObj, cmdRes, queryOptions);
+    auto resTuple = conn->runCommandWithTarget(database, cmdObj, cmdRes, conn, queryOptions);
 
     // the returned object is not read only as some of our tests depend on modifying it.
     //
     // Also, we make a copy here because we want a copy after we dump cmdRes
     ValueReader(cx, args.rval()).fromBSON(cmdRes.getOwned(), nullptr, false /* read only */);
+    setHiddenMongo(cx, std::get<1>(resTuple), conn.get(), args);
+
+    ObjectWrapper o(cx, args.rval());
+    if (!o.hasField(InternedString::_commandObj)) {
+        o.defineProperty(
+            InternedString::_commandObj, args.get(1), JSPROP_READONLY | JSPROP_PERMANENT);
+    }
 }
 
 void MongoBase::Functions::runCommandWithMetadata::call(JSContext* cx, JS::CallArgs args) {
-    if (args.length() != 4)
-        uasserted(ErrorCodes::BadValue, "runCommandWithMetadata needs 4 args");
+    if (args.length() != 3)
+        uasserted(ErrorCodes::BadValue, "runCommandWithMetadata needs 3 args");
 
     if (!args.get(0).isString())
         uasserted(ErrorCodes::BadValue,
                   "the database parameter to runCommandWithMetadata must be a string");
 
-    if (!args.get(1).isString())
-        uasserted(ErrorCodes::BadValue,
-                  "the commandName parameter to runCommandWithMetadata must be a string");
-
-    if (!args.get(2).isObject())
+    if (!args.get(1).isObject())
         uasserted(ErrorCodes::BadValue,
                   "the metadata argument to runCommandWithMetadata must be an object");
 
-    if (!args.get(3).isObject())
+    if (!args.get(2).isObject())
         uasserted(ErrorCodes::BadValue,
                   "the commandArgs argument to runCommandWithMetadata must be an object");
 
     std::string database = ValueWriter(cx, args.get(0)).toString();
-    std::string commandName = ValueWriter(cx, args.get(1)).toString();
-    BSONObj metadata = ValueWriter(cx, args.get(2)).toBSON();
-    BSONObj commandArgs = ValueWriter(cx, args.get(3)).toBSON();
+    BSONObj metadata = ValueWriter(cx, args.get(1)).toBSON();
+    BSONObj commandArgs = ValueWriter(cx, args.get(2)).toBSON();
 
-    auto conn = getConnection(args);
-    auto res = conn->runCommandWithMetadata(database, commandName, metadata, commandArgs);
+    const auto& conn = getConnectionRef(args);
+
+    if (isUnacknowledged(commandArgs)) {
+        runFireAndForgetCommand(conn, database, commandArgs, metadata);
+        setHiddenMongo(cx, args);
+        returnOk(cx, args);
+        return;
+    }
+
+    auto resTuple = conn->runCommandWithTarget(
+        OpMsgRequest::fromDBAndBody(database, commandArgs, metadata), conn);
+    auto res = std::move(std::get<0>(resTuple));
 
     BSONObjBuilder mergedResultBob;
     mergedResultBob.append("commandReply", res->getCommandReply());
-    mergedResultBob.append("metadata", res->getMetadata());
 
-    auto mergedResult = mergedResultBob.obj();
-    ValueReader(cx, args.rval()).fromBSON(mergedResult, nullptr, false);
+    ValueReader(cx, args.rval()).fromBSON(mergedResultBob.obj(), nullptr, false);
+    setHiddenMongo(cx, std::get<1>(resTuple), conn.get(), args);
 }
 
 void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
@@ -214,8 +362,16 @@ void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
     int batchSize = ValueWriter(cx, args.get(5)).toInt32();
     int options = ValueWriter(cx, args.get(6)).toInt32();
 
-    std::unique_ptr<DBClientCursor> cursor(
-        conn->query(ns, q, nToReturn, nToSkip, haveFields ? &fields : NULL, options, batchSize));
+    // The shell only calls this method when it wants to test OP_QUERY.
+    options |= DBClientCursor::QueryOptionLocal_forceOpQuery;
+
+    std::unique_ptr<DBClientCursor> cursor(conn->query(NamespaceString(ns),
+                                                       q,
+                                                       nToReturn,
+                                                       nToSkip,
+                                                       haveFields ? &fields : nullptr,
+                                                       options,
+                                                       batchSize));
     if (!cursor.get()) {
         uasserted(ErrorCodes::InternalError, "error doing query: failed");
     }
@@ -223,7 +379,7 @@ void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
     JS::RootedObject c(cx);
     scope->getProto<CursorInfo>().newObject(&c);
 
-    setCursor(c, std::move(cursor), args);
+    setCursor(scope, c, std::move(cursor), args);
 
     args.rval().setObjectOrNull(c);
 }
@@ -265,32 +421,46 @@ void MongoBase::Functions::insert::call(JSContext* cx, JS::CallArgs args) {
         return ValueWriter(cx, value).toBSON();
     };
 
-    if (args.get(1).isObject() && JS_IsArrayObject(cx, args.get(1))) {
-        JS::RootedObject obj(cx, args.get(1).toObjectOrNull());
-        ObjectWrapper array(cx, obj);
+    Message toSend;
+    if (args.get(1).isObject()) {
+        bool isArray;
 
-        std::vector<BSONObj> bos;
+        if (!JS_IsArrayObject(cx, args.get(1), &isArray)) {
+            uasserted(ErrorCodes::BadValue, "Failure to check is object an array");
+        }
 
-        bool foundElement = false;
+        if (isArray) {
+            JS::RootedObject obj(cx, args.get(1).toObjectOrNull());
+            ObjectWrapper array(cx, obj);
 
-        array.enumerate([&](JS::HandleId id) {
-            foundElement = true;
+            std::vector<BSONObj> bos;
 
-            JS::RootedValue value(cx);
-            array.getValue(id, &value);
+            bool foundElement = false;
 
-            bos.push_back(addId(value));
+            array.enumerate([&](JS::HandleId id) {
+                foundElement = true;
 
-            return true;
-        });
+                JS::RootedValue value(cx);
+                array.getValue(id, &value);
 
-        if (!foundElement)
-            uasserted(ErrorCodes::BadValue, "attempted to insert an empty array");
+                bos.push_back(addId(value));
 
-        conn->insert(ns, bos, flags);
+                return true;
+            });
+
+            if (!foundElement)
+                uasserted(ErrorCodes::BadValue, "attempted to insert an empty array");
+
+            toSend = makeInsertMessage(ns, bos.data(), bos.size(), flags);
+        } else {
+            toSend = makeInsertMessage(ns, addId(args.get(1)));
+        }
     } else {
-        conn->insert(ns, addId(args.get(1)));
+        toSend = makeInsertMessage(ns, addId(args.get(1)));
     }
+
+    invariant(!toSend.empty());
+    conn->say(toSend);
 
     args.rval().setUndefined();
 }
@@ -317,7 +487,8 @@ void MongoBase::Functions::remove::call(JSContext* cx, JS::CallArgs args) {
         justOne = args.get(2).toBoolean();
     }
 
-    conn->remove(ns, bson, justOne);
+    auto toSend = makeRemoveMessage(ns, bson, justOne ? RemoveOption_JustOne : 0);
+    conn->say(toSend);
     args.rval().setUndefined();
 }
 
@@ -345,34 +516,46 @@ void MongoBase::Functions::update::call(JSContext* cx, JS::CallArgs args) {
     bool upsert = args.length() > 3 && args.get(3).isBoolean() && args.get(3).toBoolean();
     bool multi = args.length() > 4 && args.get(4).isBoolean() && args.get(4).toBoolean();
 
-    conn->update(ns, q1, o1, upsert, multi);
+    auto toSend = makeUpdateMessage(
+        ns, q1, o1, (upsert ? UpdateOption_Upsert : 0) | (multi ? UpdateOption_Multi : 0));
+    conn->say(toSend);
     args.rval().setUndefined();
 }
 
 void MongoBase::Functions::auth::call(JSContext* cx, JS::CallArgs args) {
     auto conn = getConnection(args);
-    if (!conn)
-        uasserted(ErrorCodes::BadValue, "no connection");
+    uassert(ErrorCodes::BadValue, "no connection", conn);
+    uassert(ErrorCodes::BadValue, "mongoAuth takes exactly 1 object argument", args.length() == 1);
 
-    BSONObj params;
-    switch (args.length()) {
-        case 1:
-            params = ValueWriter(cx, args.get(0)).toBSON();
-            break;
-        case 3:
-            params = BSON(saslCommandMechanismFieldName
-                          << "MONGODB-CR" << saslCommandUserDBFieldName
-                          << ValueWriter(cx, args[0]).toString() << saslCommandUserFieldName
-                          << ValueWriter(cx, args[1]).toString() << saslCommandPasswordFieldName
-                          << ValueWriter(cx, args[2]).toString());
-            break;
-        default:
-            uasserted(ErrorCodes::BadValue, "mongoAuth takes 1 object or 3 string arguments");
-    }
-
-    conn->auth(params);
-
+    conn->auth(ValueWriter(cx, args.get(0)).toBSON());
     args.rval().setBoolean(true);
+}
+
+void MongoBase::Functions::generateDataKey::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+    auto ptr = getEncryptionCallbacks(conn);
+    ptr->generateDataKey(cx, args);
+}
+
+void MongoBase::Functions::getDataKeyCollection::call(JSContext* cx, JS::CallArgs args) {
+    JS::RootedValue collection(cx);
+    auto conn = getConnection(args);
+    auto ptr = getEncryptionCallbacks(conn);
+    ptr->getDataKeyCollection(cx, args);
+}
+
+void MongoBase::Functions::encrypt::call(JSContext* cx, JS::CallArgs args) {
+    auto scope = getScope(cx);
+    auto conn = getConnection(args);
+    auto ptr = getEncryptionCallbacks(conn);
+    ptr->encrypt(scope, cx, args);
+}
+
+void MongoBase::Functions::decrypt::call(JSContext* cx, JS::CallArgs args) {
+    auto scope = getScope(cx);
+    auto conn = getConnection(args);
+    auto ptr = getEncryptionCallbacks(conn);
+    ptr->decrypt(scope, cx, args);
 }
 
 void MongoBase::Functions::logout::call(JSContext* cx, JS::CallArgs args) {
@@ -411,7 +594,9 @@ void MongoBase::Functions::cursorFromId::call(JSContext* cx, JS::CallArgs args) 
 
     long long cursorId = NumberLongInfo::ToNumberLong(cx, args.get(1));
 
-    auto cursor = stdx::make_unique<DBClientCursor>(conn, ns, cursorId, 0, 0);
+    // The shell only calls this method when it wants to test OP_GETMORE.
+    auto cursor = std::make_unique<DBClientCursor>(
+        conn, NamespaceString(ns), cursorId, 0, DBClientCursor::QueryOptionLocal_forceOpQuery);
 
     if (args.get(2).isNumber())
         cursor->setBatchSize(ValueWriter(cx, args.get(2)).toInt32());
@@ -419,7 +604,7 @@ void MongoBase::Functions::cursorFromId::call(JSContext* cx, JS::CallArgs args) 
     JS::RootedObject c(cx);
     scope->getProto<CursorInfo>().newObject(&c);
 
-    setCursor(c, std::move(cursor), args);
+    setCursor(scope, c, std::move(cursor), args);
 
     args.rval().setObjectOrNull(c);
 }
@@ -427,105 +612,26 @@ void MongoBase::Functions::cursorFromId::call(JSContext* cx, JS::CallArgs args) 
 void MongoBase::Functions::cursorHandleFromId::call(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
-    if (args.length() != 1) {
-        uasserted(ErrorCodes::BadValue, "cursorHandleFromId needs 1 arg");
-    }
-    if (!scope->getProto<NumberLongInfo>().instanceOf(args.get(0))) {
-        uasserted(ErrorCodes::BadValue, "1st arg must be a NumberLong");
+    if (args.length() != 2) {
+        uasserted(ErrorCodes::BadValue, "cursorHandleFromId needs 2 args");
     }
 
-    long long cursorId = NumberLongInfo::ToNumberLong(cx, args.get(0));
+    if (!scope->getProto<NumberLongInfo>().instanceOf(args.get(1))) {
+        uasserted(ErrorCodes::BadValue, "2nd arg must be a NumberLong");
+    }
+
+    // getConnectionRef verifies that the connection is still open
+    getConnectionRef(args);
+
+    std::string ns = ValueWriter(cx, args.get(0)).toString();
+    long long cursorId = NumberLongInfo::ToNumberLong(cx, args.get(1));
 
     JS::RootedObject c(cx);
     scope->getProto<CursorHandleInfo>().newObject(&c);
 
-    setCursorHandle(c, cursorId, args);
+    setCursorHandle(scope, c, NamespaceString(ns), cursorId, args);
 
     args.rval().setObjectOrNull(c);
-}
-
-void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallArgs args) {
-    auto conn = getConnection(args);
-
-    if (!conn)
-        uasserted(ErrorCodes::BadValue, "no connection");
-
-    if (args.length() != 5)
-        uasserted(ErrorCodes::BadValue, "copyDatabase needs 5 arg");
-
-    // copyDatabase(fromdb, todb, fromhost, username, password);
-    std::string fromDb = ValueWriter(cx, args.get(0)).toString();
-    std::string toDb = ValueWriter(cx, args.get(1)).toString();
-    std::string fromHost = ValueWriter(cx, args.get(2)).toString();
-    std::string user = ValueWriter(cx, args.get(3)).toString();
-    std::string password = ValueWriter(cx, args.get(4)).toString();
-
-    std::string hashedPwd = DBClientWithCommands::createPasswordDigest(user, password);
-
-    std::unique_ptr<SaslClientSession> session(new NativeSaslClientSession());
-
-    session->setParameter(SaslClientSession::parameterMechanism, "SCRAM-SHA-1");
-    session->setParameter(SaslClientSession::parameterUser, user);
-    session->setParameter(SaslClientSession::parameterPassword, hashedPwd);
-    session->initialize();
-
-    BSONObj saslFirstCommandPrefix =
-        BSON("copydbsaslstart" << 1 << "fromhost" << fromHost << "fromdb" << fromDb
-                               << saslCommandMechanismFieldName << "SCRAM-SHA-1");
-
-    BSONObj saslFollowupCommandPrefix =
-        BSON("copydb" << 1 << "fromhost" << fromHost << "fromdb" << fromDb << "todb" << toDb);
-
-    BSONObj saslCommandPrefix = saslFirstCommandPrefix;
-    BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
-    bool isServerDone = false;
-
-    while (!session->isDone()) {
-        std::string payload;
-        BSONType type;
-
-        Status status = saslExtractPayload(inputObj, &payload, &type);
-        uassertStatusOK(status);
-
-        std::string responsePayload;
-        status = session->step(payload, &responsePayload);
-        uassertStatusOK(status);
-
-        BSONObjBuilder commandBuilder;
-
-        commandBuilder.appendElements(saslCommandPrefix);
-        commandBuilder.appendBinData(saslCommandPayloadFieldName,
-                                     static_cast<int>(responsePayload.size()),
-                                     BinDataGeneral,
-                                     responsePayload.c_str());
-        BSONElement conversationId = inputObj[saslCommandConversationIdFieldName];
-        if (!conversationId.eoo())
-            commandBuilder.append(conversationId);
-
-        BSONObj command = commandBuilder.obj();
-
-        bool ok = conn->runCommand("admin", command, inputObj);
-
-        ErrorCodes::Error code =
-            ErrorCodes::fromInt(inputObj[saslCommandCodeFieldName].numberInt());
-
-        if (!ok || code != ErrorCodes::OK) {
-            if (code == ErrorCodes::OK)
-                code = ErrorCodes::UnknownError;
-
-            ValueReader(cx, args.rval()).fromBSON(inputObj, nullptr, true);
-            return;
-        }
-
-        isServerDone = inputObj[saslCommandDoneFieldName].trueValue();
-        saslCommandPrefix = saslFollowupCommandPrefix;
-    }
-
-    if (!isServerDone) {
-        uasserted(ErrorCodes::InternalError, "copydb client finished before server.");
-    }
-
-    ValueReader(cx, args.rval()).fromBSON(inputObj, nullptr, true);
 }
 
 void MongoBase::Functions::getClientRPCProtocols::call(JSContext* cx, JS::CallArgs args) {
@@ -574,28 +680,68 @@ void MongoBase::Functions::getServerRPCProtocols::call(JSContext* cx, JS::CallAr
     ValueReader(cx, args.rval()).fromStringData(protoStr);
 }
 
-void MongoLocalInfo::construct(JSContext* cx, JS::CallArgs args) {
-    auto scope = getScope(cx);
+void MongoBase::Functions::isReplicaSetConnection::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
 
-    if (args.length() != 0)
-        uasserted(ErrorCodes::BadValue, "local Mongo constructor takes no args");
+    if (args.length() != 0) {
+        uasserted(ErrorCodes::BadValue, "isReplicaSetConnection takes no args");
+    }
 
-    std::unique_ptr<DBClientBase> conn;
-
-    conn.reset(createDirectClient(scope->getOpContext()));
-
-    JS::RootedObject thisv(cx);
-    scope->getProto<MongoLocalInfo>().newObject(&thisv);
-    ObjectWrapper o(cx, thisv);
-
-    JS_SetPrivate(thisv, new std::shared_ptr<DBClientBase>(conn.release()));
-
-    o.setBoolean(InternedString::slaveOk, false);
-    o.setString(InternedString::host, "EMBEDDED");
-
-    args.rval().setObjectOrNull(thisv);
+    args.rval().setBoolean(conn->type() == ConnectionString::ConnectionType::kReplicaSet);
 }
 
+void MongoBase::Functions::_markNodeAsFailed::call(JSContext* cx, JS::CallArgs args) {
+    if (args.length() != 3) {
+        uasserted(ErrorCodes::BadValue, "_markNodeAsFailed needs 3 args");
+    }
+
+    if (!args.get(0).isString()) {
+        uasserted(ErrorCodes::BadValue,
+                  "first argument to _markNodeAsFailed must be a stringified host and port");
+    }
+
+    if (!args.get(1).isNumber()) {
+        uasserted(ErrorCodes::BadValue,
+                  "second argument to _markNodeAsFailed must be a numeric error code");
+    }
+
+    if (!args.get(2).isString()) {
+        uasserted(ErrorCodes::BadValue,
+                  "third argument to _markNodeAsFailed must be a stringified reason");
+    }
+
+    auto* rsConn = dynamic_cast<DBClientReplicaSet*>(getConnection(args));
+    if (!rsConn) {
+        uasserted(ErrorCodes::BadValue, "connection object isn't a replica set connection");
+    }
+
+    auto hostAndPort = ValueWriter(cx, args.get(0)).toString();
+    auto code = ValueWriter(cx, args.get(1)).toInt32();
+    auto reason = ValueWriter(cx, args.get(2)).toString();
+
+    const auto& replicaSetName = rsConn->getSetName();
+    ReplicaSetMonitor::get(replicaSetName)
+        ->failedHost(HostAndPort(hostAndPort),
+                     Status{static_cast<ErrorCodes::Error>(code), reason});
+
+    args.rval().setUndefined();
+}
+
+std::unique_ptr<DBClientBase> runEncryptedDBClientCallback(std::unique_ptr<DBClientBase> conn,
+                                                           JS::HandleValue arg,
+                                                           JS::HandleObject mongoConnection,
+                                                           JSContext* cx) {
+    if (encryptedDBClientCallback != nullptr) {
+        return encryptedDBClientCallback(std::move(conn), arg, mongoConnection, cx);
+    }
+    return conn;
+}
+
+void setEncryptedDBClientCallback(EncryptedDBClientCallback* callback) {
+    encryptedDBClientCallback = callback;
+}
+
+// "new Mongo(uri, encryptedDBClientCallback, {options...})"
 void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
@@ -605,28 +751,107 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
         host = ValueWriter(cx, args.get(0)).toString();
     }
 
-    auto statusWithHost = MongoURI::parse(host);
-    uassertStatusOK(statusWithHost);
-    auto cs = statusWithHost.getValue();
+    auto cs = uassertStatusOK(MongoURI::parse(host));
 
+    ClientAPIVersionParameters apiParameters;
+    if (args.length() > 2 && !args.get(2).isUndefined()) {
+        uassert(4938000,
+                str::stream() << "the 'options' parameter to Mongo() must be an object",
+                args.get(2).isObject());
+        auto options = ValueWriter(cx, args.get(2)).toBSON();
+        if (options.hasField("api")) {
+            uassert(4938001,
+                    "the 'api' option for Mongo() must be an object",
+                    options["api"].isABSONObj());
+            apiParameters = ClientAPIVersionParameters::parse(IDLParserErrorContext("api"_sd),
+                                                              options["api"].Obj());
+            if (apiParameters.getDeprecationErrors().value_or(false) ||
+                apiParameters.getStrict().value_or(false)) {
+                uassert(4938002,
+                        "the 'api' option for Mongo() must include 'version' if it includes "
+                        "'strict' or "
+                        "'deprecationErrors'",
+                        apiParameters.getVersion());
+            }
+        }
+    }
+
+    boost::optional<std::string> appname = cs.getAppName();
     std::string errmsg;
-    std::unique_ptr<DBClientBase> conn(cs.connect(errmsg));
+    std::unique_ptr<DBClientBase> conn(
+        cs.connect(appname.value_or("MongoDB Shell"), errmsg, boost::none, &apiParameters));
 
     if (!conn.get()) {
         uasserted(ErrorCodes::InternalError, errmsg);
     }
 
+    ScriptEngine::runConnectCallback(*conn, host);
+
     JS::RootedObject thisv(cx);
     scope->getProto<MongoExternalInfo>().newObject(&thisv);
     ObjectWrapper o(cx, thisv);
 
-    JS_SetPrivate(thisv, new std::shared_ptr<DBClientBase>(conn.release()));
+    conn = runEncryptedDBClientCallback(std::move(conn), args.get(1), thisv, cx);
+
+    JS_SetPrivate(thisv, scope->trackedNew<std::shared_ptr<DBClientBase>>(conn.release()));
 
     o.setBoolean(InternedString::slaveOk, false);
-    o.setString(InternedString::host, host);
-    o.setString(InternedString::defaultDB, cs.getDatabase());
+    o.setString(InternedString::host, cs.connectionString().toString());
+    auto defaultDB = cs.getDatabase() == "" ? "test" : cs.getDatabase();
+    o.setString(InternedString::defaultDB, defaultDB);
+
+    // Adds a property to the Mongo connection object.
+    boost::optional<bool> retryWrites = cs.getRetryWrites();
+    // If retryWrites is not explicitly set in uri, sessions created on this connection default to
+    // the global retryWrites value. This is checked in sessions.js by using the injected
+    // _shouldRetryWrites() function, which returns true if the --retryWrites flag was passed.
+    if (retryWrites) {
+        o.setBoolean(InternedString::_retryWrites, retryWrites.get());
+    }
 
     args.rval().setObjectOrNull(thisv);
+}
+
+void MongoBase::Functions::getMinWireVersion::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    args.rval().setInt32(conn->getMinWireVersion());
+}
+
+void MongoBase::Functions::getMaxWireVersion::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    args.rval().setInt32(conn->getMaxWireVersion());
+}
+
+void MongoBase::Functions::isReplicaSetMember::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    args.rval().setBoolean(conn->isReplicaSetMember());
+}
+
+void MongoBase::Functions::isMongos::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    args.rval().setBoolean(conn->isMongos());
+}
+
+void MongoBase::Functions::getApiParameters::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+    ValueReader(cx, args.rval()).fromBSON(conn->getApiParameters().toBSON(), nullptr, false);
+}
+
+void MongoBase::Functions::_startSession::call(JSContext* cx, JS::CallArgs args) {
+    auto client =
+        static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
+
+    LogicalSessionIdToClient id;
+    id.setId(UUID::gen());
+
+    JS::RootedObject obj(cx);
+    SessionInfo::make(cx, &obj, *client, id.toBSON());
+
+    args.rval().setObjectOrNull(obj.get());
 }
 
 void MongoExternalInfo::Functions::load::call(JSContext* cx, JS::CallArgs args) {
@@ -644,11 +869,7 @@ void MongoExternalInfo::Functions::load::call(JSContext* cx, JS::CallArgs args) 
 }
 
 void MongoExternalInfo::Functions::quit::call(JSContext* cx, JS::CallArgs args) {
-    auto scope = getScope(cx);
-
-    scope->setQuickExit(args.get(0).isNumber() ? args.get(0).toNumber() : 0);
-
-    uasserted(ErrorCodes::JSUncatchableError, "Calling Quit");
+    quickExit(args.get(0).isNumber() ? args.get(0).toNumber() : 0);
 }
 
 void MongoExternalInfo::Functions::_forgetReplSet::call(JSContext* cx, JS::CallArgs args) {
@@ -659,7 +880,7 @@ void MongoExternalInfo::Functions::_forgetReplSet::call(JSContext* cx, JS::CallA
     }
 
     std::string rsName = ValueWriter(cx, args.get(0)).toString();
-    globalRSMonitorManager.removeMonitor(rsName);
+    ReplicaSetMonitorManager::get()->removeMonitor(rsName);
 
     args.rval().setUndefined();
 }

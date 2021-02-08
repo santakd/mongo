@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -31,6 +32,7 @@
 #include "mongo/scripting/mozjs/objectwrapper.h"
 
 #include <js/Conversions.h>
+#include <jsapi.h>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -43,9 +45,7 @@
 namespace mongo {
 namespace mozjs {
 
-#ifndef _MSC_EXTENSIONS
 const int ObjectWrapper::kMaxWriteFieldDepth;
-#endif  // _MSC_EXTENSIONS
 
 void ObjectWrapper::Key::get(JSContext* cx, JS::HandleObject o, JS::MutableHandleValue value) {
     switch (_type) {
@@ -137,6 +137,36 @@ void ObjectWrapper::Key::define(JSContext* cx,
     throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to define value on a JSObject");
 }
 
+void ObjectWrapper::Key::define(
+    JSContext* cx, JS::HandleObject o, unsigned attrs, JSNative getter, JSNative setter) {
+    switch (_type) {
+        case Type::Field:
+            if (JS_DefineProperty(cx, o, _field, getter, setter, attrs))
+                return;
+            break;
+        case Type::Index:
+            if (JS_DefineElement(cx, o, _idx, getter, setter, attrs))
+                return;
+            break;
+        case Type::Id: {
+            JS::RootedId id(cx, _id);
+
+            if (JS_DefinePropertyById(cx, o, id, getter, setter, attrs))
+                return;
+            break;
+        }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_DefinePropertyById(cx, o, id, getter, setter, attrs))
+                return;
+            break;
+        }
+    }
+
+    throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to define value on a JSObject");
+}
+
 bool ObjectWrapper::Key::has(JSContext* cx, JS::HandleObject o) {
     bool has;
 
@@ -173,6 +203,41 @@ bool ObjectWrapper::Key::hasOwn(JSContext* cx, JS::HandleObject o) {
 
     switch (_type) {
         case Type::Field:
+            if (JS_HasOwnProperty(cx, o, _field, &has))
+                return has;
+            break;
+        case Type::Index: {
+            JS::RootedId id(cx);
+
+            // This is a little different because there is no JS_HasOwnElement
+            if (JS_IndexToId(cx, _idx, &id) && JS_HasOwnPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
+        case Type::Id: {
+            JS::RootedId id(cx, _id);
+
+            if (JS_HasOwnPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
+        case Type::InternedString: {
+            InternedStringId id(cx, _internedString);
+
+            if (JS_HasOwnPropertyById(cx, o, id, &has))
+                return has;
+            break;
+        }
+    }
+
+    throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to hasOwn value on a JSObject");
+}
+
+bool ObjectWrapper::Key::alreadyHasOwn(JSContext* cx, JS::HandleObject o) {
+    bool has;
+
+    switch (_type) {
+        case Type::Field:
             if (JS_AlreadyHasOwnProperty(cx, o, _field, &has))
                 return has;
             break;
@@ -196,7 +261,8 @@ bool ObjectWrapper::Key::hasOwn(JSContext* cx, JS::HandleObject o) {
         }
     }
 
-    throwCurrentJSException(cx, ErrorCodes::InternalError, "Failed to hasOwn value on a JSObject");
+    throwCurrentJSException(
+        cx, ErrorCodes::InternalError, "Failed to alreadyHasOwn value on a JSObject");
 }
 
 void ObjectWrapper::Key::del(JSContext* cx, JS::HandleObject o) {
@@ -326,7 +392,7 @@ void ObjectWrapper::getValue(Key key, JS::MutableHandleValue value) {
 
 void ObjectWrapper::setNumber(Key key, double val) {
     JS::RootedValue jsValue(_context);
-    jsValue.setDouble(val);
+    ValueReader(_context, &jsValue).fromDouble(val);
 
     setValue(key, jsValue);
 }
@@ -362,6 +428,13 @@ void ObjectWrapper::setBSON(Key key, const BSONObj& obj, bool readOnly) {
     setValue(key, value);
 }
 
+void ObjectWrapper::setBSONArray(Key key, const BSONObj& obj, bool readOnly) {
+    JS::RootedValue value(_context);
+    ValueReader(_context, &value).fromBSONArray(obj, nullptr, readOnly);
+
+    setValue(key, value);
+}
+
 void ObjectWrapper::setValue(Key key, JS::HandleValue val) {
     key.set(_context, _object, val);
 }
@@ -373,8 +446,19 @@ void ObjectWrapper::setObject(Key key, JS::HandleObject object) {
     setValue(key, value);
 }
 
+void ObjectWrapper::setPrototype(JS::HandleObject object) {
+    if (JS_SetPrototype(_context, _object, object))
+        return;
+
+    throwCurrentJSException(_context, ErrorCodes::InternalError, "Failed to set prototype");
+}
+
 void ObjectWrapper::defineProperty(Key key, JS::HandleValue val, unsigned attrs) {
     key.define(_context, _object, val, attrs);
+}
+
+void ObjectWrapper::defineProperty(Key key, unsigned attrs, JSNative getter, JSNative setter) {
+    key.define(_context, _object, attrs, getter, setter);
 }
 
 void ObjectWrapper::deleteProperty(Key key) {
@@ -408,6 +492,10 @@ bool ObjectWrapper::hasOwnField(Key key) {
     return key.hasOwn(_context, _object);
 }
 
+bool ObjectWrapper::alreadyHasOwnField(Key key) {
+    return key.alreadyHasOwn(_context, _object);
+}
+
 void ObjectWrapper::callMethod(const char* field,
                                const JS::HandleValueArray& args,
                                JS::MutableHandleValue out) {
@@ -439,7 +527,8 @@ void ObjectWrapper::callMethod(JS::HandleValue fun, JS::MutableHandleValue out) 
 }
 
 BSONObj ObjectWrapper::toBSON() {
-    if (getScope(_context)->getProto<BSONInfo>().instanceOf(_object)) {
+    if (getScope(_context)->getProto<BSONInfo>().instanceOf(_object) ||
+        getScope(_context)->getProto<DBRefInfo>().instanceOf(_object)) {
         BSONObj* originalBSON = nullptr;
         bool altered;
 
@@ -467,51 +556,60 @@ BSONObj ObjectWrapper::toBSON() {
     // emplace() inside ValueWriter. The runtime asserts enabled by MozJS's
     // debug mode will catch runtime errors, but be aware of how difficult this
     // is to get right and what to look for if one of them bites you.
-    WriteFieldRecursionFrames frames;
-    frames.emplace(_context, _object, nullptr, StringData{});
 
     BSONObjBuilder b;
 
-    // We special case the _id field in top-level objects and move it to the front.
-    // This matches other drivers behavior and makes finding the _id field quicker in BSON.
-    if (hasOwnField(InternedString::_id)) {
-        _writeField(&b, InternedString::_id, &frames, frames.top().originalBSON);
-    }
+    {
+        // NOTE: Keep the frames in a scope so that it is clear that
+        // we always destroy them before we destroy 'b'. It is
+        // important to do so: if 'b' is destroyed before the frames,
+        // and we don't pop all of the frames (say, due to an
+        // exeption), then the frame dtors would write to freed
+        // memory.
+        WriteFieldRecursionFrames frames;
+        frames.emplace(_context, _object, nullptr, StringData{});
 
-    while (frames.size()) {
-        auto& frame = frames.top();
-
-        // If the index is the same as length, we've seen all the keys at this
-        // level and should go up a level
-        if (frame.idx == frame.ids.length()) {
-            frames.pop();
-            continue;
+        // We special case the _id field in top-level objects and move it to the front.
+        // This matches other drivers behavior and makes finding the _id field quicker in BSON.
+        if (hasOwnField(InternedString::_id)) {
+            _writeField(&b, InternedString::_id, &frames, frames.top().originalBSON);
         }
 
-        if (frame.idx == 0 && frame.originalBSON && !frame.altered) {
-            // If this is our first look at the object and it has an unaltered
-            // bson behind it, move idx to the end so we'll roll up on the next
-            // pass through the loop.
-            frame.subbob_or(&b)->appendElements(*frame.originalBSON);
-            frame.idx = frame.ids.length();
-            continue;
-        }
+        while (frames.size()) {
+            auto& frame = frames.top();
 
-        id.set(frame.ids[frame.idx++]);
-
-        if (frames.size() == 1) {
-            IdWrapper idw(_context, id);
-
-            // TODO: check if it's cheaper to just compare with an interned
-            // string of "_id" rather than with ascii
-            if (idw.isString() && idw.equalsAscii("_id")) {
+            // If the index is the same as length, we've seen all the keys at this
+            // level and should go up a level
+            if (frame.idx == frame.ids.length()) {
+                frames.pop();
                 continue;
             }
-        }
 
-        // writeField invokes ValueWriter with the frame stack, which will push
-        // onto frames for subobjects, which will effectively recurse the loop.
-        _writeField(frame.subbob_or(&b), JS::HandleId(id), &frames, frame.originalBSON);
+            if (frame.idx == 0 && frame.originalBSON && !frame.altered) {
+                // If this is our first look at the object and it has an unaltered
+                // bson behind it, move idx to the end so we'll roll up on the next
+                // pass through the loop.
+                frame.subbob_or(&b)->appendElements(*frame.originalBSON);
+                frame.idx = frame.ids.length();
+                continue;
+            }
+
+            id.set(frame.ids[frame.idx++]);
+
+            if (frames.size() == 1) {
+                IdWrapper idw(_context, id);
+
+                // TODO: check if it's cheaper to just compare with an interned
+                // string of "_id" rather than with ascii
+                if (idw.isString() && idw.equalsAscii("_id")) {
+                    continue;
+                }
+            }
+
+            // writeField invokes ValueWriter with the frame stack, which will push
+            // onto frames for subobjects, which will effectively recurse the loop.
+            _writeField(frame.subbob_or(&b), JS::HandleId(id), &frames, frame.originalBSON);
+        }
     }
 
     const int sizeWithEOO = b.len() + 1 /*EOO*/ - 4 /*BSONObj::Holder ref count*/;
@@ -528,18 +626,43 @@ ObjectWrapper::WriteFieldRecursionFrame::WriteFieldRecursionFrame(JSContext* cx,
                                                                   JSObject* obj,
                                                                   BSONObjBuilder* parent,
                                                                   StringData sd)
-    : thisv(cx, obj), ids(cx, JS_Enumerate(cx, thisv)) {
+    : thisv(cx, obj), ids(cx, JS::IdVector(cx)) {
+    bool isArray = false;
     if (parent) {
-        subbob.emplace(JS_IsArrayObject(cx, thisv) ? parent->subarrayStart(sd)
-                                                   : parent->subobjStart(sd));
+        if (!JS_IsArrayObject(cx, thisv, &isArray)) {
+            throwCurrentJSException(
+                cx, ErrorCodes::JSInterpreterFailure, "Failure to check object is an array");
+        }
+
+        subbob.emplace(isArray ? parent->subarrayStart(sd) : parent->subobjStart(sd));
     }
 
-    if (!ids) {
-        throwCurrentJSException(
-            cx, ErrorCodes::JSInterpreterFailure, "Failure to enumerate object");
+    if (isArray) {
+        uint32_t length;
+        if (!JS_GetArrayLength(cx, thisv, &length)) {
+            throwCurrentJSException(
+                cx, ErrorCodes::JSInterpreterFailure, "Failure to get array length");
+        }
+
+        if (!ids.reserve(length)) {
+            throwCurrentJSException(
+                cx, ErrorCodes::JSInterpreterFailure, "Failure to reserve array");
+        }
+
+        JS::RootedId rid(cx);
+        for (uint32_t i = 0; i < length; i++) {
+            rid.set(INT_TO_JSID(i));
+            ids.infallibleAppend(rid);
+        }
+    } else {
+        if (!JS_Enumerate(cx, thisv, &ids)) {
+            throwCurrentJSException(
+                cx, ErrorCodes::JSInterpreterFailure, "Failure to enumerate object");
+        }
     }
 
-    if (getScope(cx)->getProto<BSONInfo>().instanceOf(thisv)) {
+    if (getScope(cx)->getProto<BSONInfo>().instanceOf(thisv) ||
+        getScope(cx)->getProto<DBRefInfo>().instanceOf(thisv)) {
         std::tie(originalBSON, altered) = BSONInfo::originalBSON(cx, thisv);
     }
 }

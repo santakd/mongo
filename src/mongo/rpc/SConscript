@@ -1,6 +1,10 @@
 # -*- mode: python -*-
 
 Import("env")
+Import("wiredtiger")
+Import("get_option")
+
+env = env.Clone()
 
 env.Library(
     target=[
@@ -8,196 +12,178 @@ env.Library(
     ],
     source=[
         'get_status_from_command_result.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/util/foundation'
-    ],
-)
-
-env.Library(
-    target=[
-        'document_range',
-    ],
-    source=[
-        'document_range.cpp'
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on validation in a strange way right now
-        'incomplete'
-    ],
-)
-
-env.Library(
-    target=[
-        'protocol',
-    ],
-    source=[
-        'protocol.cpp',
+        'write_concern_error_detail.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
+        '$BUILD_DIR/mongo/db/common',
+    ],
+)
+
+protoEnv = env.Clone()
+if wiredtiger:
+    protoEnv.InjectThirdParty(libraries=['wiredtiger'])
+
+protoEnv.Library(
+    target=[
+        'protocol',
+    ],
+    source=[
+        'message.cpp',
+        'op_msg.cpp',
+        'protocol.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/wire_version',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/bson/util/bson_extract',
+        '$BUILD_DIR/mongo/db/bson/dotted_path_support',
+        '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/third_party/wiredtiger/wiredtiger_checksum' if wiredtiger else [],
     ],
 )
 
 env.Library(
-    target=[
-        'rpc',
-    ],
+    target='rpc',
     source=[
         'factory.cpp',
         'object_check.cpp',
-    ],
-    LIBDEPS=[
-        'command_reply',
-        'command_request',
-        'legacy_reply',
-        'legacy_request',
-        'metadata',
-        'protocol',
-        '$BUILD_DIR/mongo/db/server_parameters',
-        '$BUILD_DIR/mongo/db/dbmessage',
-    ],
-)
-
-env.Library(
-    target=[
-        'command_request',
-    ],
-    source=[
-        'command_request.cpp',
-        'command_request_builder.cpp',
-    ],
-    LIBDEPS=[
-        'document_range',
-        '$BUILD_DIR/mongo/util/net/network',
-    ],
-    LIBDEPS_TAGS=[
-        # Circular with rpc because it needs object_check.cpp
-        'incomplete'
-    ],
-)
-
-env.Library(
-    target=[
-        'legacy_request',
-    ],
-    source=[
         'legacy_request.cpp',
         'legacy_request_builder.cpp',
-    ],
-    LIBDEPS=[
-        'document_range',
-        'metadata',
-        '$BUILD_DIR/mongo/db/dbmessage',
-        '$BUILD_DIR/mongo/util/net/network',
-    ],
-)
-
-env.Library(
-    target=[
-        'command_reply',
-    ],
-    source=[
-        'command_reply.cpp',
-        'command_reply_builder.cpp',
-        'reply_builder_interface.cpp',
-    ],
-    LIBDEPS=[
-        'document_range',
-        '$BUILD_DIR/mongo/util/net/network',
-    ],
-    LIBDEPS_TAGS=[
-        # Circular with rpc because it needs object_check.cpp
-        'incomplete'
-    ],
-)
-
-env.Library(
-    target=[
-        'legacy_reply',
-    ],
-    source=[
         'legacy_reply.cpp',
-        'legacy_reply_builder.cpp'
+        'legacy_reply_builder.cpp',
+        'reply_builder_interface.cpp',
+        'object_check.idl',
     ],
     LIBDEPS=[
-        'document_range',
-        'metadata',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/dbmessage',
+        '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/idl/basic_types',
+        '$BUILD_DIR/mongo/s/common_s',
         '$BUILD_DIR/mongo/util/net/network',
+        'metadata',
+        'protocol',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/server_parameter',
+    ],
+)
+
+env.CppLibfuzzerTest(
+    target='protocol_fuzzer',
+    source=[
+        'protocol_fuzzer.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
+        '$BUILD_DIR/mongo/transport/message_compressor',
+        'protocol',
+        'rpc',
     ],
 )
 
 env.Library(
-    target=[
-        'metadata',
-    ],
+    target='metadata',
     source=[
         'metadata.cpp',
-        'metadata/audit_metadata.cpp',
         'metadata/config_server_metadata.cpp',
-        'metadata/server_selection_metadata.cpp',
+        'metadata/egress_metadata_hook_list.cpp',
         'metadata/sharding_metadata.cpp',
         'metadata/repl_set_metadata.cpp',
+        'metadata/oplog_query_metadata.cpp',
+        'metadata/tracking_metadata.cpp',
+        'topology_version.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/client/read_preference',
         '$BUILD_DIR/mongo/db/repl/optime',
-        '$BUILD_DIR/mongo/util/decorable',
+        '$BUILD_DIR/mongo/db/signed_logical_time',
+        'client_metadata',
+        'metadata_impersonated_user',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/vector_clock',
     ],
 )
 
-env.CppUnitTest(
+env.Library(
     target=[
-        'metadata_test',
+        'metadata_impersonated_user'
     ],
     source=[
-        'metadata/server_selection_metadata_test.cpp',
-        'metadata/sharding_metadata_test.cpp',
+        'metadata/impersonated_user_metadata.cpp',
+        'metadata/impersonated_user_metadata.idl',
     ],
     LIBDEPS=[
-        'metadata',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/auth',
+        '$BUILD_DIR/mongo/db/server_options',
     ],
 )
 
-env.CppUnitTest(
-    target=[
-        'rpc_test',
-    ],
+
+env.Library(
+    target='client_metadata',
     source=[
-        'command_reply_test.cpp',
-        'command_request_builder_test.cpp',
-        'command_request_test.cpp',
-        'legacy_request_test.cpp',
-        'object_check_test.cpp',
-        'protocol_test.cpp',
-        'reply_builder_test.cpp',
+        'metadata/client_metadata.cpp',
     ],
     LIBDEPS=[
-        'rpc',
-        '$BUILD_DIR/mongo/client/clientdriver'
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/s/is_mongos',
+        '$BUILD_DIR/mongo/transport/transport_layer_common',
+        "$BUILD_DIR/mongo/util/concurrency/spin_lock",
+        '$BUILD_DIR/mongo/util/net/network',
+        "$BUILD_DIR/mongo/util/processinfo",
     ],
 )
 
-env.CppUnitTest(
-    target='repl_set_metadata_test',
+if wiredtiger:
+    env.CppUnitTest(
+        target='rpc_test',
+        source=[
+            'get_status_from_command_result_test.cpp',
+            'legacy_request_test.cpp',
+            'metadata/client_metadata_test.cpp',
+            'metadata/config_server_metadata_test.cpp',
+            'metadata/egress_metadata_hook_list_test.cpp',
+            'metadata/oplog_query_metadata_test.cpp',
+            'metadata/repl_set_metadata_test.cpp',
+            'metadata/sharding_metadata_test.cpp',
+            'metadata/tracking_metadata_test.cpp',
+            'metadata_test.cpp',
+            'object_check_test.cpp',
+            'op_msg_test.cpp',
+            'protocol_test.cpp',
+            'reply_builder_test.cpp',
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/client/clientdriver_minimal',
+            '$BUILD_DIR/third_party/wiredtiger/wiredtiger_checksum',
+            'client_metadata',
+            'metadata',
+            'rpc',
+        ]
+    )
+
+env.CppIntegrationTest(
+    target='rpc_integration_test',
     source=[
-        'metadata/repl_set_metadata_test.cpp',
+        'op_msg_integration_test.cpp',
     ],
-    LIBDEPS=['metadata']
-)
-
-env.CppUnitTest(
-    target='config_server_metadata_test',
-    source=[
-        'metadata/config_server_metadata_test.cpp',
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/client/clientdriver_network',
+        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
+        '$BUILD_DIR/mongo/util/version_impl',
+        'protocol',
     ],
-    LIBDEPS=['metadata']
 )
-

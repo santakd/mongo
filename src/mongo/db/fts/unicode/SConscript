@@ -2,6 +2,8 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.Command( 
     target="codepoints_casefold.cpp",
     source=[
@@ -36,8 +38,8 @@ env.Command(
 env.Alias('generated-sources', "codepoints_diacritic_list.cpp")
 
 env.Library(
-    target='unicode', 
-	source=[
+    target='unicode',
+    source=[
         'codepoints_casefold.cpp',
         'codepoints_delimiter_list.cpp',
         'codepoints_diacritic_list.cpp',
@@ -46,26 +48,18 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/linenoise_utf8',
+        '$BUILD_DIR/mongo/shell/linenoise_utf8',
     ]
 )
 
 env.CppUnitTest(
-    target='string_test',
+    target='db_fts_unicode_test',
     source=[
-        'string_test.cpp'
+        'byte_vector_test.cpp',
+        'codepoints_test.cpp',
+        'string_test.cpp',
     ],
     LIBDEPS=[
-        'unicode', 
-    ]
-)
-
-env.CppUnitTest(
-    target='codepoints_test',
-    source=[
-        'codepoints_test.cpp'
+        'unicode',
     ],
-    LIBDEPS=[
-        'unicode', 
-    ]
 )

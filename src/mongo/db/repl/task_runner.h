@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,23 +29,25 @@
 
 #pragma once
 
+#include <functional>
 #include <list>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 
-class OperationContext;
 class Status;
-class OldThreadPool;
+class OperationContext;
 
 namespace repl {
 
 class TaskRunner {
-    MONGO_DISALLOW_COPYING(TaskRunner);
+    TaskRunner(const TaskRunner&) = delete;
+    TaskRunner& operator=(const TaskRunner&) = delete;
 
 public:
     /**
@@ -57,8 +60,7 @@ public:
         kCancel = 3,
     };
 
-    using CreateOperationContextFn = stdx::function<OperationContext*()>;
-    using Task = stdx::function<NextAction(OperationContext*, const Status&)>;
+    using Task = unique_function<NextAction(OperationContext*, const Status&)>;
 
     /**
      * Creates a Task returning kCancel. This is useful in shutting down the task runner after
@@ -69,7 +71,7 @@ public:
      */
     static Task makeCancelTask();
 
-    TaskRunner(OldThreadPool* threadPool, const CreateOperationContextFn& createOperationContext);
+    explicit TaskRunner(ThreadPool* threadPool);
 
     virtual ~TaskRunner();
 
@@ -89,7 +91,7 @@ public:
      *
      * This transitions the task runner to an active state.
      *
-     * The task runner creates an operation context using '_createOperationContext'
+     * The task runner creates an operation context using the current client
      * prior to running a scheduled task. Depending on the NextAction returned from the
      * task, operation contexts may be shared between consecutive tasks invoked by the task
      * runner.
@@ -114,7 +116,7 @@ public:
      * immediately. This is usually the case when the task runner is canceled. Accessing the
      * operation context in the task will result in undefined behavior.
      */
-    void schedule(const Task& task);
+    void schedule(Task task);
 
     /**
      * If there is a task that is already running, allows the task to run to completion.
@@ -126,6 +128,11 @@ public:
      * It is a no-op to call cancel() before scheduling any tasks.
      */
     void cancel();
+
+    /**
+     * Waits for the task runner to become inactive.
+     */
+    void join();
 
 private:
     /**
@@ -141,11 +148,10 @@ private:
      */
     Task _waitForNextTask();
 
-    OldThreadPool* _threadPool;
-    CreateOperationContextFn _createOperationContext;
+    ThreadPool* _threadPool;
 
     // Protects member data of this TaskRunner.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("TaskRunner::_mutex");
 
     stdx::condition_variable _condition;
 

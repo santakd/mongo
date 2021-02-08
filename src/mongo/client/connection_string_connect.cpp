@@ -1,31 +1,33 @@
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -35,52 +37,71 @@
 #include <memory>
 
 #include "mongo/client/dbclient_rs.h"
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/client/syncclusterconnection.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
-stdx::mutex ConnectionString::_connectHookMutex;
-ConnectionString::ConnectionHook* ConnectionString::_connectHook = NULL;
+Mutex ConnectionString::_connectHookMutex = MONGO_MAKE_LATCH();
+ConnectionString::ConnectionHook* ConnectionString::_connectHook = nullptr;
 
-DBClientBase* ConnectionString::connect(std::string& errmsg, double socketTimeout) const {
+StatusWith<std::unique_ptr<DBClientBase>> ConnectionString::connect(
+    StringData applicationName,
+    double socketTimeout,
+    const MongoURI* uri,
+    const ClientAPIVersionParameters* apiParameters,
+    const TransientSSLParams* transientSSLParams) const {
+    MongoURI newURI{};
+    if (uri) {
+        newURI = *uri;
+    }
+
     switch (_type) {
-        case MASTER: {
-            auto c = stdx::make_unique<DBClientConnection>(true);
-            c->setSoTimeout(socketTimeout);
-            LOG(1) << "creating new connection to:" << _servers[0];
-            if (!c->connect(_servers[0], errmsg)) {
-                return 0;
+        case ConnectionType::kStandalone: {
+            Status lastError =
+                Status(ErrorCodes::BadValue,
+                       "Invalid standalone connection string with empty server list.");
+            for (const auto& server : _servers) {
+                auto c = std::make_unique<DBClientConnection>(
+                    true, 0, newURI, DBClientConnection::HandshakeValidationHook(), apiParameters);
+
+                c->setSoTimeout(socketTimeout);
+                LOGV2_DEBUG(20109,
+                            1,
+                            "Creating new connection to: {hostAndPort}",
+                            "Creating new connection",
+                            "hostAndPort"_attr = server);
+                lastError = c->connect(
+                    server,
+                    applicationName,
+                    transientSSLParams ? boost::make_optional(*transientSSLParams) : boost::none);
+                if (!lastError.isOK()) {
+                    continue;
+                }
+                LOGV2_DEBUG(20110, 1, "Connected connection!");
+                return std::move(c);
             }
-            LOG(1) << "connected connection!";
-            return c.release();
+            return lastError;
         }
 
-        case SET: {
-            auto set = stdx::make_unique<DBClientReplicaSet>(_setName, _servers, socketTimeout);
-            if (!set->connect()) {
-                errmsg = "connect failed to replica set ";
-                errmsg += toString();
-                return 0;
+        case ConnectionType::kReplicaSet: {
+            auto set = std::make_unique<DBClientReplicaSet>(_replicaSetName,
+                                                            _servers,
+                                                            applicationName,
+                                                            socketTimeout,
+                                                            std::move(newURI),
+                                                            apiParameters);
+            auto status = set->connect();
+            if (!status.isOK()) {
+                return status.withReason(status.reason() + ", " + toString());
             }
-            return set.release();
+            return std::move(set);
         }
 
-        case SYNC: {
-            // TODO , don't copy
-            std::list<HostAndPort> l;
-            for (unsigned i = 0; i < _servers.size(); i++)
-                l.push_back(_servers[i]);
-            SyncClusterConnection* c = new SyncClusterConnection(l, socketTimeout);
-            return c;
-        }
-
-        case CUSTOM: {
+        case ConnectionType::kCustom: {
             // Lock in case other things are modifying this at the same time
-            stdx::lock_guard<stdx::mutex> lk(_connectHookMutex);
+            stdx::lock_guard<Latch> lk(_connectHookMutex);
 
             // Allow the replacement of connections with other connections - useful for testing.
 
@@ -90,19 +111,29 @@ DBClientBase* ConnectionString::connect(std::string& errmsg, double socketTimeou
                     _connectHook);
 
             // Double-checked lock, since this will never be active during normal operation
-            DBClientBase* replacementConn = _connectHook->connect(*this, errmsg, socketTimeout);
+            std::string errmsg;
+            auto replacementConn =
+                _connectHook->connect(*this, errmsg, socketTimeout, apiParameters);
 
-            log() << "replacing connection to " << this->toString() << " with "
-                  << (replacementConn ? replacementConn->getServerAddress() : "(empty)");
+            LOGV2(20111,
+                  "Replacing connection to {oldConnString} with {newConnString}",
+                  "Replacing connection string",
+                  "oldConnString"_attr = this->toString(),
+                  "newConnString"_attr =
+                      (replacementConn ? replacementConn->getServerAddress() : "(empty)"));
 
-            return replacementConn;
+            if (replacementConn) {
+                return std::move(replacementConn);
+            }
+            return Status(ErrorCodes::HostUnreachable, "Connection hook error: " + errmsg);
         }
 
-        case INVALID:
-            uasserted(13421, "trying to connect to invalid ConnectionString");
+        case ConnectionType::kLocal:
+        case ConnectionType::kInvalid:
+            MONGO_UNREACHABLE;
     }
 
     MONGO_UNREACHABLE;
 }
 
-}  // namepspace mongo
+}  // namespace mongo

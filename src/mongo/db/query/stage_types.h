@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,7 +29,19 @@
 
 #pragma once
 
+#include <cstdint>
+
+#include "mongo/base/string_data.h"
+
 namespace mongo {
+/**
+ * This type acts as an identifier for a node in a query plan tree, such as a 'QuerySolution' tree
+ * or an 'sbe::PlanStage' tree.
+ *
+ * An id of 0 is used to represent the absence of an explicitly assigned id.
+ */
+using PlanNodeId = uint32_t;
+static constexpr PlanNodeId kEmptyPlanNodeId = 0u;
 
 /**
  * These map to implementations of the PlanStage interface, all of which live in db/exec/
@@ -38,6 +51,10 @@ enum StageType {
     STAGE_AND_SORTED,
     STAGE_CACHED_PLAN,
     STAGE_COLLSCAN,
+
+    // A virtual scan stage that simulates a collection scan and doesn't depend on underlying
+    // storage.
+    STAGE_VIRTUAL_SCAN,
 
     // This stage sits at the root of the query tree and counts up the number of results
     // returned by its child.
@@ -54,14 +71,9 @@ enum StageType {
     // scan stage is an ixscan with some key-skipping behvaior that only distinct uses.
     STAGE_DISTINCT_SCAN,
 
-    // Dummy stage used for receiving notifications of deletions during chunk migration.
-    STAGE_NOTIFY_DELETE,
+    STAGE_ENSURE_SORTED,
 
     STAGE_EOF,
-
-    // This is more of an "internal-only" stage where we try to keep docs that were mutated
-    // during query execution.
-    STAGE_KEEP_MUTATIONS,
 
     STAGE_FETCH,
 
@@ -69,32 +81,34 @@ enum StageType {
     STAGE_GEO_NEAR_2D,
     STAGE_GEO_NEAR_2DSPHERE,
 
-    STAGE_GROUP,
-
     STAGE_IDHACK,
-
-    // Simple wrapper to iterate a SortedDataInterface::Cursor.
-    STAGE_INDEX_ITERATOR,
 
     STAGE_IXSCAN,
     STAGE_LIMIT,
 
-    // Implements parallelCollectionScan.
+    STAGE_MOCK,
+
+    // Implements iterating over one or more RecordStore::Cursor.
     STAGE_MULTI_ITERATOR,
 
     STAGE_MULTI_PLAN,
-    STAGE_OPLOG_START,
     STAGE_OR,
-    STAGE_PROJECTION,
 
-    // Stage for running aggregation pipelines.
-    STAGE_PIPELINE_PROXY,
+    // Projection has three alternate implementations.
+    STAGE_PROJECTION_DEFAULT,
+    STAGE_PROJECTION_COVERED,
+    STAGE_PROJECTION_SIMPLE,
 
     STAGE_QUEUED_DATA,
+    STAGE_RECORD_STORE_FAST_COUNT,
+    STAGE_RETURN_KEY,
     STAGE_SHARDING_FILTER,
     STAGE_SKIP,
-    STAGE_SORT,
+
+    STAGE_SORT_DEFAULT,
+    STAGE_SORT_SIMPLE,
     STAGE_SORT_KEY_GENERATOR,
+
     STAGE_SORT_MERGE,
     STAGE_SUBPLAN,
 
@@ -103,9 +117,34 @@ enum StageType {
     STAGE_TEXT_OR,
     STAGE_TEXT_MATCH,
 
+    // Stage for choosing between two alternate plans based on an initial trial period.
+    STAGE_TRIAL,
+
     STAGE_UNKNOWN,
 
     STAGE_UPDATE,
 };
 
+inline bool isProjectionStageType(StageType stageType) {
+    switch (stageType) {
+        case STAGE_PROJECTION_COVERED:
+        case STAGE_PROJECTION_DEFAULT:
+        case STAGE_PROJECTION_SIMPLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool isSortStageType(StageType stageType) {
+    switch (stageType) {
+        case STAGE_SORT_DEFAULT:
+        case STAGE_SORT_SIMPLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+StringData stageTypeToString(StageType stageType);
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,240 +27,122 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/canonical_query.h"
 
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/cst/cst_parser.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/canonical_query_encoder.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/indexability.h"
+#include "mongo/db/query/projection_parser.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
-/**
- * Comparator for MatchExpression nodes.  Returns an integer less than, equal to, or greater
- * than zero if 'lhs' is less than, equal to, or greater than 'rhs', respectively.
- *
- * Sorts by:
- * 1) operator type (MatchExpression::MatchType)
- * 2) path name (MatchExpression::path())
- * 3) sort order of children
- * 4) number of children (MatchExpression::numChildren())
- *
- * The third item is needed to ensure that match expression trees which should have the same
- * cache key always sort the same way. If you're wondering when the tuple (operator type, path
- * name) could ever be equal, consider this query:
- *
- * {$and:[{$or:[{a:1},{a:2}]},{$or:[{a:1},{b:2}]}]}
- *
- * The two OR nodes would compare as equal in this case were it not for tuple item #3 (sort
- * order of children).
- */
-int matchExpressionComparator(const MatchExpression* lhs, const MatchExpression* rhs) {
-    MatchExpression::MatchType lhsMatchType = lhs->matchType();
-    MatchExpression::MatchType rhsMatchType = rhs->matchType();
-    if (lhsMatchType != rhsMatchType) {
-        return lhsMatchType < rhsMatchType ? -1 : 1;
-    }
-
-    StringData lhsPath = lhs->path();
-    StringData rhsPath = rhs->path();
-    int pathsCompare = lhsPath.compare(rhsPath);
-    if (pathsCompare != 0) {
-        return pathsCompare;
-    }
-
-    const size_t numChildren = std::min(lhs->numChildren(), rhs->numChildren());
-    for (size_t childIdx = 0; childIdx < numChildren; ++childIdx) {
-        int childCompare =
-            matchExpressionComparator(lhs->getChild(childIdx), rhs->getChild(childIdx));
-        if (childCompare != 0) {
-            return childCompare;
-        }
-    }
-
-    if (lhs->numChildren() != rhs->numChildren()) {
-        return lhs->numChildren() < rhs->numChildren() ? -1 : 1;
-    }
-
-    // They're equal!
-    return 0;
-}
-
-bool matchExpressionLessThan(const MatchExpression* lhs, const MatchExpression* rhs) {
-    return matchExpressionComparator(lhs, rhs) < 0;
+bool parsingCanProduceNoopMatchNodes(const ExtensionsCallback& extensionsCallback,
+                                     MatchExpressionParser::AllowedFeatureSet allowedFeatures) {
+    return extensionsCallback.hasNoopExtensions() &&
+        (allowedFeatures & MatchExpressionParser::AllowedFeatures::kText ||
+         allowedFeatures & MatchExpressionParser::AllowedFeatures::kJavascript);
 }
 
 }  // namespace
 
-//
-// These all punt to the many-argumented canonicalize below.
-//
-
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    NamespaceString nss,
-    const BSONObj& query,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(
-        std::move(nss), query, emptyObj, emptyObj, 0, 0, whereCallback);
-}
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    NamespaceString nss,
-    const BSONObj& query,
-    bool explain,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(std::move(nss),
-                                        query,
-                                        emptyObj,  // sort
-                                        emptyObj,  // projection
-                                        0,         // skip
-                                        0,         // limit
-                                        emptyObj,  // hint
-                                        emptyObj,  // min
-                                        emptyObj,  // max
-                                        false,     // snapshot
-                                        explain,
-                                        whereCallback);
-}
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    NamespaceString nss,
-    const BSONObj& query,
-    long long skip,
-    long long limit,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(
-        std::move(nss), query, emptyObj, emptyObj, skip, limit, whereCallback);
-}
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    NamespaceString nss,
-    const BSONObj& query,
-    const BSONObj& sort,
-    const BSONObj& proj,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    return CanonicalQuery::canonicalize(std::move(nss), query, sort, proj, 0, 0, whereCallback);
-}
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    NamespaceString nss,
-    const BSONObj& query,
-    const BSONObj& sort,
-    const BSONObj& proj,
-    long long skip,
-    long long limit,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(
-        std::move(nss), query, sort, proj, skip, limit, emptyObj, whereCallback);
-}
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    NamespaceString nss,
-    const BSONObj& query,
-    const BSONObj& sort,
-    const BSONObj& proj,
-    long long skip,
-    long long limit,
-    const BSONObj& hint,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(std::move(nss),
-                                        query,
-                                        sort,
-                                        proj,
-                                        skip,
-                                        limit,
-                                        hint,
-                                        emptyObj,
-                                        emptyObj,
-                                        false,  // snapshot
-                                        false,  // explain
-                                        whereCallback);
-}
-
-//
-// These actually call init() on the CQ.
-//
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const QueryMessage& qm, const MatchExpressionParser::WhereCallback& whereCallback) {
-    // Make LiteParsedQuery.
-    auto lpqStatus = LiteParsedQuery::fromLegacyQueryMessage(qm);
-    if (!lpqStatus.isOK()) {
-        return lpqStatus.getStatus();
+    OperationContext* opCtx,
+    const QueryMessage& qm,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const ExtensionsCallback& extensionsCallback,
+    MatchExpressionParser::AllowedFeatureSet allowedFeatures) {
+    // Make QueryRequest.
+    auto qrStatus = QueryRequest::fromLegacyQueryMessage(qm);
+    if (!qrStatus.isOK()) {
+        return qrStatus.getStatus();
     }
 
-    return CanonicalQuery::canonicalize(lpqStatus.getValue().release(), whereCallback);
+    return CanonicalQuery::canonicalize(
+        opCtx, std::move(qrStatus.getValue()), expCtx, extensionsCallback, allowedFeatures);
 }
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    LiteParsedQuery* lpq, const MatchExpressionParser::WhereCallback& whereCallback) {
-    std::unique_ptr<LiteParsedQuery> autoLpq(lpq);
+    OperationContext* opCtx,
+    std::unique_ptr<QueryRequest> qr,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const ExtensionsCallback& extensionsCallback,
+    MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+    const ProjectionPolicies& projectionPolicies) {
+    auto qrStatus = qr->validate();
+    if (!qrStatus.isOK()) {
+        return qrStatus;
+    }
+
+    std::unique_ptr<CollatorInterface> collator;
+    if (!qr->getCollation().isEmpty()) {
+        auto statusWithCollator = CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                      ->makeFromBSON(qr->getCollation());
+        if (!statusWithCollator.isOK()) {
+            return statusWithCollator.getStatus();
+        }
+        collator = std::move(statusWithCollator.getValue());
+    }
 
     // Make MatchExpression.
-    StatusWithMatchExpression statusWithMatcher =
-        MatchExpressionParser::parse(autoLpq->getFilter(), whereCallback);
+    boost::intrusive_ptr<ExpressionContext> newExpCtx;
+    if (!expCtx.get()) {
+        newExpCtx = make_intrusive<ExpressionContext>(opCtx,
+                                                      std::move(collator),
+                                                      qr->nss(),
+                                                      qr->getLegacyRuntimeConstants(),
+                                                      qr->getLetParameters());
+    } else {
+        newExpCtx = expCtx;
+        // A collator can enter through both the QueryRequest and ExpressionContext arguments.
+        // This invariant ensures that both collators are the same because downstream we
+        // pull the collator from only one of the ExpressionContext carrier.
+        if (collator.get() && expCtx->getCollator()) {
+            invariant(CollatorInterface::collatorsMatch(collator.get(), expCtx->getCollator()));
+        }
+    }
+
+    // Make the CQ we'll hopefully return.
+    std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
+
+    StatusWithMatchExpression statusWithMatcher = [&]() -> StatusWithMatchExpression {
+        if (getTestCommandsEnabled() && internalQueryEnableCSTParser.load()) {
+            try {
+                return cst::parseToMatchExpression(qr->getFilter(), newExpCtx, extensionsCallback);
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        } else {
+            return MatchExpressionParser::parse(
+                qr->getFilter(), newExpCtx, extensionsCallback, allowedFeatures);
+        }
+    }();
     if (!statusWithMatcher.isOK()) {
         return statusWithMatcher.getStatus();
     }
     std::unique_ptr<MatchExpression> me = std::move(statusWithMatcher.getValue());
 
-    // Make the CQ we'll hopefully return.
-    std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
-
-    Status initStatus = cq->init(autoLpq.release(), whereCallback, me.release());
-
-    if (!initStatus.isOK()) {
-        return initStatus;
-    }
-    return std::move(cq);
-}
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const CanonicalQuery& baseQuery,
-    MatchExpression* root,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    // TODO: we should be passing the filter corresponding to 'root' to the LPQ rather than the base
-    // query's filter, baseQuery.getParsed().getFilter().
-    BSONObj emptyObj;
-    auto lpqStatus = LiteParsedQuery::makeAsOpQuery(baseQuery.nss(),
-                                                    0,  // ntoskip
-                                                    0,  // ntoreturn
-                                                    0,  // queryOptions
-                                                    baseQuery.getParsed().getFilter(),
-                                                    baseQuery.getParsed().getProj(),
-                                                    baseQuery.getParsed().getSort(),
-                                                    emptyObj,  // hint
-                                                    emptyObj,  // min
-                                                    emptyObj,  // max
-                                                    false,     // snapshot
-                                                    baseQuery.getParsed().isExplain());
-    if (!lpqStatus.isOK()) {
-        return lpqStatus.getStatus();
-    }
-
-    // Make the CQ we'll hopefully return.
-    std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
     Status initStatus =
-        cq->init(lpqStatus.getValue().release(), whereCallback, root->shallowClone().release());
+        cq->init(opCtx,
+                 std::move(newExpCtx),
+                 std::move(qr),
+                 parsingCanProduceNoopMatchNodes(extensionsCallback, allowedFeatures),
+                 std::move(me),
+                 projectionPolicies);
 
     if (!initStatus.isOK()) {
         return initStatus;
@@ -269,40 +152,28 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    NamespaceString nss,
-    const BSONObj& query,
-    const BSONObj& sort,
-    const BSONObj& proj,
-    long long skip,
-    long long limit,
-    const BSONObj& hint,
-    const BSONObj& minObj,
-    const BSONObj& maxObj,
-    bool snapshot,
-    bool explain,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    // Pass empty sort and projection.
-    BSONObj emptyObj;
-
-    auto lpqStatus = LiteParsedQuery::makeAsOpQuery(
-        std::move(nss), skip, limit, 0, query, proj, sort, hint, minObj, maxObj, snapshot, explain);
-    if (!lpqStatus.isOK()) {
-        return lpqStatus.getStatus();
+    OperationContext* opCtx, const CanonicalQuery& baseQuery, MatchExpression* root) {
+    auto qr = std::make_unique<QueryRequest>(baseQuery.nss());
+    BSONObjBuilder builder;
+    root->serialize(&builder, true);
+    qr->setFilter(builder.obj());
+    qr->setProj(baseQuery.getQueryRequest().getProj());
+    qr->setSort(baseQuery.getQueryRequest().getSort());
+    qr->setCollation(baseQuery.getQueryRequest().getCollation());
+    qr->setExplain(baseQuery.getQueryRequest().isExplain());
+    auto qrStatus = qr->validate();
+    if (!qrStatus.isOK()) {
+        return qrStatus;
     }
-
-    auto& lpq = lpqStatus.getValue();
-
-    // Build a parse tree from the BSONObj in the parsed query.
-    StatusWithMatchExpression statusWithMatcher =
-        MatchExpressionParser::parse(lpq->getFilter(), whereCallback);
-    if (!statusWithMatcher.isOK()) {
-        return statusWithMatcher.getStatus();
-    }
-    std::unique_ptr<MatchExpression> me = std::move(statusWithMatcher.getValue());
 
     // Make the CQ we'll hopefully return.
     std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
-    Status initStatus = cq->init(lpq.release(), whereCallback, me.release());
+    Status initStatus = cq->init(opCtx,
+                                 baseQuery.getExpCtx(),
+                                 std::move(qr),
+                                 baseQuery.canHaveNoopMatchNodes(),
+                                 root->shallowClone(),
+                                 ProjectionPolicies::findProjectionPolicies());
 
     if (!initStatus.isOK()) {
         return initStatus;
@@ -310,38 +181,99 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     return std::move(cq);
 }
 
-Status CanonicalQuery::init(LiteParsedQuery* lpq,
-                            const MatchExpressionParser::WhereCallback& whereCallback,
-                            MatchExpression* root) {
-    _pq.reset(lpq);
+Status CanonicalQuery::init(OperationContext* opCtx,
+                            boost::intrusive_ptr<ExpressionContext> expCtx,
+                            std::unique_ptr<QueryRequest> qr,
+                            bool canHaveNoopMatchNodes,
+                            std::unique_ptr<MatchExpression> root,
+                            const ProjectionPolicies& projectionPolicies) {
+    _expCtx = expCtx;
+    _qr = std::move(qr);
 
-    // Normalize, sort and validate tree.
-    root = normalizeTree(root);
+    _canHaveNoopMatchNodes = canHaveNoopMatchNodes;
 
-    sortTree(root);
-    _root.reset(root);
-    Status validStatus = isValid(root, *_pq);
+    // Normalize and validate tree.
+    _root = MatchExpression::normalize(std::move(root));
+    auto validStatus = isValid(_root.get(), *_qr);
     if (!validStatus.isOK()) {
-        return validStatus;
+        return validStatus.getStatus();
     }
+    auto unavailableMetadata = validStatus.getValue();
 
     // Validate the projection if there is one.
-    if (!_pq->getProj().isEmpty()) {
-        ParsedProjection* pp;
-        Status projStatus = ParsedProjection::make(_pq->getProj(), _root.get(), &pp, whereCallback);
-        if (!projStatus.isOK()) {
-            return projStatus;
+    if (!_qr->getProj().isEmpty()) {
+        try {
+            _proj.emplace(projection_ast::parse(
+                expCtx, _qr->getProj(), _root.get(), _qr->getFilter(), projectionPolicies));
+
+            // Fail if any of the projection's dependencies are unavailable.
+            DepsTracker{unavailableMetadata}.requestMetadata(_proj->metadataDeps());
+        } catch (const DBException& e) {
+            return e.toStatus();
         }
-        _proj.reset(pp);
+
+        _metadataDeps = _proj->metadataDeps();
     }
 
-    if (_proj && _proj->wantSortKey() && _pq->getSort().isEmpty()) {
+    if (_proj && _proj->metadataDeps()[DocumentMetadataFields::kSortKey] &&
+        _qr->getSort().isEmpty()) {
         return Status(ErrorCodes::BadValue, "cannot use sortKey $meta projection without a sort");
+    }
+
+    // If there is a sort, parse it and add any metadata dependencies it induces.
+    try {
+        initSortPattern(unavailableMetadata);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+
+    // If the 'returnKey' option is set, then the plan should produce index key metadata.
+    if (_qr->returnKey()) {
+        _metadataDeps.set(DocumentMetadataFields::kIndexKey);
     }
 
     return Status::OK();
 }
 
+void CanonicalQuery::initSortPattern(QueryMetadataBitSet unavailableMetadata) {
+    if (_qr->getSort().isEmpty()) {
+        return;
+    }
+
+    // A $natural sort is really a hint, and should be handled as such. Furthermore, the downstream
+    // sort handling code may not expect a $natural sort.
+    //
+    // We have already validated that if there is a $natural sort and a hint, that the hint
+    // also specifies $natural with the same direction. Therefore, it is safe to clear the $natural
+    // sort and rewrite it as a $natural hint.
+    if (_qr->getSort()[QueryRequest::kNaturalSortField]) {
+        _qr->setHint(_qr->getSort());
+        _qr->setSort(BSONObj{});
+    }
+
+    if (getTestCommandsEnabled() && internalQueryEnableCSTParser.load()) {
+        _sortPattern = cst::parseToSortPattern(_qr->getSort(), _expCtx);
+    } else {
+        _sortPattern = SortPattern{_qr->getSort(), _expCtx};
+    }
+    _metadataDeps |= _sortPattern->metadataDeps(unavailableMetadata);
+
+    // If the results of this query might have to be merged on a remote node, then that node might
+    // need the sort key metadata. Request that the plan generates this metadata.
+    if (_expCtx->needsMerge) {
+        _metadataDeps.set(DocumentMetadataFields::kSortKey);
+    }
+}
+
+void CanonicalQuery::setCollator(std::unique_ptr<CollatorInterface> collator) {
+    auto collatorRaw = collator.get();
+    // We must give the ExpressionContext the same collator.
+    _expCtx->setCollator(std::move(collator));
+
+    // The collator associated with the match expression tree is now invalid, since we have reset
+    // the collator owned by the ExpressionContext.
+    _root->setCollator(collatorRaw);
+}
 
 // static
 bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
@@ -350,7 +282,7 @@ bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
     BSONObjIterator it(query);
     while (it.more()) {
         BSONElement elt = it.next();
-        if (str::equals("_id", elt.fieldName())) {
+        if (elt.fieldNameStringData() == "_id") {
             // Verify that the query on _id is a simple equality.
             hasID = true;
 
@@ -360,16 +292,12 @@ bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
                 if (elt.Obj().firstElementFieldName()[0] == '$') {
                     return false;
                 }
-            } else if (!elt.isSimpleType() && BinData != elt.type()) {
+            } else if (!Indexability::isExactBoundsGenerating(elt)) {
                 // The _id fild cannot be something like { _id : { $gt : ...
                 // But it can be BinData.
                 return false;
             }
-        } else if (elt.fieldName()[0] == '$' && (str::equals("$isolated", elt.fieldName()) ||
-                                                 str::equals("$atomic", elt.fieldName()))) {
-            // ok, passthrough
         } else {
-            // If the field is not _id, it must be $isolated/$atomic.
             return false;
         }
     }
@@ -377,78 +305,6 @@ bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
     return hasID;
 }
 
-// static
-MatchExpression* CanonicalQuery::normalizeTree(MatchExpression* root) {
-    // root->isLogical() is true now.  We care about AND, OR, and NOT. NOR currently scares us.
-    if (MatchExpression::AND == root->matchType() || MatchExpression::OR == root->matchType()) {
-        // We could have AND of AND of AND.  Make sure we clean up our children before merging
-        // them.
-        // UNITTEST 11738048
-        for (size_t i = 0; i < root->getChildVector()->size(); ++i) {
-            (*root->getChildVector())[i] = normalizeTree(root->getChild(i));
-        }
-
-        // If any of our children are of the same logical operator that we are, we remove the
-        // child's children and append them to ourselves after we examine all children.
-        std::vector<MatchExpression*> absorbedChildren;
-
-        for (size_t i = 0; i < root->numChildren();) {
-            MatchExpression* child = root->getChild(i);
-            if (child->matchType() == root->matchType()) {
-                // AND of an AND or OR of an OR.  Absorb child's children into ourself.
-                for (size_t j = 0; j < child->numChildren(); ++j) {
-                    absorbedChildren.push_back(child->getChild(j));
-                }
-                // TODO(opt): this is possibly n^2-ish
-                root->getChildVector()->erase(root->getChildVector()->begin() + i);
-                child->getChildVector()->clear();
-                // Note that this only works because we cleared the child's children
-                delete child;
-                // Don't increment 'i' as the current child 'i' used to be child 'i+1'
-            } else {
-                ++i;
-            }
-        }
-
-        root->getChildVector()->insert(
-            root->getChildVector()->end(), absorbedChildren.begin(), absorbedChildren.end());
-
-        // AND of 1 thing is the thing, OR of 1 thing is the thing.
-        if (1 == root->numChildren()) {
-            MatchExpression* ret = root->getChild(0);
-            root->getChildVector()->clear();
-            delete root;
-            return ret;
-        }
-    } else if (MatchExpression::NOT == root->matchType()) {
-        // Normalize the rest of the tree hanging off this NOT node.
-        NotMatchExpression* nme = static_cast<NotMatchExpression*>(root);
-        MatchExpression* child = nme->releaseChild();
-        // normalizeTree(...) takes ownership of 'child', and then
-        // transfers ownership of its return value to 'nme'.
-        nme->resetChild(normalizeTree(child));
-    } else if (MatchExpression::ELEM_MATCH_VALUE == root->matchType()) {
-        // Just normalize our children.
-        for (size_t i = 0; i < root->getChildVector()->size(); ++i) {
-            (*root->getChildVector())[i] = normalizeTree(root->getChild(i));
-        }
-    }
-
-    return root;
-}
-
-// static
-void CanonicalQuery::sortTree(MatchExpression* tree) {
-    for (size_t i = 0; i < tree->numChildren(); ++i) {
-        sortTree(tree->getChild(i));
-    }
-    std::vector<MatchExpression*>* children = tree->getChildVector();
-    if (NULL != children) {
-        std::sort(children->begin(), children->end(), matchExpressionLessThan);
-    }
-}
-
-// static
 size_t CanonicalQuery::countNodes(const MatchExpression* root, MatchExpression::MatchType type) {
     size_t sum = 0;
     if (type == root->matchType()) {
@@ -477,9 +333,9 @@ bool hasNodeInSubtree(MatchExpression* root,
     return false;
 }
 
-// static
-Status CanonicalQuery::isValid(MatchExpression* root, const LiteParsedQuery& parsed) {
-    // Analysis below should be done after squashing the tree to make it clearer.
+StatusWith<QueryMetadataBitSet> CanonicalQuery::isValid(MatchExpression* root,
+                                                        const QueryRequest& request) {
+    QueryMetadataBitSet unavailableMetadata{};
 
     // There can only be one TEXT.  If there is a TEXT, it cannot appear inside a NOR.
     //
@@ -492,6 +348,9 @@ Status CanonicalQuery::isValid(MatchExpression* root, const LiteParsedQuery& par
         if (hasNodeInSubtree(root, MatchExpression::TEXT, MatchExpression::NOR)) {
             return Status(ErrorCodes::BadValue, "text expression not allowed in nor");
         }
+    } else {
+        // Text metadata is not available.
+        unavailableMetadata.set(DocumentMetadataFields::kTextScore);
     }
 
     // There can only be one NEAR.  If there is a NEAR, it must be either the root or the root
@@ -514,18 +373,34 @@ Status CanonicalQuery::isValid(MatchExpression* root, const LiteParsedQuery& par
         if (!topLevel) {
             return Status(ErrorCodes::BadValue, "geoNear must be top-level expr");
         }
+    } else {
+        // Geo distance and geo point metadata are unavailable.
+        unavailableMetadata |= DepsTracker::kAllGeoNearData;
+    }
+
+    const BSONObj& sortObj = request.getSort();
+    BSONElement sortNaturalElt = sortObj["$natural"];
+    const BSONObj& hintObj = request.getHint();
+    BSONElement hintNaturalElt = hintObj["$natural"];
+
+    if (sortNaturalElt && sortObj.nFields() != 1) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Cannot include '$natural' in compound sort: " << sortObj);
+    }
+
+    if (hintNaturalElt && hintObj.nFields() != 1) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Cannot include '$natural' in compound hint: " << hintObj);
     }
 
     // NEAR cannot have a $natural sort or $natural hint.
     if (numGeoNear > 0) {
-        BSONObj sortObj = parsed.getSort();
-        if (!sortObj["$natural"].eoo()) {
+        if (sortNaturalElt) {
             return Status(ErrorCodes::BadValue,
                           "geoNear expression not allowed with $natural sort order");
         }
 
-        BSONObj hintObj = parsed.getHint();
-        if (!hintObj["$natural"].eoo()) {
+        if (hintNaturalElt) {
             return Status(ErrorCodes::BadValue,
                           "geoNear expression not allowed with $natural hint");
         }
@@ -537,80 +412,102 @@ Status CanonicalQuery::isValid(MatchExpression* root, const LiteParsedQuery& par
     }
 
     // TEXT and {$natural: ...} sort order cannot both be in the query.
-    if (numText > 0) {
-        const BSONObj& sortObj = parsed.getSort();
-        BSONObjIterator it(sortObj);
-        while (it.more()) {
-            BSONElement elt = it.next();
-            if (str::equals("$natural", elt.fieldName())) {
+    if (numText > 0 && sortNaturalElt) {
+        return Status(ErrorCodes::BadValue, "text expression not allowed with $natural sort order");
+    }
+
+    // TEXT and hint cannot both be in the query.
+    if (numText > 0 && !hintObj.isEmpty()) {
+        return Status(ErrorCodes::BadValue, "text and hint not allowed in same query");
+    }
+
+    // TEXT and tailable are incompatible.
+    if (numText > 0 && request.isTailable()) {
+        return Status(ErrorCodes::BadValue, "text and tailable cursor not allowed in same query");
+    }
+
+    // NEAR and tailable are incompatible.
+    if (numGeoNear > 0 && request.isTailable()) {
+        return Status(ErrorCodes::BadValue,
+                      "Tailable cursors and geo $near cannot be used together");
+    }
+
+    // $natural sort order must agree with hint.
+    if (sortNaturalElt) {
+        if (!hintObj.isEmpty() && !hintNaturalElt) {
+            return Status(ErrorCodes::BadValue, "index hint not allowed with $natural sort order");
+        }
+        if (hintNaturalElt) {
+            if (hintNaturalElt.numberInt() != sortNaturalElt.numberInt()) {
                 return Status(ErrorCodes::BadValue,
-                              "text expression not allowed with $natural sort order");
+                              "$natural hint must be in the same direction as $natural sort order");
             }
         }
     }
 
-    // TEXT and hint cannot both be in the query.
-    if (numText > 0 && !parsed.getHint().isEmpty()) {
-        return Status(ErrorCodes::BadValue, "text and hint not allowed in same query");
-    }
-
-    // TEXT and snapshot cannot both be in the query.
-    if (numText > 0 && parsed.isSnapshot()) {
-        return Status(ErrorCodes::BadValue, "text and snapshot not allowed in same query");
-    }
-
-    return Status::OK();
+    return unavailableMetadata;
 }
 
 std::string CanonicalQuery::toString() const {
     str::stream ss;
-    ss << "ns=" << _pq->ns();
+    ss << "ns=" << _qr->nss().ns();
 
-    if (_pq->getBatchSize()) {
-        ss << " batchSize=" << *_pq->getBatchSize();
+    if (_qr->getBatchSize()) {
+        ss << " batchSize=" << *_qr->getBatchSize();
     }
 
-    if (_pq->getLimit()) {
-        ss << " limit=" << *_pq->getLimit();
+    if (_qr->getLimit()) {
+        ss << " limit=" << *_qr->getLimit();
     }
 
-    if (_pq->getSkip()) {
-        ss << " skip=" << *_pq->getSkip();
+    if (_qr->getSkip()) {
+        ss << " skip=" << *_qr->getSkip();
     }
 
-    if (_pq->getNToReturn()) {
-        ss << " ntoreturn=" << *_pq->getNToReturn() << '\n';
+    if (_qr->getNToReturn()) {
+        ss << " ntoreturn=" << *_qr->getNToReturn() << '\n';
     }
 
     // The expression tree puts an endl on for us.
-    ss << "Tree: " << _root->toString();
-    ss << "Sort: " << _pq->getSort().toString() << '\n';
-    ss << "Proj: " << _pq->getProj().toString() << '\n';
+    ss << "Tree: " << _root->debugString();
+    ss << "Sort: " << _qr->getSort().toString() << '\n';
+    ss << "Proj: " << _qr->getProj().toString() << '\n';
+    if (!_qr->getCollation().isEmpty()) {
+        ss << "Collation: " << _qr->getCollation().toString() << '\n';
+    }
     return ss;
 }
 
 std::string CanonicalQuery::toStringShort() const {
     str::stream ss;
-    ss << "query: " << _pq->getFilter().toString() << " sort: " << _pq->getSort().toString()
-       << " projection: " << _pq->getProj().toString();
+    ss << "ns: " << _qr->nss().ns() << " query: " << _qr->getFilter().toString()
+       << " sort: " << _qr->getSort().toString() << " projection: " << _qr->getProj().toString();
 
-    if (_pq->getBatchSize()) {
-        ss << " batchSize: " << *_pq->getBatchSize();
+    if (!_qr->getCollation().isEmpty()) {
+        ss << " collation: " << _qr->getCollation().toString();
     }
 
-    if (_pq->getLimit()) {
-        ss << " limit: " << *_pq->getLimit();
+    if (_qr->getBatchSize()) {
+        ss << " batchSize: " << *_qr->getBatchSize();
     }
 
-    if (_pq->getSkip()) {
-        ss << " skip: " << *_pq->getSkip();
+    if (_qr->getLimit()) {
+        ss << " limit: " << *_qr->getLimit();
     }
 
-    if (_pq->getNToReturn()) {
-        ss << " ntoreturn=" << *_pq->getNToReturn();
+    if (_qr->getSkip()) {
+        ss << " skip: " << *_qr->getSkip();
+    }
+
+    if (_qr->getNToReturn()) {
+        ss << " ntoreturn=" << *_qr->getNToReturn();
     }
 
     return ss;
+}
+
+CanonicalQuery::QueryShapeString CanonicalQuery::encodeKey() const {
+    return canonical_query_encoder::encode(*this);
 }
 
 }  // namespace mongo

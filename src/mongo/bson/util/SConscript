@@ -2,6 +2,8 @@
 
 Import('env')
 
+env = env.Clone()
+
 env.Library(
     target='bson_extract',
     source=[
@@ -9,38 +11,18 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/repl/optime',
     ],
 )
 
 env.CppUnitTest(
-    target='bson_extract_test',
+    target='bson_util_test',
     source=[
-        'bson_extract_test.cpp'
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/repl/optime',
-        'bson_extract',
-    ],
-)
-
-env.CppUnitTest(
-    target='builder_test',
-    source=[
+        'bson_check_test.cpp',
+        'bson_extract_test.cpp',
         'builder_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.CppUnitTest(
-    target='bson_check_test',
-    source=[
-        'bson_check_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
+        'bson_extract',
     ],
 )

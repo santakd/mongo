@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/auth/privilege_parser.h"
@@ -33,14 +34,14 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::string;
 using std::vector;
 
-using mongoutils::str::stream;
+using str::stream;
 
 const BSONField<bool> ParsedResource::anyResource("anyResource");
 const BSONField<bool> ParsedResource::cluster("cluster");
@@ -55,7 +56,7 @@ ParsedResource::~ParsedResource() {}
 
 bool ParsedResource::isValid(std::string* errMsg) const {
     std::string dummy;
-    if (errMsg == NULL) {
+    if (errMsg == nullptr) {
         errMsg = &dummy;
     }
 
@@ -87,14 +88,21 @@ bool ParsedResource::isValid(std::string* errMsg) const {
         *errMsg = stream() << cluster.name() << " must be true when specified";
         return false;
     }
-    if (isDbSet() && (!NamespaceString::validDBName(getDb()) && !getDb().empty())) {
+    if (isDbSet() &&
+        (!NamespaceString::validDBName(getDb(), NamespaceString::DollarInDbNameBehavior::Allow) &&
+         !getDb().empty())) {
         *errMsg = stream() << getDb() << " is not a valid database name";
         return false;
     }
     if (isCollectionSet() &&
         (!NamespaceString::validCollectionName(getCollection()) && !getCollection().empty())) {
-        *errMsg = stream() << getCollection() << " is not a valid collection name";
-        return false;
+        // local.oplog.$main is a real collection that the server will create. But, collection
+        // names with a '$' character are illegal. We must make an exception for this collection
+        // here so we can grant users access to it.
+        if (!(getDb() == "local" && getCollection() == "oplog.$main")) {
+            *errMsg = stream() << getCollection() << " is not a valid collection name";
+            return false;
+        }
     }
     return true;
 }
@@ -265,7 +273,7 @@ ParsedPrivilege::~ParsedPrivilege() {}
 
 bool ParsedPrivilege::isValid(std::string* errMsg) const {
     std::string dummy;
-    if (errMsg == NULL) {
+    if (errMsg == nullptr) {
         errMsg = &dummy;
     }
 
@@ -387,20 +395,21 @@ const ParsedResource& ParsedPrivilege::getResource() const {
     return _resource;
 }
 
-bool ParsedPrivilege::parsedPrivilegeToPrivilege(const ParsedPrivilege& parsedPrivilege,
-                                                 Privilege* result,
-                                                 std::string* errmsg) {
-    if (!parsedPrivilege.isValid(errmsg)) {
-        return false;
+Status ParsedPrivilege::parsedPrivilegeToPrivilege(const ParsedPrivilege& parsedPrivilege,
+                                                   Privilege* result,
+                                                   std::vector<std::string>* unrecognizedActions) {
+    std::string errmsg;
+    if (!parsedPrivilege.isValid(&errmsg)) {
+        return Status(ErrorCodes::FailedToParse, errmsg);
     }
 
     // Build actions
     ActionSet actions;
     const vector<std::string>& parsedActions = parsedPrivilege.getActions();
-    Status status = ActionSet::parseActionSetFromStringVector(parsedActions, &actions);
+    Status status =
+        ActionSet::parseActionSetFromStringVector(parsedActions, &actions, unrecognizedActions);
     if (!status.isOK()) {
-        *errmsg = status.reason();
-        return false;
+        return status;
     }
 
     // Build resource
@@ -428,7 +437,7 @@ bool ParsedPrivilege::parsedPrivilegeToPrivilege(const ParsedPrivilege& parsedPr
     }
 
     *result = Privilege(resource, actions);
-    return true;
+    return Status::OK();
 }
 
 bool ParsedPrivilege::privilegeToParsedPrivilege(const Privilege& privilege,

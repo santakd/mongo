@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,472 +27,394 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/chunk_manager.h"
 
-#include <boost/next_prior.hpp>
-#include <map>
-#include <set>
-
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/remote_command_targeter.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/namespace_string.h"
+#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/chunk.h"
-#include "mongo/s/chunk_diff.h"
-#include "mongo/s/client/shard_connection.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config.h"
-#include "mongo/s/grid.h"
-#include "mongo/util/log.h"
-#include "mongo/util/timer.h"
+#include "mongo/db/storage/key_string.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/chunk_writes_tracker.h"
+#include "mongo/s/mongod_and_mongos_server_parameters_gen.h"
+#include "mongo/s/shard_invalidated_for_targeting_exception.h"
 
 namespace mongo {
-
-using std::make_pair;
-using std::map;
-using std::max;
-using std::pair;
-using std::set;
-using std::shared_ptr;
-using std::string;
-using std::unique_ptr;
-using std::vector;
-
 namespace {
 
-/**
- * This is an adapter so we can use config diffs - mongos and mongod do them slightly
- * differently
- *
- * The mongos adapter here tracks all shards, and stores ranges by (max, Chunk) in the map.
- */
-class CMConfigDiffTracker : public ConfigDiffTracker<shared_ptr<Chunk>> {
-public:
-    CMConfigDiffTracker(ChunkManager* manager) : _manager(manager) {}
-
-    bool isTracked(const ChunkType& chunk) const final {
-        // Mongos tracks all shards
-        return true;
-    }
-
-    bool isMinKeyIndexed() const final {
-        return false;
-    }
-
-    pair<BSONObj, shared_ptr<Chunk>> rangeFor(OperationContext* txn,
-                                              const ChunkType& chunk) const final {
-        shared_ptr<Chunk> c(new Chunk(txn, _manager, chunk));
-        return make_pair(chunk.getMax(), c);
-    }
-
-    string shardFor(OperationContext* txn, const string& hostName) const final {
-        const auto shard = grid.shardRegistry()->getShard(txn, hostName);
-        return shard->getId();
-    }
-
-private:
-    ChunkManager* const _manager;
-};
-
-
-bool allOfType(BSONType type, const BSONObj& o) {
-    BSONObjIterator it(o);
-    while (it.more()) {
-        if (it.next().type() != type) {
+bool allElementsAreOfType(BSONType type, const BSONObj& obj) {
+    for (auto&& elem : obj) {
+        if (elem.type() != type) {
             return false;
         }
     }
     return true;
 }
 
-bool isChunkMapValid(const ChunkMap& chunkMap) {
-#define ENSURE(x)                                          \
-    do {                                                   \
-        if (!(x)) {                                        \
-            log() << "ChunkManager::_isValid failed: " #x; \
-            return false;                                  \
-        }                                                  \
-    } while (0)
+void checkAllElementsAreOfType(BSONType type, const BSONObj& o) {
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            str::stream() << "Not all elements of " << o << " are of type " << typeName(type),
+            allElementsAreOfType(type, o));
+}
 
-    if (chunkMap.empty()) {
-        return true;
-    }
-
-    // Check endpoints
-    ENSURE(allOfType(MinKey, chunkMap.begin()->second->getMin()));
-    ENSURE(allOfType(MaxKey, boost::prior(chunkMap.end())->second->getMax()));
-
-    // Make sure there are no gaps or overlaps
-    for (ChunkMap::const_iterator it = boost::next(chunkMap.begin()), end = chunkMap.end();
-         it != end;
-         ++it) {
-        ChunkMap::const_iterator last = boost::prior(it);
-
-        if (!(it->second->getMin() == last->second->getMax())) {
-            log() << last->second->toString();
-            log() << it->second->toString();
-            log() << it->second->getMin();
-            log() << last->second->getMax();
+void appendChunkTo(std::vector<std::shared_ptr<ChunkInfo>>& chunks,
+                   const std::shared_ptr<ChunkInfo>& chunk) {
+    if (!chunks.empty() && chunk->getRange().overlaps(chunks.back()->getRange())) {
+        if (chunks.back()->getLastmod().isOlderThan(chunk->getLastmod())) {
+            chunks.pop_back();
+            chunks.push_back(chunk);
         }
+    } else {
+        chunks.push_back(chunk);
+    }
+}
 
-        ENSURE(it->second->getMin() == last->second->getMax());
+// This function processes the passed in chunks by removing the older versions of any overlapping
+// chunks. The resulting chunks must be ordered by the maximum bound and not have any
+// overlapping chunks. In order to process the original set of chunks correctly which may have
+// chunks from older versions of the map that overlap, this algorithm would need to sort by
+// ascending minimum bounds before processing it. However, since we want to take advantage of the
+// precomputed KeyString representations of the maximum bounds, this function implements the same
+// algorithm by reverse sorting the chunks by the maximum before processing but then must
+// reverse the resulting collection before it is returned.
+std::vector<std::shared_ptr<ChunkInfo>> flatten(const std::vector<ChunkType>& changedChunks) {
+    if (changedChunks.empty())
+        return std::vector<std::shared_ptr<ChunkInfo>>();
+
+    std::vector<std::shared_ptr<ChunkInfo>> changedChunkInfos(changedChunks.size());
+    std::transform(changedChunks.begin(),
+                   changedChunks.end(),
+                   changedChunkInfos.begin(),
+                   [](const auto& c) { return std::make_shared<ChunkInfo>(c); });
+
+    std::sort(changedChunkInfos.begin(), changedChunkInfos.end(), [](const auto& a, const auto& b) {
+        return a->getMaxKeyString() > b->getMaxKeyString();
+    });
+
+    std::vector<std::shared_ptr<ChunkInfo>> flattened;
+    flattened.reserve(changedChunkInfos.size());
+    flattened.push_back(changedChunkInfos[0]);
+
+    for (size_t i = 1; i < changedChunkInfos.size(); ++i) {
+        appendChunkTo(flattened, changedChunkInfos[i]);
     }
 
-    return true;
+    std::reverse(flattened.begin(), flattened.end());
 
-#undef ENSURE
+    return flattened;
 }
 
 }  // namespace
 
-AtomicUInt32 ChunkManager::NextSequenceNumber(1U);
+ShardVersionMap ChunkMap::constructShardVersionMap() const {
+    ShardVersionMap shardVersions;
+    ChunkVector::const_iterator current = _chunkMap.cbegin();
 
-ChunkManager::ChunkManager(const string& ns, const ShardKeyPattern& pattern, bool unique)
-    : _ns(ns),
-      _keyPattern(pattern.getKeyPattern()),
-      _unique(unique),
-      _sequenceNumber(NextSequenceNumber.addAndFetch(1)),
-      _chunkRanges() {}
+    boost::optional<BSONObj> firstMin = boost::none;
+    boost::optional<BSONObj> lastMax = boost::none;
 
-ChunkManager::ChunkManager(const CollectionType& coll)
-    : _ns(coll.getNs().ns()),
-      _keyPattern(coll.getKeyPattern()),
-      _unique(coll.getUnique()),
-      _sequenceNumber(NextSequenceNumber.addAndFetch(1)),
-      _chunkRanges() {
-    // coll does not have correct version. Use same initial version as _load and createFirstChunks.
-    _version = ChunkVersion(0, 0, coll.getEpoch());
-}
+    while (current != _chunkMap.cend()) {
+        const auto& firstChunkInRange = *current;
+        const auto& currentRangeShardId = firstChunkInRange->getShardIdAt(boost::none);
 
-void ChunkManager::loadExistingRanges(OperationContext* txn, const ChunkManager* oldManager) {
-    int tries = 3;
-
-    while (tries--) {
-        ChunkMap chunkMap;
-        set<ShardId> shardIds;
-        ShardVersionMap shardVersions;
-
-        Timer t;
-
-        bool success = _load(txn, chunkMap, shardIds, &shardVersions, oldManager);
-        if (success) {
-            log() << "ChunkManager: time to load chunks for " << _ns << ": " << t.millis() << "ms"
-                  << " sequenceNumber: " << _sequenceNumber << " version: " << _version.toString()
-                  << " based on: "
-                  << (oldManager ? oldManager->getVersion().toString() : "(empty)");
-
-            // TODO: Merge into diff code above, so we validate in one place
-            if (isChunkMapValid(chunkMap)) {
-                _chunkMap.swap(chunkMap);
-                _shardIds.swap(shardIds);
-                _shardVersions.swap(shardVersions);
-                _chunkRanges.reloadAll(_chunkMap);
-
-                return;
-            }
+        // Tracks the max shard version for the shard on which the current range will reside
+        auto shardVersionIt = shardVersions.find(currentRangeShardId);
+        if (shardVersionIt == shardVersions.end()) {
+            shardVersionIt = shardVersions
+                                 .emplace(std::piecewise_construct,
+                                          std::forward_as_tuple(currentRangeShardId),
+                                          std::forward_as_tuple(_collectionVersion.epoch(),
+                                                                _collectionVersion.getTimestamp()))
+                                 .first;
         }
 
-        if (_chunkMap.size() < 10) {
-            _printChunks();
+        auto& maxShardVersion = shardVersionIt->second.shardVersion;
+
+        current =
+            std::find_if(current,
+                         _chunkMap.cend(),
+                         [&currentRangeShardId, &maxShardVersion](const auto& currentChunk) {
+                             if (currentChunk->getShardIdAt(boost::none) != currentRangeShardId)
+                                 return true;
+
+                             if (maxShardVersion.isOlderThan(currentChunk->getLastmod()))
+                                 maxShardVersion = currentChunk->getLastmod();
+
+                             return false;
+                         });
+
+        const auto rangeLast = *std::prev(current);
+
+        const auto& rangeMin = firstChunkInRange->getMin();
+        const auto& rangeMax = rangeLast->getMax();
+
+        // Check the continuity of the chunks map
+        if (lastMax && !SimpleBSONObjComparator::kInstance.evaluate(*lastMax == rangeMin)) {
+            if (SimpleBSONObjComparator::kInstance.evaluate(*lastMax < rangeMin))
+                uasserted(ErrorCodes::ConflictingOperationInProgress,
+                          str::stream() << "Gap exists in the routing table between chunks "
+                                        << findIntersectingChunk(*lastMax)->getRange().toString()
+                                        << " and " << rangeLast->getRange().toString());
+            else
+                uasserted(ErrorCodes::ConflictingOperationInProgress,
+                          str::stream() << "Overlap exists in the routing table between chunks "
+                                        << findIntersectingChunk(*lastMax)->getRange().toString()
+                                        << " and " << rangeLast->getRange().toString());
         }
 
-        warning() << "ChunkManager loaded an invalid config for " << _ns << ", trying again";
+        if (!firstMin)
+            firstMin = rangeMin;
 
-        sleepmillis(10 * (3 - tries));
+        lastMax = rangeMax;
+
+        // If a shard has chunks it must have a shard version, otherwise we have an invalid chunk
+        // somewhere, which should have been caught at chunk load time
+        invariant(maxShardVersion.isSet());
     }
 
-    // This will abort construction so we should never have a reference to an invalid config
-    msgasserted(13282,
-                str::stream() << "Couldn't load a valid config for " << _ns
-                              << " after 3 attempts. Please try again.");
-}
+    if (!_chunkMap.empty()) {
+        invariant(!shardVersions.empty());
+        invariant(firstMin.is_initialized());
+        invariant(lastMax.is_initialized());
 
-bool ChunkManager::_load(OperationContext* txn,
-                         ChunkMap& chunkMap,
-                         set<ShardId>& shardIds,
-                         ShardVersionMap* shardVersions,
-                         const ChunkManager* oldManager) {
-    // Reset the max version, but not the epoch, when we aren't loading from the oldManager
-    _version = ChunkVersion(0, 0, _version.epoch());
-
-    // If we have a previous version of the ChunkManager to work from, use that info to reduce
-    // our config query
-    if (oldManager && oldManager->getVersion().isSet()) {
-        // Get the old max version
-        _version = oldManager->getVersion();
-
-        // Load a copy of the old versions
-        *shardVersions = oldManager->_shardVersions;
-
-        // Load a copy of the chunk map, replacing the chunk manager with our own
-        const ChunkMap& oldChunkMap = oldManager->getChunkMap();
-
-        // Could be v.expensive
-        // TODO: If chunks were immutable and didn't reference the manager, we could do more
-        // interesting things here
-        for (const auto& oldChunkMapEntry : oldChunkMap) {
-            shared_ptr<Chunk> oldC = oldChunkMapEntry.second;
-            shared_ptr<Chunk> newC(new Chunk(
-                this, oldC->getMin(), oldC->getMax(), oldC->getShardId(), oldC->getLastmod()));
-
-            newC->setBytesWritten(oldC->getBytesWritten());
-
-            chunkMap.insert(make_pair(oldC->getMax(), newC));
-        }
-
-        LOG(2) << "loading chunk manager for collection " << _ns
-               << " using old chunk manager w/ version " << _version.toString() << " and "
-               << oldChunkMap.size() << " chunks";
+        checkAllElementsAreOfType(MinKey, firstMin.get());
+        checkAllElementsAreOfType(MaxKey, lastMax.get());
     }
 
-    // Attach a diff tracker for the versioned chunk data
-    CMConfigDiffTracker differ(this);
-    differ.attach(_ns, chunkMap, _version, *shardVersions);
+    return shardVersions;
+}
 
-    // Diff tracker should *always* find at least one chunk if collection exists
-    // Get the diff query required
-    auto diffQuery = differ.configDiffQuery();
+void ChunkMap::appendChunk(const std::shared_ptr<ChunkInfo>& chunk) {
+    appendChunkTo(_chunkMap, chunk);
 
-    repl::OpTime opTime;
-    std::vector<ChunkType> chunks;
-    uassertStatusOK(grid.catalogManager(txn)->getChunks(
-        txn, diffQuery.query, diffQuery.sort, boost::none, &chunks, &opTime));
+    if (_collectionVersion.isOlderThan(chunk->getLastmod()))
+        _collectionVersion = chunk->getLastmod();
+}
 
-    invariant(opTime >= _configOpTime);
-    _configOpTime = opTime;
+std::shared_ptr<ChunkInfo> ChunkMap::findIntersectingChunk(const BSONObj& shardKey) const {
+    const auto it = _findIntersectingChunk(shardKey);
 
-    int diffsApplied = differ.calculateConfigDiff(txn, chunks);
-    if (diffsApplied > 0) {
-        LOG(2) << "loaded " << diffsApplied << " chunks into new chunk manager for " << _ns
-               << " with version " << _version;
+    if (it != _chunkMap.end())
+        return *it;
 
-        // Add all existing shards we find to the shards set
-        for (ShardVersionMap::iterator it = shardVersions->begin(); it != shardVersions->end();) {
-            shared_ptr<Shard> shard = grid.shardRegistry()->getShard(txn, it->first);
-            if (shard) {
-                shardIds.insert(it->first);
-                ++it;
-            } else {
-                shardVersions->erase(it++);
-            }
+    return std::shared_ptr<ChunkInfo>();
+}
+
+void validateChunk(const std::shared_ptr<ChunkInfo>& chunk, const ChunkVersion& version) {
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            str::stream() << "Changed chunk " << chunk->toString()
+                          << " has epoch different from that of the collection " << version.epoch(),
+            version.epoch() == chunk->getLastmod().epoch());
+
+    invariant(version.isOlderOrEqualThan(chunk->getLastmod()));
+}
+
+ChunkMap ChunkMap::createMerged(
+    const std::vector<std::shared_ptr<ChunkInfo>>& changedChunks) const {
+    size_t chunkMapIndex = 0;
+    size_t changedChunkIndex = 0;
+
+    ChunkMap updatedChunkMap(
+        getVersion().epoch(), getVersion().getTimestamp(), _chunkMap.size() + changedChunks.size());
+
+    while (chunkMapIndex < _chunkMap.size() || changedChunkIndex < changedChunks.size()) {
+        if (chunkMapIndex >= _chunkMap.size()) {
+            validateChunk(changedChunks[changedChunkIndex], getVersion());
+            updatedChunkMap.appendChunk(changedChunks[changedChunkIndex++]);
+            continue;
         }
 
-        _configOpTime = opTime;
+        if (changedChunkIndex >= changedChunks.size()) {
+            updatedChunkMap.appendChunk(_chunkMap[chunkMapIndex++]);
+            continue;
+        }
 
-        return true;
-    } else if (diffsApplied == 0) {
-        // No chunks were found for the ns
-        warning() << "no chunks found when reloading " << _ns << ", previous version was "
-                  << _version;
+        auto overlap = _chunkMap[chunkMapIndex]->getRange().overlaps(
+            changedChunks[changedChunkIndex]->getRange());
 
-        // Set all our data to empty
-        chunkMap.clear();
-        shardVersions->clear();
+        if (overlap) {
+            auto& changedChunk = changedChunks[changedChunkIndex++];
+            auto& chunkInfo = _chunkMap[chunkMapIndex];
 
-        _version = ChunkVersion(0, 0, OID());
-        _configOpTime = opTime;
+            auto bytesInReplacedChunk = chunkInfo->getWritesTracker()->getBytesWritten();
+            changedChunk->getWritesTracker()->addBytesWritten(bytesInReplacedChunk);
 
-        return true;
-    } else {  // diffsApplied < 0
-
-        bool allInconsistent = (differ.numValidDiffs() == 0);
-        if (allInconsistent) {
-            // All versions are different, this can be normal
-            warning() << "major change in chunk information found when reloading " << _ns
-                      << ", previous version was " << _version;
+            validateChunk(changedChunk, getVersion());
+            updatedChunkMap.appendChunk(changedChunk);
         } else {
-            // Inconsistent load halfway through (due to yielding cursor during load)
-            // should be rare
-            warning() << "inconsistent chunks found when reloading " << _ns
-                      << ", previous version was " << _version << ", this should be rare";
-        }
-
-        // Set all our data to empty to be extra safe
-        chunkMap.clear();
-        shardVersions->clear();
-
-        _version = ChunkVersion(0, 0, OID());
-
-        return allInconsistent;
-    }
-}
-
-shared_ptr<ChunkManager> ChunkManager::reload(OperationContext* txn, bool force) const {
-    const NamespaceString nss(_ns);
-    auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
-    shared_ptr<DBConfig> config = uassertStatusOK(status);
-
-    return config->getChunkManagerIfExists(txn, getns(), force);
-}
-
-void ChunkManager::_printChunks() const {
-    for (ChunkMap::const_iterator it = _chunkMap.begin(), end = _chunkMap.end(); it != end; ++it) {
-        log() << *it->second;
-    }
-}
-
-void ChunkManager::calcInitSplitsAndShards(OperationContext* txn,
-                                           const ShardId& primaryShardId,
-                                           const vector<BSONObj>* initPoints,
-                                           const set<ShardId>* initShardIds,
-                                           vector<BSONObj>* splitPoints,
-                                           vector<ShardId>* shardIds) const {
-    verify(_chunkMap.size() == 0);
-
-    Chunk c(this,
-            _keyPattern.getKeyPattern().globalMin(),
-            _keyPattern.getKeyPattern().globalMax(),
-            primaryShardId);
-
-    if (!initPoints || !initPoints->size()) {
-        // discover split points
-        const auto primaryShard = grid.shardRegistry()->getShard(txn, primaryShardId);
-        const NamespaceString nss{getns()};
-        auto result = grid.shardRegistry()->runCommandOnShard(
-            txn,
-            primaryShard,
-            ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
-            nss.db().toString(),
-            BSON("count" << nss.coll()));
-
-        long long numObjects = 0;
-        uassertStatusOK(result.getStatus());
-        uassertStatusOK(Command::getStatusFromCommandResult(result.getValue()));
-        uassertStatusOK(bsonExtractIntegerField(result.getValue(), "n", &numObjects));
-
-        if (numObjects > 0)
-            c.pickSplitVector(txn, *splitPoints, Chunk::MaxChunkSize);
-
-        // since docs already exists, must use primary shard
-        shardIds->push_back(primaryShardId);
-    } else {
-        // make sure points are unique and ordered
-        set<BSONObj> orderedPts;
-        for (unsigned i = 0; i < initPoints->size(); ++i) {
-            BSONObj pt = (*initPoints)[i];
-            orderedPts.insert(pt);
-        }
-        for (set<BSONObj>::iterator it = orderedPts.begin(); it != orderedPts.end(); ++it) {
-            splitPoints->push_back(*it);
-        }
-
-        if (!initShardIds || !initShardIds->size()) {
-            // If not specified, only use the primary shard (note that it's not safe for mongos
-            // to put initial chunks on other shards without the primary mongod knowing).
-            shardIds->push_back(primaryShardId);
-        } else {
-            std::copy(initShardIds->begin(), initShardIds->end(), std::back_inserter(*shardIds));
-        }
-    }
-}
-
-void ChunkManager::createFirstChunks(OperationContext* txn,
-                                     const ShardId& primaryShardId,
-                                     const vector<BSONObj>* initPoints,
-                                     const set<ShardId>* initShardIds) {
-    // TODO distlock?
-    // TODO: Race condition if we shard the collection and insert data while we split across
-    // the non-primary shard.
-
-    vector<BSONObj> splitPoints;
-    vector<ShardId> shardIds;
-    calcInitSplitsAndShards(txn, primaryShardId, initPoints, initShardIds, &splitPoints, &shardIds);
-
-
-    // this is the first chunk; start the versioning from scratch
-    ChunkVersion version;
-    version.incEpoch();
-    version.incMajor();
-
-    log() << "going to create " << splitPoints.size() + 1 << " chunk(s) for: " << _ns
-          << " using new epoch " << version.epoch();
-
-    for (unsigned i = 0; i <= splitPoints.size(); i++) {
-        BSONObj min = i == 0 ? _keyPattern.getKeyPattern().globalMin() : splitPoints[i - 1];
-        BSONObj max =
-            i < splitPoints.size() ? splitPoints[i] : _keyPattern.getKeyPattern().globalMax();
-
-        Chunk temp(this, min, max, shardIds[i % shardIds.size()], version);
-
-        BSONObjBuilder chunkBuilder;
-        temp.serialize(chunkBuilder);
-
-        BSONObj chunkObj = chunkBuilder.obj();
-
-        Status result = grid.catalogManager(txn)->update(txn,
-                                                         ChunkType::ConfigNS,
-                                                         BSON(ChunkType::name(temp.genID())),
-                                                         chunkObj,
-                                                         true,
-                                                         false,
-                                                         NULL);
-
-        version.incMinor();
-
-        if (!result.isOK()) {
-            string ss = str::stream()
-                << "creating first chunks failed. result: " << result.reason();
-            error() << ss;
-            msgasserted(15903, ss);
+            updatedChunkMap.appendChunk(_chunkMap[chunkMapIndex++]);
         }
     }
 
-    _version = ChunkVersion(0, 0, version.epoch());
+    return updatedChunkMap;
 }
 
-ChunkPtr ChunkManager::findIntersectingChunk(OperationContext* txn, const BSONObj& shardKey) const {
+BSONObj ChunkMap::toBSON() const {
+    BSONObjBuilder builder;
+
+    builder.append("startingVersion"_sd, getVersion().toBSON());
+    builder.append("chunkCount", static_cast<int64_t>(_chunkMap.size()));
+
     {
-        BSONObj chunkMin;
-        ChunkPtr chunk;
-        {
-            ChunkMap::const_iterator it = _chunkMap.upper_bound(shardKey);
-            if (it != _chunkMap.end()) {
-                chunkMin = it->first;
-                chunk = it->second;
-            }
-        }
-
-        if (chunk) {
-            if (chunk->containsKey(shardKey)) {
-                return chunk;
-            }
-
-            log() << chunkMin;
-            log() << *chunk;
-            log() << shardKey;
-
-            reload(txn);
-            msgasserted(13141, "Chunk map pointed to incorrect chunk");
+        BSONArrayBuilder arrayBuilder(builder.subarrayStart("chunks"_sd));
+        for (const auto& chunk : _chunkMap) {
+            arrayBuilder.append(chunk->toString());
         }
     }
 
-    msgasserted(8070,
-                str::stream() << "couldn't find a chunk intersecting: " << shardKey
-                              << " for ns: " << _ns << " at version: " << _version.toString()
-                              << ", number of chunks: " << _chunkMap.size());
+    return builder.obj();
 }
 
-void ChunkManager::getShardIdsForQuery(set<ShardId>& shardIds, const BSONObj& query) const {
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(NamespaceString(_ns), query, WhereCallbackNoop());
+ChunkMap::ChunkVector::const_iterator ChunkMap::_findIntersectingChunk(const BSONObj& shardKey,
+                                                                       bool isMaxInclusive) const {
+    auto shardKeyString = ShardKeyPattern::toKeyString(shardKey);
 
-    uassertStatusOK(statusWithCQ.getStatus());
-    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    if (!isMaxInclusive) {
+        return std::lower_bound(_chunkMap.begin(),
+                                _chunkMap.end(),
+                                shardKey,
+                                [&shardKeyString](const auto& chunkInfo, const BSONObj& shardKey) {
+                                    return chunkInfo->getMaxKeyString() < shardKeyString;
+                                });
+    } else {
+        return std::upper_bound(_chunkMap.begin(),
+                                _chunkMap.end(),
+                                shardKey,
+                                [&shardKeyString](const BSONObj& shardKey, const auto& chunkInfo) {
+                                    return shardKeyString < chunkInfo->getMaxKeyString();
+                                });
+    }
+}
 
-    // Query validation
-    if (QueryPlannerCommon::hasNode(cq->root(), MatchExpression::GEO_NEAR)) {
-        uassert(13501, "use geoNear command rather than $near query", false);
+std::pair<ChunkMap::ChunkVector::const_iterator, ChunkMap::ChunkVector::const_iterator>
+ChunkMap::_overlappingBounds(const BSONObj& min, const BSONObj& max, bool isMaxInclusive) const {
+    const auto itMin = _findIntersectingChunk(min);
+    const auto itMax = [&]() {
+        auto it = _findIntersectingChunk(max, isMaxInclusive);
+        return it == _chunkMap.end() ? it : ++it;
+    }();
+
+    return {itMin, itMax};
+}
+
+ShardVersionTargetingInfo::ShardVersionTargetingInfo(const OID& epoch,
+                                                     const boost::optional<Timestamp>& timestamp)
+    : shardVersion(0, 0, epoch, timestamp) {}
+
+RoutingTableHistory::RoutingTableHistory(
+    NamespaceString nss,
+    boost::optional<UUID> uuid,
+    KeyPattern shardKeyPattern,
+    std::unique_ptr<CollatorInterface> defaultCollator,
+    bool unique,
+    boost::optional<TypeCollectionReshardingFields> reshardingFields,
+    bool allowMigrations,
+    ChunkMap chunkMap)
+    : _nss(std::move(nss)),
+      _uuid(uuid),
+      _shardKeyPattern(shardKeyPattern),
+      _defaultCollator(std::move(defaultCollator)),
+      _unique(unique),
+      _reshardingFields(std::move(reshardingFields)),
+      _allowMigrations(allowMigrations),
+      _chunkMap(std::move(chunkMap)),
+      _shardVersions(_chunkMap.constructShardVersionMap()) {}
+
+void RoutingTableHistory::setShardStale(const ShardId& shardId) {
+    if (gEnableFinerGrainedCatalogCacheRefresh) {
+        auto it = _shardVersions.find(shardId);
+        if (it != _shardVersions.end()) {
+            it->second.isStale.store(true);
+        }
+    }
+}
+
+void RoutingTableHistory::setAllShardsRefreshed() {
+    if (gEnableFinerGrainedCatalogCacheRefresh) {
+        for (auto& [shard, targetingInfo] : _shardVersions) {
+            targetingInfo.isStale.store(false);
+        }
+    }
+}
+
+Chunk ChunkManager::findIntersectingChunk(const BSONObj& shardKey, const BSONObj& collation) const {
+    const bool hasSimpleCollation = (collation.isEmpty() && !_rt->optRt->getDefaultCollator()) ||
+        SimpleBSONObjComparator::kInstance.evaluate(collation == CollationSpec::kSimpleSpec);
+    if (!hasSimpleCollation) {
+        for (BSONElement elt : shardKey) {
+            uassert(ErrorCodes::ShardKeyNotFound,
+                    str::stream() << "Cannot target single shard due to collation of key "
+                                  << elt.fieldNameStringData() << " for namespace "
+                                  << _rt->optRt->nss(),
+                    !CollationIndexKey::isCollatableType(elt.type()));
+        }
+    }
+
+    auto chunkInfo = _rt->optRt->findIntersectingChunk(shardKey);
+
+    uassert(ErrorCodes::ShardKeyNotFound,
+            str::stream() << "Cannot target single shard using key " << shardKey
+                          << " for namespace " << _rt->optRt->nss(),
+            chunkInfo && chunkInfo->containsKey(shardKey));
+
+    return Chunk(*chunkInfo, _clusterTime);
+}
+
+bool ChunkManager::keyBelongsToShard(const BSONObj& shardKey, const ShardId& shardId) const {
+    if (shardKey.isEmpty())
+        return false;
+
+    auto chunkInfo = _rt->optRt->findIntersectingChunk(shardKey);
+    if (!chunkInfo)
+        return false;
+
+    invariant(chunkInfo->containsKey(shardKey));
+
+    return chunkInfo->getShardIdAt(_clusterTime) == shardId;
+}
+
+void ChunkManager::getShardIdsForQuery(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                       const BSONObj& query,
+                                       const BSONObj& collation,
+                                       std::set<ShardId>* shardIds) const {
+    auto qr = std::make_unique<QueryRequest>(_rt->optRt->nss());
+    qr->setFilter(query);
+
+    if (auto uuid = getUUID())
+        expCtx->uuid = uuid;
+
+    if (!collation.isEmpty()) {
+        qr->setCollation(collation);
+    } else if (_rt->optRt->getDefaultCollator()) {
+        auto defaultCollator = _rt->optRt->getDefaultCollator();
+        qr->setCollation(defaultCollator->getSpec().toBSON());
+        expCtx->setCollator(defaultCollator->clone());
+    }
+
+    auto cq = uassertStatusOK(
+        CanonicalQuery::canonicalize(expCtx->opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures));
+
+    // Fast path for targeting equalities on the shard key.
+    auto shardKeyToFind = _rt->optRt->getShardKeyPattern().extractShardKeyFromQuery(*cq);
+    if (!shardKeyToFind.isEmpty()) {
+        try {
+            auto chunk = findIntersectingChunk(shardKeyToFind, collation);
+            shardIds->insert(chunk.getShardId());
+            return;
+        } catch (const DBException&) {
+            // The query uses multiple shards
+        }
     }
 
     // Transforms query into bounds for each field in the shard key
@@ -500,65 +423,121 @@ void ChunkManager::getShardIdsForQuery(set<ShardId>& shardIds, const BSONObj& qu
     //   Query { a : { $gte : 1, $lt : 2 },
     //            b : { $gte : 3, $lt : 4 } }
     //   => Bounds { a : [1, 2), b : [3, 4) }
-    IndexBounds bounds = getIndexBoundsForQuery(_keyPattern.toBSON(), *cq);
+    IndexBounds bounds = getIndexBoundsForQuery(_rt->optRt->getShardKeyPattern().toBSON(), *cq);
 
     // Transforms bounds for each shard key field into full shard key ranges
     // for example :
     //   Key { a : 1, b : 1 }
     //   Bounds { a : [1, 2), b : [3, 4) }
     //   => Ranges { a : 1, b : 3 } => { a : 2, b : 4 }
-    BoundList ranges = _keyPattern.flattenBounds(bounds);
+    BoundList ranges = _rt->optRt->getShardKeyPattern().flattenBounds(bounds);
 
     for (BoundList::const_iterator it = ranges.begin(); it != ranges.end(); ++it) {
-        getShardIdsForRange(shardIds, it->first /*min*/, it->second /*max*/);
+        getShardIdsForRange(it->first /*min*/, it->second /*max*/, shardIds);
 
-        // once we know we need to visit all shards no need to keep looping
-        if (shardIds.size() == _shardIds.size())
+        // Once we know we need to visit all shards no need to keep looping.
+        // However, this optimization does not apply when we are reading from a snapshot
+        // because _shardVersions contains shards with chunks and is built based on the last
+        // refresh. Therefore, it is possible for _shardVersions to have fewer entries if a shard
+        // no longer owns chunks when it used to at _clusterTime.
+        if (!_clusterTime && shardIds->size() == _rt->optRt->_shardVersions.size()) {
             break;
+        }
     }
 
-    // SERVER-4914 Some clients of getShardIdsForQuery() assume at least one shard will be
-    // returned.  For now, we satisfy that assumption by adding a shard with no matches rather
-    // than return an empty set of shards.
-    if (shardIds.empty()) {
-        massert(16068, "no chunk ranges available", !_chunkRanges.ranges().empty());
-        shardIds.insert(_chunkRanges.ranges().begin()->second->getShardId());
+    // SERVER-4914 Some clients of getShardIdsForQuery() assume at least one shard will be returned.
+    // For now, we satisfy that assumption by adding a shard with no matches rather than returning
+    // an empty set of shards.
+    if (shardIds->empty()) {
+        _rt->optRt->forEachChunk([&](const std::shared_ptr<ChunkInfo>& chunkInfo) {
+            shardIds->insert(chunkInfo->getShardIdAt(_clusterTime));
+            return false;
+        });
     }
 }
 
-void ChunkManager::getShardIdsForRange(set<ShardId>& shardIds,
-                                       const BSONObj& min,
-                                       const BSONObj& max) const {
-    ChunkRangeMap::const_iterator it = _chunkRanges.upper_bound(min);
-    ChunkRangeMap::const_iterator end = _chunkRanges.upper_bound(max);
-
-    massert(13507,
-            str::stream() << "no chunks found between bounds " << min << " and " << max,
-            it != _chunkRanges.ranges().end());
-
-    if (end != _chunkRanges.ranges().end())
-        ++end;
-
-    for (; it != end; ++it) {
-        shardIds.insert(it->second->getShardId());
-
-        // once we know we need to visit all shards no need to keep looping
-        if (shardIds.size() == _shardIds.size())
-            break;
+void ChunkManager::getShardIdsForRange(const BSONObj& min,
+                                       const BSONObj& max,
+                                       std::set<ShardId>* shardIds) const {
+    // If our range is [MinKey, MaxKey], we can simply return all shard ids right away. However,
+    // this optimization does not apply when we are reading from a snapshot because _shardVersions
+    // contains shards with chunks and is built based on the last refresh. Therefore, it is
+    // possible for _shardVersions to have fewer entries if a shard no longer owns chunks when it
+    // used to at _clusterTime.
+    if (!_clusterTime && allElementsAreOfType(MinKey, min) && allElementsAreOfType(MaxKey, max)) {
+        getAllShardIds(shardIds);
+        return;
     }
+
+    _rt->optRt->forEachOverlappingChunk(min, max, true, [&](auto& chunkInfo) {
+        shardIds->insert(chunkInfo->getShardIdAt(_clusterTime));
+
+        // No need to iterate through the rest of the ranges, because we already know we need to use
+        // all shards. However, this optimization does not apply when we are reading from a snapshot
+        // because _shardVersions contains shards with chunks and is built based on the last
+        // refresh. Therefore, it is possible for _shardVersions to have fewer entries if a shard
+        // no longer owns chunks when it used to at _clusterTime.
+        if (!_clusterTime && shardIds->size() == _rt->optRt->_shardVersions.size()) {
+            return false;
+        }
+
+        return true;
+    });
 }
 
-void ChunkManager::getAllShardIds(set<ShardId>* all) const {
-    dassert(all);
+bool ChunkManager::rangeOverlapsShard(const ChunkRange& range, const ShardId& shardId) const {
+    bool overlapFound = false;
 
-    all->insert(_shardIds.begin(), _shardIds.end());
+    _rt->optRt->forEachOverlappingChunk(
+        range.getMin(), range.getMax(), false, [&](auto& chunkInfo) {
+            if (chunkInfo->getShardIdAt(_clusterTime) == shardId) {
+                overlapFound = true;
+                return false;
+            }
+
+            return true;
+        });
+
+    return overlapFound;
+}
+
+boost::optional<Chunk> ChunkManager::getNextChunkOnShard(const BSONObj& shardKey,
+                                                         const ShardId& shardId) const {
+    boost::optional<Chunk> chunk;
+
+    _rt->optRt->forEachChunk(
+        [&](auto& chunkInfo) {
+            if (chunkInfo->getShardIdAt(_clusterTime) == shardId) {
+                chunk.emplace(*chunkInfo, _clusterTime);
+                return false;
+            }
+            return true;
+        },
+        shardKey);
+
+    return chunk;
+}
+
+ShardId ChunkManager::getMinKeyShardIdWithSimpleCollation() const {
+    auto minKey = getShardKeyPattern().getKeyPattern().globalMin();
+    return findIntersectingChunkWithSimpleCollation(minKey).getShardId();
+}
+
+void RoutingTableHistory::getAllShardIds(std::set<ShardId>* all) const {
+    std::transform(_shardVersions.begin(),
+                   _shardVersions.end(),
+                   std::inserter(*all, all->begin()),
+                   [](const ShardVersionMap::value_type& pair) { return pair.first; });
+}
+
+int RoutingTableHistory::getNShardsOwningChunks() const {
+    return _shardVersions.size();
 }
 
 IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key,
                                                  const CanonicalQuery& canonicalQuery) {
     // $text is not allowed in planning since we don't have text index on mongos.
-    //
-    // TODO: Treat $text query as a no-op in planning. So with shard key {a: 1},
+    // TODO: Treat $text query as a no-op in planning on mongos. So with shard key {a: 1},
     //       the query { a: 2, $text: { ... } } will only target to {a: 2}.
     if (QueryPlannerCommon::hasNode(canonicalQuery.root(), MatchExpression::TEXT)) {
         IndexBounds bounds;
@@ -566,46 +545,62 @@ IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key,
         return bounds;
     }
 
+    // Similarly, ignore GEO_NEAR queries in planning, since we do not have geo indexes on mongos.
+    if (QueryPlannerCommon::hasNode(canonicalQuery.root(), MatchExpression::GEO_NEAR)) {
+        IndexBounds bounds;
+        IndexBoundsBuilder::allValuesBounds(key, &bounds);
+        return bounds;
+    }
+
     // Consider shard key as an index
-    string accessMethod = IndexNames::findPluginName(key);
+    std::string accessMethod = IndexNames::findPluginName(key);
     dassert(accessMethod == IndexNames::BTREE || accessMethod == IndexNames::HASHED);
+    const auto indexType = IndexNames::nameToType(accessMethod);
 
     // Use query framework to generate index bounds
     QueryPlannerParams plannerParams;
     // Must use "shard key" index
     plannerParams.options = QueryPlannerParams::NO_TABLE_SCAN;
     IndexEntry indexEntry(key,
-                          accessMethod,
-                          false /* multiKey */,
+                          indexType,
+                          IndexDescriptor::kLatestIndexVersion,
+                          // The shard key index cannot be multikey.
+                          false,
+                          // Empty multikey paths, since the shard key index cannot be multikey.
+                          MultikeyPaths{},
+                          // Empty multikey path set, since the shard key index cannot be multikey.
+                          {},
                           false /* sparse */,
                           false /* unique */,
-                          "shardkey",
-                          NULL /* filterExpr */,
-                          BSONObj());
-    plannerParams.indices.push_back(indexEntry);
+                          IndexEntry::Identifier{"shardkey"},
+                          nullptr /* filterExpr */,
+                          BSONObj(),
+                          nullptr, /* collator */
+                          nullptr /* projExec */);
+    plannerParams.indices.push_back(std::move(indexEntry));
 
-    OwnedPointerVector<QuerySolution> solutions;
-    Status status = QueryPlanner::plan(canonicalQuery, plannerParams, &solutions.mutableVector());
-    uassert(status.code(), status.reason(), status.isOK());
+    auto plannerResult = QueryPlanner::plan(canonicalQuery, plannerParams);
+    if (plannerResult.getStatus().code() != ErrorCodes::NoQueryExecutionPlans) {
+        auto solutions = uassertStatusOK(std::move(plannerResult));
 
+        // Pick any solution that has non-trivial IndexBounds. bounds.size() == 0 represents a
+        // trivial IndexBounds where none of the fields' values are bounded.
+        for (auto&& soln : solutions) {
+            IndexBounds bounds = collapseQuerySolution(soln->root());
+            if (bounds.size() > 0) {
+                return bounds;
+            }
+        }
+    }
+
+    // We cannot plan the query without collection scan, so target to all shards.
     IndexBounds bounds;
-
-    for (vector<QuerySolution*>::const_iterator it = solutions.begin();
-         bounds.size() == 0 && it != solutions.end();
-         it++) {
-        // Try next solution if we failed to generate index bounds, i.e. bounds.size() == 0
-        bounds = collapseQuerySolution((*it)->root.get());
-    }
-
-    if (bounds.size() == 0) {
-        // We cannot plan the query without collection scan, so target to all shards.
-        IndexBoundsBuilder::allValuesBounds(key, &bounds);  // [minKey, maxKey]
-    }
+    IndexBoundsBuilder::allValuesBounds(key, &bounds);  // [minKey, maxKey]
     return bounds;
 }
 
 IndexBounds ChunkManager::collapseQuerySolution(const QuerySolutionNode* node) {
-    if (node->children.size() == 0) {
+    if (node->children.empty()) {
         invariant(node->getType() == STAGE_IXSCAN);
 
         const IndexScanNode* ixNode = static_cast<const IndexScanNode*>(node);
@@ -620,7 +615,9 @@ IndexBounds ChunkManager::collapseQuerySolution(const QuerySolutionNode* node) {
     // children.size() > 1, assert it's OR / SORT_MERGE.
     if (node->getType() != STAGE_OR && node->getType() != STAGE_SORT_MERGE) {
         // Unexpected node. We should never reach here.
-        error() << "could not generate index bounds on query solution tree: " << node->toString();
+        LOGV2_ERROR(23833,
+                    "could not generate index bounds on query solution tree: {node}",
+                    "node"_attr = redact(node->toString()));
         dassert(false);  // We'd like to know this error in testing.
 
         // Bail out with all shards in production, since this isn't a fatal error.
@@ -628,7 +625,8 @@ IndexBounds ChunkManager::collapseQuerySolution(const QuerySolutionNode* node) {
     }
 
     IndexBounds bounds;
-    for (vector<QuerySolutionNode*>::const_iterator it = node->children.begin();
+
+    for (std::vector<QuerySolutionNode*>::const_iterator it = node->children.begin();
          it != node->children.end();
          it++) {
         // The first branch under OR
@@ -642,11 +640,13 @@ IndexBounds ChunkManager::collapseQuerySolution(const QuerySolutionNode* node) {
         }
 
         IndexBounds childBounds = collapseQuerySolution(*it);
-        if (childBounds.size() == 0) {  // Got unexpected node in query solution tree
+        if (childBounds.size() == 0) {
+            // Got unexpected node in query solution tree
             return IndexBounds();
         }
 
         invariant(childBounds.size() == bounds.size());
+
         for (size_t i = 0; i < bounds.size(); i++) {
             bounds.fields[i].intervals.insert(bounds.fields[i].intervals.end(),
                                               childBounds.fields[i].intervals.begin(),
@@ -661,173 +661,260 @@ IndexBounds ChunkManager::collapseQuerySolution(const QuerySolutionNode* node) {
     return bounds;
 }
 
-bool ChunkManager::compatibleWith(const ChunkManager& other, const string& shardName) const {
+ChunkManager ChunkManager::makeAtTime(const ChunkManager& cm, Timestamp clusterTime) {
+    return ChunkManager(cm.dbPrimary(), cm.dbVersion(), cm._rt, clusterTime);
+}
+
+bool ChunkManager::allowMigrations() const {
+    if (!_rt->optRt)
+        return true;
+    return _rt->optRt->allowMigrations();
+}
+
+std::string ChunkManager::toString() const {
+    return _rt->optRt ? _rt->optRt->toString() : "UNSHARDED";
+}
+
+bool RoutingTableHistory::compatibleWith(const RoutingTableHistory& other,
+                                         const ShardId& shardName) const {
     // Return true if the shard version is the same in the two chunk managers
     // TODO: This doesn't need to be so strong, just major vs
-    return other.getVersion(shardName).equals(getVersion(shardName));
+    return other.getVersion(shardName) == getVersion(shardName);
 }
 
-ChunkVersion ChunkManager::getVersion(const std::string& shardName) const {
-    ShardVersionMap::const_iterator i = _shardVersions.find(shardName);
-    if (i == _shardVersions.end()) {
-        // Shards without explicitly tracked shard versions (meaning they have
-        // no chunks) always have a version of (0, 0, epoch).  Note this is
-        // *different* from the dropped chunk version of (0, 0, OID(000...)).
-        // See s/chunk_version.h.
-        return ChunkVersion(0, 0, _version.epoch());
+ChunkVersion RoutingTableHistory::_getVersion(const ShardId& shardName,
+                                              bool throwOnStaleShard) const {
+    auto it = _shardVersions.find(shardName);
+    if (it == _shardVersions.end()) {
+        // Shards without explicitly tracked shard versions (meaning they have no chunks) always
+        // have a version of (0, 0, epoch, timestamp)
+        const auto collVersion = _chunkMap.getVersion();
+        return ChunkVersion(0, 0, collVersion.epoch(), collVersion.getTimestamp());
     }
-    return i->second;
+
+    if (throwOnStaleShard && gEnableFinerGrainedCatalogCacheRefresh) {
+        uassert(ShardInvalidatedForTargetingInfo(_nss),
+                "shard has been marked stale",
+                !it->second.isStale.load());
+    }
+
+    return it->second.shardVersion;
 }
 
-ChunkVersion ChunkManager::getVersion() const {
-    return _version;
+ChunkVersion RoutingTableHistory::getVersion(const ShardId& shardName) const {
+    return _getVersion(shardName, true);
 }
 
-string ChunkManager::toString() const {
+ChunkVersion RoutingTableHistory::getVersionForLogging(const ShardId& shardName) const {
+    return _getVersion(shardName, false);
+}
+
+std::string RoutingTableHistory::toString() const {
     StringBuilder sb;
-    sb << "ChunkManager: " << _ns << " key:" << _keyPattern.toString() << '\n';
+    sb << "RoutingTableHistory: " << _nss.ns() << " key: " << _shardKeyPattern.toString() << '\n';
 
-    for (ChunkMap::const_iterator i = _chunkMap.begin(); i != _chunkMap.end(); ++i) {
-        sb << "\t" << i->second->toString() << '\n';
+    sb << "Chunks:\n";
+    _chunkMap.forEach([&sb](const auto& chunk) {
+        sb << "\t" << chunk->toString() << '\n';
+        return true;
+    });
+
+    sb << "Shard versions:\n";
+    for (const auto& entry : _shardVersions) {
+        sb << "\t" << entry.first << ": " << entry.second.shardVersion.toString() << '\n';
     }
 
     return sb.str();
 }
 
+RoutingTableHistory RoutingTableHistory::makeNew(
+    NamespaceString nss,
+    boost::optional<UUID> uuid,
+    KeyPattern shardKeyPattern,
+    std::unique_ptr<CollatorInterface> defaultCollator,
+    bool unique,
+    OID epoch,
+    const boost::optional<Timestamp>& timestamp,
+    boost::optional<TypeCollectionReshardingFields> reshardingFields,
+    bool allowMigrations,
+    const std::vector<ChunkType>& chunks) {
+    return RoutingTableHistory(std::move(nss),
+                               std::move(uuid),
+                               std::move(shardKeyPattern),
+                               std::move(defaultCollator),
+                               std::move(unique),
+                               boost::none,
+                               allowMigrations,
+                               ChunkMap{epoch, timestamp})
+        .makeUpdated(std::move(reshardingFields), allowMigrations, chunks);
+}
 
-ChunkRange::ChunkRange(ChunkMap::const_iterator begin, const ChunkMap::const_iterator end)
-    : _manager(begin->second->getManager()),
-      _shardId(begin->second->getShardId()),
-      _min(begin->second->getMin()),
-      _max(boost::prior(end)->second->getMax()) {
-    invariant(begin != end);
+// Note that any new parameters added to RoutingTableHistory::makeUpdated() must also be added to
+// ShardServerCatalogCacheLoader::_getLoaderMetadata() and copied into the persisted metadata when
+// it may overlap with the enqueued metadata.
+RoutingTableHistory RoutingTableHistory::makeUpdated(
+    boost::optional<TypeCollectionReshardingFields> reshardingFields,
+    bool allowMigrations,
+    const std::vector<ChunkType>& changedChunks) const {
+    auto changedChunkInfos = flatten(changedChunks);
+    auto chunkMap = _chunkMap.createMerged(changedChunkInfos);
 
-    DEV while (begin != end) {
-        dassert(begin->second->getManager() == _manager);
-        dassert(begin->second->getShardId() == _shardId);
-        ++begin;
+    // Only update the same collection.
+    invariant(getVersion().epoch() == chunkMap.getVersion().epoch());
+
+    return RoutingTableHistory(_nss,
+                               _uuid,
+                               getShardKeyPattern().getKeyPattern(),
+                               CollatorInterface::cloneCollator(getDefaultCollator()),
+                               isUnique(),
+                               std::move(reshardingFields),
+                               allowMigrations,
+                               std::move(chunkMap));
+}
+
+RoutingTableHistory RoutingTableHistory::makeUpdatedReplacingTimestamp(
+    const boost::optional<Timestamp>& timestamp) const {
+    invariant(getVersion().getTimestamp().is_initialized() != timestamp.is_initialized());
+
+    ChunkMap newMap(getVersion().epoch(), timestamp, _chunkMap.size());
+    _chunkMap.forEach([&](const std::shared_ptr<ChunkInfo>& chunkInfo) {
+        const ChunkVersion oldVersion = chunkInfo->getLastmod();
+        newMap.appendChunk(std::make_shared<ChunkInfo>(chunkInfo->getRange(),
+                                                       chunkInfo->getMaxKeyString(),
+                                                       chunkInfo->getShardId(),
+                                                       ChunkVersion(oldVersion.majorVersion(),
+                                                                    oldVersion.minorVersion(),
+                                                                    oldVersion.epoch(),
+                                                                    timestamp),
+                                                       chunkInfo->getHistory(),
+                                                       chunkInfo->isJumbo(),
+                                                       chunkInfo->getWritesTracker()));
+        return true;
+    });
+
+    return RoutingTableHistory(_nss,
+                               _uuid,
+                               getShardKeyPattern().getKeyPattern(),
+                               CollatorInterface::cloneCollator(getDefaultCollator()),
+                               _unique,
+                               _reshardingFields,
+                               _allowMigrations,
+                               std::move(newMap));
+}
+
+AtomicWord<uint64_t> ComparableChunkVersion::_epochDisambiguatingSequenceNumSource{1ULL};
+AtomicWord<uint64_t> ComparableChunkVersion::_forcedRefreshSequenceNumSource{1ULL};
+
+ComparableChunkVersion ComparableChunkVersion::makeComparableChunkVersion(
+    const ChunkVersion& version) {
+    return ComparableChunkVersion(_forcedRefreshSequenceNumSource.load(),
+                                  version,
+                                  _epochDisambiguatingSequenceNumSource.fetchAndAdd(1));
+}
+
+ComparableChunkVersion ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh() {
+    return ComparableChunkVersion(_forcedRefreshSequenceNumSource.addAndFetch(2) - 1,
+                                  boost::none,
+                                  _epochDisambiguatingSequenceNumSource.fetchAndAdd(1));
+}
+
+ComparableChunkVersion ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh(
+    const ChunkVersion& version) {
+    return ComparableChunkVersion(_forcedRefreshSequenceNumSource.addAndFetch(1),
+                                  version,
+                                  _epochDisambiguatingSequenceNumSource.fetchAndAdd(1));
+}
+
+BSONObj ComparableChunkVersion::toBSONForLogging() const {
+    BSONObjBuilder builder;
+    if (_chunkVersion)
+        builder.append("chunkVersion"_sd, _chunkVersion->toBSON());
+    else
+        builder.append("chunkVersion"_sd, "None");
+
+    builder.append("forcedRefreshSequenceNum"_sd, static_cast<int64_t>(_forcedRefreshSequenceNum));
+    builder.append("epochDisambiguatingSequenceNum"_sd,
+                   static_cast<int64_t>(_epochDisambiguatingSequenceNum));
+
+    return builder.obj();
+}
+
+bool ComparableChunkVersion::operator==(const ComparableChunkVersion& other) const {
+    if (_forcedRefreshSequenceNum != other._forcedRefreshSequenceNum)
+        return false;  // Values created on two sides of a forced refresh sequence number are always
+                       // considered different
+    if (_forcedRefreshSequenceNum == 0)
+        return true;  // Only default constructed values have _forcedRefreshSequenceNum == 0 and
+                      // they are always equal
+
+    // Relying on the boost::optional<ChunkVersion>::operator== comparison
+    return _chunkVersion == other._chunkVersion;
+}
+
+bool ComparableChunkVersion::operator<(const ComparableChunkVersion& other) const {
+    if (_forcedRefreshSequenceNum < other._forcedRefreshSequenceNum)
+        return true;  // Values created on two sides of a forced refresh sequence number are always
+                      // considered different
+    if (_forcedRefreshSequenceNum > other._forcedRefreshSequenceNum)
+        return false;  // Values created on two sides of a forced refresh sequence number are always
+                       // considered different
+    if (_forcedRefreshSequenceNum == 0)
+        return false;  // Only default constructed values have _forcedRefreshSequenceNum == 0 and
+                       // they are always equal
+    if (_chunkVersion.is_initialized() != other._chunkVersion.is_initialized())
+        return _epochDisambiguatingSequenceNum <
+            other._epochDisambiguatingSequenceNum;  // One side is not initialised, but the other
+                                                    // is, which can only happen if one side is
+                                                    // ForForcedRefresh and the other is made from
+                                                    // makeComparableChunkVersion. In this case, use
+                                                    // the _epochDisambiguatingSequenceNum to see
+                                                    // which one is more recent.
+    if (!_chunkVersion.is_initialized())
+        return _epochDisambiguatingSequenceNum <
+            other._epochDisambiguatingSequenceNum;  // Both sides are not initialised, which can
+                                                    // only happen if both were created from
+                                                    // ForForcedRefresh. In this case, use the
+                                                    // _epochDisambiguatingSequenceNum to see which
+                                                    // one is more recent.
+
+    const boost::optional<Timestamp> timestamp = _chunkVersion->getTimestamp();
+    const boost::optional<Timestamp> otherTimestamp = other._chunkVersion->getTimestamp();
+    if (timestamp && otherTimestamp) {
+        if (_chunkVersion->isSet() && other._chunkVersion->isSet()) {
+            if (*timestamp == *otherTimestamp)
+                return _chunkVersion->majorVersion() < other._chunkVersion->majorVersion() ||
+                    (_chunkVersion->majorVersion() == other._chunkVersion->majorVersion() &&
+                     _chunkVersion->minorVersion() < other._chunkVersion->minorVersion());
+            else
+                return *timestamp < *otherTimestamp;
+        } else if (!_chunkVersion->isSet() && !other._chunkVersion->isSet())
+            return false;  // Both sides are the "no chunks on the shard version"
+    } else if (sameEpoch(other)) {
+        if (_chunkVersion->isSet() && other._chunkVersion->isSet())
+            return _chunkVersion->majorVersion() < other._chunkVersion->majorVersion() ||
+                (_chunkVersion->majorVersion() == other._chunkVersion->majorVersion() &&
+                 _chunkVersion->minorVersion() < other._chunkVersion->minorVersion());
+        else if (!_chunkVersion->isSet() && !other._chunkVersion->isSet())
+            return false;  // Both sides are the "no chunks on the shard version"
     }
+
+    // If the epochs are different, or if they match, but one of the versions is the "no chunks"
+    // version, use the _epochDisambiguatingSequenceNum to disambiguate
+    return _epochDisambiguatingSequenceNum < other._epochDisambiguatingSequenceNum;
 }
 
-ChunkRange::ChunkRange(const ChunkRange& min, const ChunkRange& max)
-    : _manager(min.getManager()),
-      _shardId(min.getShardId()),
-      _min(min.getMin()),
-      _max(max.getMax()) {
-    invariant(min.getShardId() == max.getShardId());
-    invariant(min.getManager() == max.getManager());
-    invariant(min.getMax() == max.getMin());
-}
-
-string ChunkRange::toString() const {
-    StringBuilder sb;
-    sb << "ChunkRange(min=" << _min << ", max=" << _max << ", shard=" << _shardId << ")";
-
-    return sb.str();
-}
-
-
-void ChunkRangeManager::assertValid() const {
-    if (_ranges.empty())
-        return;
-
-    try {
-        // No Nulls
-        for (ChunkRangeMap::const_iterator it = _ranges.begin(), end = _ranges.end(); it != end;
-             ++it) {
-            verify(it->second);
-        }
-
-        // Check endpoints
-        verify(allOfType(MinKey, _ranges.begin()->second->getMin()));
-        verify(allOfType(MaxKey, boost::prior(_ranges.end())->second->getMax()));
-
-        // Make sure there are no gaps or overlaps
-        for (ChunkRangeMap::const_iterator it = boost::next(_ranges.begin()), end = _ranges.end();
-             it != end;
-             ++it) {
-            ChunkRangeMap::const_iterator last = boost::prior(it);
-            verify(it->second->getMin() == last->second->getMax());
-        }
-
-        // Check Map keys
-        for (ChunkRangeMap::const_iterator it = _ranges.begin(), end = _ranges.end(); it != end;
-             ++it) {
-            verify(it->first == it->second->getMax());
-        }
-
-        // Make sure we match the original chunks
-        const ChunkMap chunks = _ranges.begin()->second->getManager()->_chunkMap;
-        for (ChunkMap::const_iterator i = chunks.begin(); i != chunks.end(); ++i) {
-            const ChunkPtr chunk = i->second;
-
-            ChunkRangeMap::const_iterator min = _ranges.upper_bound(chunk->getMin());
-            ChunkRangeMap::const_iterator max = _ranges.lower_bound(chunk->getMax());
-
-            verify(min != _ranges.end());
-            verify(max != _ranges.end());
-            verify(min == max);
-            verify(min->second->getShardId() == chunk->getShardId());
-            verify(min->second->containsKey(chunk->getMin()));
-            verify(min->second->containsKey(chunk->getMax()) ||
-                   (min->second->getMax() == chunk->getMax()));
-        }
-
-    } catch (...) {
-        error() << "\t invalid ChunkRangeMap! printing ranges:";
-
-        for (ChunkRangeMap::const_iterator it = _ranges.begin(), end = _ranges.end(); it != end;
-             ++it) {
-            log() << it->first << ": " << it->second->toString();
-        }
-
-        throw;
-    }
-}
-
-void ChunkRangeManager::reloadAll(const ChunkMap& chunks) {
-    _ranges.clear();
-    _insertRange(chunks.begin(), chunks.end());
-
-    DEV assertValid();
-}
-
-void ChunkRangeManager::_insertRange(ChunkMap::const_iterator begin,
-                                     const ChunkMap::const_iterator end) {
-    while (begin != end) {
-        ChunkMap::const_iterator first = begin;
-        ShardId shardId = first->second->getShardId();
-        while (begin != end && (begin->second->getShardId() == shardId))
-            ++begin;
-
-        shared_ptr<ChunkRange> cr(new ChunkRange(first, begin));
-        _ranges[cr->getMax()] = cr;
-    }
-}
-
-int ChunkManager::getCurrentDesiredChunkSize() const {
-    // split faster in early chunks helps spread out an initial load better
-    const int minChunkSize = 1 << 20;  // 1 MBytes
-
-    int splitThreshold = Chunk::MaxChunkSize;
-
-    int nc = numChunks();
-
-    if (nc <= 1) {
-        return 1024;
-    } else if (nc < 3) {
-        return minChunkSize / 2;
-    } else if (nc < 10) {
-        splitThreshold = max(splitThreshold / 4, minChunkSize);
-    } else if (nc < 20) {
-        splitThreshold = max(splitThreshold / 2, minChunkSize);
-    }
-
-    return splitThreshold;
-}
-
-repl::OpTime ChunkManager::getConfigOpTime() const {
-    return _configOpTime;
+ShardEndpoint::ShardEndpoint(const ShardId& shardName,
+                             boost::optional<ChunkVersion> shardVersion,
+                             boost::optional<DatabaseVersion> dbVersion)
+    : shardName(shardName),
+      shardVersion(std::move(shardVersion)),
+      databaseVersion(std::move(dbVersion)) {
+    if (databaseVersion)
+        invariant(shardVersion && *shardVersion == ChunkVersion::UNSHARDED());
+    else if (shardVersion)
+        invariant(*shardVersion != ChunkVersion::UNSHARDED());
+    else
+        invariant(shardName == ShardId::kConfigServerId);
 }
 
 }  // namespace mongo

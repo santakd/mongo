@@ -1,25 +1,24 @@
-// bson_collection_catalog_entry.cpp
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,77 +29,80 @@
 
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
 
+#include <algorithm>
+#include <numeric>
+
+#include "mongo/db/field_ref.h"
+#include "mongo/db/server_options.h"
+
 namespace mongo {
 
-BSONCollectionCatalogEntry::BSONCollectionCatalogEntry(StringData ns)
-    : CollectionCatalogEntry(ns) {}
+namespace {
 
-CollectionOptions BSONCollectionCatalogEntry::getCollectionOptions(OperationContext* txn) const {
-    MetaData md = _getMetaData(txn);
-    return md.options;
-}
+// An index will fail to get created if the size in bytes of its key pattern is greater than 2048.
+// We use that value to represent the largest number of path components we could ever possibly
+// expect to see in an indexed field.
+const size_t kMaxKeyPatternPathLength = 2048;
 
-int BSONCollectionCatalogEntry::getTotalIndexCount(OperationContext* txn) const {
-    MetaData md = _getMetaData(txn);
+/**
+ * Encodes 'multikeyPaths' as binary data and appends it to 'bob'.
+ *
+ * For example, consider the index {'a.b': 1, 'a.c': 1} where the paths "a" and "a.b" cause it to be
+ * multikey. The object {'a.b': HexData('0101'), 'a.c': HexData('0100')} would then be appended to
+ * 'bob'.
+ */
+void appendMultikeyPathsAsBytes(BSONObj keyPattern,
+                                const MultikeyPaths& multikeyPaths,
+                                BSONObjBuilder* bob) {
+    char multikeyPathsEncodedAsBytes[kMaxKeyPatternPathLength];
 
-    return static_cast<int>(md.indexes.size());
-}
+    size_t i = 0;
+    for (const auto& keyElem : keyPattern) {
+        StringData keyName = keyElem.fieldNameStringData();
+        size_t numParts = FieldRef{keyName}.numParts();
+        invariant(numParts > 0);
+        invariant(numParts <= kMaxKeyPatternPathLength);
 
-int BSONCollectionCatalogEntry::getCompletedIndexCount(OperationContext* txn) const {
-    MetaData md = _getMetaData(txn);
+        std::fill_n(multikeyPathsEncodedAsBytes, numParts, 0);
+        for (const auto multikeyComponent : multikeyPaths[i]) {
+            multikeyPathsEncodedAsBytes[multikeyComponent] = 1;
+        }
+        bob->appendBinData(keyName, numParts, BinDataGeneral, &multikeyPathsEncodedAsBytes[0]);
 
-    int num = 0;
-    for (unsigned i = 0; i < md.indexes.size(); i++) {
-        if (md.indexes[i].ready)
-            num++;
-    }
-    return num;
-}
-
-BSONObj BSONCollectionCatalogEntry::getIndexSpec(OperationContext* txn,
-                                                 StringData indexName) const {
-    MetaData md = _getMetaData(txn);
-
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].spec.getOwned();
-}
-
-
-void BSONCollectionCatalogEntry::getAllIndexes(OperationContext* txn,
-                                               std::vector<std::string>* names) const {
-    MetaData md = _getMetaData(txn);
-
-    for (unsigned i = 0; i < md.indexes.size(); i++) {
-        names->push_back(md.indexes[i].spec["name"].String());
+        ++i;
     }
 }
 
-bool BSONCollectionCatalogEntry::isIndexMultikey(OperationContext* txn,
-                                                 StringData indexName) const {
-    MetaData md = _getMetaData(txn);
+/**
+ * Parses the path-level multikey information encoded as binary data from 'multikeyPathsObj' and
+ * sets 'multikeyPaths' as that value.
+ *
+ * For example, consider the index {'a.b': 1, 'a.c': 1} where the paths "a" and "a.b" cause it to be
+ * multikey. The binary data {'a.b': HexData('0101'), 'a.c': HexData('0100')} would then be parsed
+ * into std::vector<std::set<size_t>>{{0U, 1U}, {0U}}.
+ */
+void parseMultikeyPathsFromBytes(BSONObj multikeyPathsObj, MultikeyPaths* multikeyPaths) {
+    invariant(multikeyPaths);
+    for (auto elem : multikeyPathsObj) {
+        MultikeyComponents multikeyComponents;
+        int len;
+        const char* data = elem.binData(len);
+        invariant(len > 0);
+        invariant(static_cast<size_t>(len) <= kMaxKeyPatternPathLength);
 
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].multikey;
+        for (int i = 0; i < len; ++i) {
+            if (data[i]) {
+                multikeyComponents.insert(i);
+            }
+        }
+        multikeyPaths->push_back(multikeyComponents);
+    }
 }
 
-RecordId BSONCollectionCatalogEntry::getIndexHead(OperationContext* txn,
-                                                  StringData indexName) const {
-    MetaData md = _getMetaData(txn);
+}  // namespace
 
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].head;
-}
-
-bool BSONCollectionCatalogEntry::isIndexReady(OperationContext* txn, StringData indexName) const {
-    MetaData md = _getMetaData(txn);
-
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].ready;
-}
+const StringData BSONCollectionCatalogEntry::kIndexBuildScanning = "scanning"_sd;
+const StringData BSONCollectionCatalogEntry::kIndexBuildDraining = "draining"_sd;
 
 // --------------------------
 
@@ -117,6 +119,26 @@ void BSONCollectionCatalogEntry::IndexMetaData::updateTTLSetting(long long newEx
     b.append("expireAfterSeconds", newExpireSeconds);
     spec = b.obj();
 }
+
+
+void BSONCollectionCatalogEntry::IndexMetaData::updateHiddenSetting(bool hidden) {
+    // If hidden == false, we remove this field from catalog rather than add a field with false.
+    // or else, the old binary can't startup due to the unknown field.
+    BSONObjBuilder b;
+    for (BSONObjIterator bi(spec); bi.more();) {
+        BSONElement e = bi.next();
+        if (e.fieldNameStringData() == "hidden") {
+            continue;
+        }
+        b.append(e);
+    }
+
+    if (hidden) {
+        b.append("hidden", hidden);
+    }
+    spec = b.obj();
+}
+
 
 // --------------------------
 
@@ -138,17 +160,6 @@ bool BSONCollectionCatalogEntry::MetaData::eraseIndex(StringData name) {
     return true;
 }
 
-void BSONCollectionCatalogEntry::MetaData::rename(StringData toNS) {
-    ns = toNS.toString();
-    for (size_t i = 0; i < indexes.size(); i++) {
-        BSONObj spec = indexes[i].spec;
-        BSONObjBuilder b;
-        b.append("ns", toNS);
-        b.appendElementsUnique(spec);
-        indexes[i].spec = b.obj();
-    }
-}
-
 BSONObj BSONCollectionCatalogEntry::MetaData::toBSON() const {
     BSONObjBuilder b;
     b.append("ns", ns);
@@ -160,10 +171,24 @@ BSONObj BSONCollectionCatalogEntry::MetaData::toBSON() const {
             sub.append("spec", indexes[i].spec);
             sub.appendBool("ready", indexes[i].ready);
             sub.appendBool("multikey", indexes[i].multikey);
-            sub.append("head", static_cast<long long>(indexes[i].head.repr()));
-            sub.done();
+
+            if (!indexes[i].multikeyPaths.empty()) {
+                BSONObjBuilder subMultikeyPaths(sub.subobjStart("multikeyPaths"));
+                appendMultikeyPathsAsBytes(indexes[i].spec.getObjectField("key"),
+                                           indexes[i].multikeyPaths,
+                                           &subMultikeyPaths);
+                subMultikeyPaths.doneFast();
+            }
+
+            sub.append("head", 0ll);  // For backward compatibility with 4.0
+            sub.append("backgroundSecondary", indexes[i].isBackgroundSecondaryBuild);
+
+            if (indexes[i].buildUUID) {
+                indexes[i].buildUUID->appendToBuilder(&sub, "buildUUID");
+            }
+            sub.doneFast();
         }
-        arr.done();
+        arr.doneFast();
     }
     return b.obj();
 }
@@ -172,7 +197,8 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
     ns = obj["ns"].valuestrsafe();
 
     if (obj["options"].isABSONObj()) {
-        options.parse(obj["options"].Obj());
+        options = uassertStatusOK(
+            CollectionOptions::parse(obj["options"].Obj(), CollectionOptions::parseForStorage));
     }
 
     BSONElement indexList = obj["indexes"];
@@ -183,14 +209,21 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
             IndexMetaData imd;
             imd.spec = idx["spec"].Obj().getOwned();
             imd.ready = idx["ready"].trueValue();
-            if (idx.hasField("head")) {
-                imd.head = RecordId(idx["head"].Long());
-            } else {
-                imd.head = RecordId(idx["head_a"].Int(), idx["head_b"].Int());
-            }
             imd.multikey = idx["multikey"].trueValue();
+
+            if (auto multikeyPathsElem = idx["multikeyPaths"]) {
+                parseMultikeyPathsFromBytes(multikeyPathsElem.Obj(), &imd.multikeyPaths);
+            }
+
+            auto bgSecondary = BSONElement(idx["backgroundSecondary"]);
+            // Opt-in to rebuilding behavior for old-format index catalog objects.
+            imd.isBackgroundSecondaryBuild = bgSecondary.eoo() || bgSecondary.trueValue();
+
+            if (idx["buildUUID"]) {
+                imd.buildUUID = fassert(31353, UUID::parse(idx["buildUUID"]));
+            }
             indexes.push_back(imd);
         }
     }
 }
-}
+}  // namespace mongo

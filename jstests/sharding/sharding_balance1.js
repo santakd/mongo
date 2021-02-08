@@ -1,63 +1,43 @@
 (function() {
+'use strict';
 
-var s = new ShardingTest({ name: "slow_sharding_balance1",
-                           shards: 2,
-                           mongos: 1,
-                           verbose: 1,
-                           other: { chunkSize: 1, enableBalancer : true } });
+load("jstests/sharding/libs/find_chunks_util.js");
 
-s.adminCommand( { enablesharding : "test" } );
-s.ensurePrimaryShard('test', 'shard0001');
+var st = new ShardingTest({shards: 2, mongos: 1, other: {chunkSize: 1, enableBalancer: true}});
 
-s.config.settings.find().forEach( printjson )
+const dbName = 'ShardingBalanceTest';
+const collName = 'foo';
+const coll = st.getDB(dbName).getCollection(collName);
+const minChunkNum = 20;
 
-db = s.getDB( "test" );
+assert.commandWorked(st.s.adminCommand({enablesharding: dbName}));
+st.ensurePrimaryShard(dbName, st.shard1.shardName);
 
-bigString = ""
-while ( bigString.length < 10000 )
-    bigString += "asdasdasdasdadasdasdasdasdasdasdasdasda";
+const bigStringSize = 10000;
+const bigString = "X=".repeat(bigStringSize / 2);
 
-inserted = 0;
-num = 0;
-var bulk = db.foo.initializeUnorderedBulkOp();
-while ( inserted < ( 20 * 1024 * 1024 ) ){
-    bulk.insert({ _id: num++, s: bigString });
-    inserted += bigString.length;
+jsTest.log("Inserting documents that will account for at least 20MB");
+var insertedChars = 0;
+var num = 0;
+var bulk = coll.initializeUnorderedBulkOp();
+while (insertedChars < (minChunkNum * 1024 * 1024)) {
+    bulk.insert({_id: num++, s: bigString});
+    insertedChars += bigStringSize;
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
-s.adminCommand( { shardcollection : "test.foo" , key : { _id : 1 } } );
-assert.lt( 20 , s.config.chunks.count()  , "setup2" );
+assert.commandWorked(st.s.adminCommand({shardcollection: coll.getFullName(), key: {_id: 1}}));
+jsTest.log("Checking initial chunk distribution: " + st.chunkCounts(collName, dbName));
+assert.lt(minChunkNum,
+          findChunksUtil.countChunksForNs(st.config, coll.getFullName()),
+          "Number of initial chunks is less then expected");
+assert.lt(minChunkNum,
+          st.chunkDiff(collName, dbName),
+          "The initial chunks difference between the shards is less then expected");
 
-function diff1(){
-    var x = s.chunkCounts( "foo" );
-    printjson( x )
-    return Math.max( x.shard0000 , x.shard0001 ) - Math.min( x.shard0000 , x.shard0001 );
-}
-
-function sum(){
-    var x = s.chunkCounts( "foo" );
-    return x.shard0000 + x.shard0001;
-}
-
-assert.lt( 20 , diff1() , "big differential here" );
-print( diff1() )
-
-assert.soon( function(){
-    var d = diff1();
-    return d < 5;
+jsTest.log("Await for the balancer to reduce the chunk imbalance between the shards");
 // Make sure there's enough time here, since balancing can sleep for 15s or so between balances.
-} , "balance didn't happen" , 1000 * 60 * 5 , 5000 );
-    
-var chunkCount = sum();
-s.adminCommand( { removeshard: "shard0000" } );
+st.awaitBalance(collName, dbName, 1000 * 60 * 5 /* 5 min */);
 
-assert.soon( function(){
-    printjson(s.chunkCounts( "foo" ));
-    s.config.shards.find().forEach(function(z){printjson(z);});
-    return chunkCount == s.config.chunks.count({shard: "shard0001"});
-} , "removeshard didn't happen" , 1000 * 60 * 3 , 5000 );
-
-s.stop();
-
+st.stop();
 })();

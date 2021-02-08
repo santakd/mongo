@@ -1,37 +1,39 @@
-// oid.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <string>
 
+#include "mongo/base/data_range.h"
 #include "mongo/base/data_view.h"
+#include "mongo/base/static_assert.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/util/time_support.h"
 
@@ -89,15 +91,8 @@ public:
     }
 
     /** init from a reference to a 12-byte array */
-    explicit OID(const unsigned char(&arr)[kOIDSize]) {
+    explicit OID(const unsigned char (&arr)[kOIDSize]) {
         std::memcpy(_data, arr, sizeof(arr));
-    }
-
-    static_assert(sizeof(int64_t) == kInstanceUniqueSize + kIncrementSize,
-                  "size of term must be size of instance unique + increment");
-    /** init with a 8 byte term id. used for ElectionID */
-    explicit OID(int64_t term) {
-        init(term);
     }
 
     /** initialize to 'null' */
@@ -120,6 +115,16 @@ public:
         return o;
     }
 
+    MONGO_STATIC_ASSERT_MSG(sizeof(int64_t) == kInstanceUniqueSize + kIncrementSize,
+                            "size of term must be size of instance unique + increment");
+
+    // Return OID initialized with a 8 byte term id and max Timestamp. Used for ElectionID.
+    static OID fromTerm(int64_t term) {
+        OID result;
+        result.initFromTermNumber(term);
+        return result;
+    }
+
     // Caller must ensure that the buffer is valid for kOIDSize bytes.
     // this is templated because some places use unsigned char vs signed char
     template <typename T>
@@ -135,6 +140,27 @@ public:
         return o;
     }
 
+    /**
+     * This method creates and initializes an OID from a string, throwing a BadValue exception if
+     * the string is not a valid OID.
+     */
+    static OID createFromString(StringData input) {
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Invalid string length for parsing to OID, expected 24 but found "
+                              << input.size(),
+                input.size() == 24);
+        for (auto digit : input) {
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "Invalid character found in hex string: " << digit,
+                    ('0' <= digit && digit <= '9') || ('a' <= digit && digit <= 'f') ||
+                        ('A' <= digit && digit <= 'F'));
+        }
+
+        OID result;
+        result.init(input.toString());
+        return result;
+    }
+
     /** sets the contents to a new oid / randomized value */
     void init();
 
@@ -144,8 +170,11 @@ public:
     /** Set to the min/max OID that could be generated at given timestamp. */
     void init(Date_t date, bool max = false);
 
-    /** Sets the contents to contain the time followed by an big endian 8 byte term id */
-    void init(int64_t term);
+    /**
+     * Sets the contents to contain the leading max Timestamp (0x7FFFFFFF)
+     * followed by an big endian 8 byte term id
+     */
+    void initFromTermNumber(int64_t term);
 
     time_t asTimeT() const;
     Date_t asDateT() const {
@@ -196,6 +225,10 @@ public:
         return ConstDataView(_data);
     }
 
+    ConstDataRange toCDR() const {
+        return ConstDataRange(_data);
+    }
+
 private:
     // Internal mutable view
     DataView _view() {
@@ -222,15 +255,7 @@ inline StringBuilder& operator<<(StringBuilder& s, const OID& o) {
     See <http://dochub.mongodb.org/core/mongodbextendedjson>
     for details.
 */
-enum JsonStringFormat {
-    /** strict RFC format */
-    Strict,
-    /** 10gen format, which is close to JS format.  This form is understandable by
-        javascript running inside the Mongo server via eval() */
-    TenGen,
-    /** Javascript JSON compatible */
-    JS
-};
+enum JsonStringFormat { ExtendedCanonicalV2_0_0, ExtendedRelaxedV2_0_0, LegacyStrict };
 
 inline bool operator==(const OID& lhs, const OID& rhs) {
     return lhs.compare(rhs) == 0;

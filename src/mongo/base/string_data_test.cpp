@@ -1,47 +1,53 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include <algorithm>
+#include <functional>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/base/string_data.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
+namespace mongo {
 namespace {
 
-using mongo::StringData;
 using std::string;
 
 TEST(Construction, Empty) {
     StringData strData;
     ASSERT_EQUALS(strData.size(), 0U);
-    ASSERT_TRUE(strData.rawData() == NULL);
+    ASSERT_TRUE(strData.rawData() == nullptr);
 }
 
 TEST(Construction, FromStdString) {
@@ -59,16 +65,55 @@ TEST(Construction, FromCString) {
 }
 
 TEST(Construction, FromNullCString) {
-    char* c = NULL;
+    char* c = nullptr;
     StringData strData(c);
     ASSERT_EQUALS(strData.size(), 0U);
-    ASSERT_TRUE(strData.rawData() == NULL);
+    ASSERT_TRUE(strData.rawData() == nullptr);
 }
 
-TEST(Construction, FromLiteral) {
-    StringData strData("ccc", StringData::LiteralTag());
-    ASSERT_EQUALS(strData.size(), 3U);
-    ASSERT_EQUALS(strData.toString(), string("ccc"));
+TEST(Construction, FromUserDefinedLiteral) {
+    const auto strData = "cc\0c"_sd;
+    ASSERT_EQUALS(strData.size(), 4U);
+    ASSERT_EQUALS(strData.toString(), string("cc\0c", 4));
+}
+
+TEST(Construction, FromUserDefinedRawLiteral) {
+    const auto strData = R"("")"_sd;
+    ASSERT_EQUALS(strData.size(), 2U);
+    ASSERT_EQUALS(strData.toString(), string("\"\"", 2));
+}
+
+TEST(Construction, FromEmptyUserDefinedLiteral) {
+    const auto strData = ""_sd;
+    ASSERT_EQUALS(strData.size(), 0U);
+    ASSERT_EQUALS(strData.toString(), string(""));
+}
+
+// Try some constexpr initializations
+TEST(Construction, Constexpr) {
+    constexpr StringData lit = "1234567"_sd;
+    ASSERT_EQUALS(lit, "1234567"_sd);
+    constexpr StringData sub = lit.substr(3, 2);
+    ASSERT_EQUALS(sub, "45"_sd);
+    constexpr StringData range(lit.begin() + 1, lit.end() - 1);
+    ASSERT_EQUALS(range, "23456"_sd);
+    constexpr char c = lit[1];
+    ASSERT_EQUALS(c, '2');
+    constexpr StringData nully{nullptr, 0};
+    ASSERT_EQUALS(nully, ""_sd);
+#if 0
+    constexpr StringData cxNully{nullptr, 1};  // must not compile
+#endif
+    constexpr StringData ptr{lit.rawData() + 1, 3};
+    ASSERT_EQUALS(ptr, "234"_sd);
+}
+
+class StringDataDeathTest : public unittest::Test {};
+
+DEATH_TEST(StringDataDeathTest,
+           InvariantNullRequiresEmpty,
+           "StringData(nullptr,len) requires len==0") {
+    StringData bad{nullptr, 1};
 }
 
 TEST(Comparison, BothEmpty) {
@@ -143,20 +188,22 @@ void SDHasher_check(void);
 
 template <>
 void SDHasher_check<4>(void) {
-    ASSERT_EQUALS(StringData::Hasher()(""), static_cast<size_t>(0));
-    ASSERT_EQUALS(StringData::Hasher()("foo"), static_cast<size_t>(4138058784ULL));
-    ASSERT_EQUALS(StringData::Hasher()("pizza"), static_cast<size_t>(3587803311ULL));
-    ASSERT_EQUALS(StringData::Hasher()("mongo"), static_cast<size_t>(3724335885ULL));
-    ASSERT_EQUALS(StringData::Hasher()("murmur"), static_cast<size_t>(1945310157ULL));
+    const auto& strCmp = SimpleStringDataComparator::kInstance;
+    ASSERT_EQUALS(strCmp.hash(""), static_cast<size_t>(0));
+    ASSERT_EQUALS(strCmp.hash("foo"), static_cast<size_t>(4138058784ULL));
+    ASSERT_EQUALS(strCmp.hash("pizza"), static_cast<size_t>(3587803311ULL));
+    ASSERT_EQUALS(strCmp.hash("mongo"), static_cast<size_t>(3724335885ULL));
+    ASSERT_EQUALS(strCmp.hash("murmur"), static_cast<size_t>(1945310157ULL));
 }
 
 template <>
 void SDHasher_check<8>(void) {
-    ASSERT_EQUALS(StringData::Hasher()(""), static_cast<size_t>(0));
-    ASSERT_EQUALS(StringData::Hasher()("foo"), static_cast<size_t>(16316970633193145697ULL));
-    ASSERT_EQUALS(StringData::Hasher()("pizza"), static_cast<size_t>(12165495155477134356ULL));
-    ASSERT_EQUALS(StringData::Hasher()("mongo"), static_cast<size_t>(2861051452199491487ULL));
-    ASSERT_EQUALS(StringData::Hasher()("murmur"), static_cast<size_t>(18237957392784716687ULL));
+    const auto& strCmp = SimpleStringDataComparator::kInstance;
+    ASSERT_EQUALS(strCmp.hash(""), static_cast<size_t>(0));
+    ASSERT_EQUALS(strCmp.hash("foo"), static_cast<size_t>(16316970633193145697ULL));
+    ASSERT_EQUALS(strCmp.hash("pizza"), static_cast<size_t>(12165495155477134356ULL));
+    ASSERT_EQUALS(strCmp.hash("mongo"), static_cast<size_t>(2861051452199491487ULL));
+    ASSERT_EQUALS(strCmp.hash("murmur"), static_cast<size_t>(18237957392784716687ULL));
 }
 
 TEST(Hasher, Str1) {
@@ -266,8 +313,7 @@ TEST(EndsWith, Simple) {
 
 TEST(ConstIterator, StdCopy) {
     std::vector<char> chars;
-    const char rawData[] = "This is some raw data.";
-    StringData data(rawData, StringData::LiteralTag());
+    auto data = "This is some raw data."_sd;
 
     chars.resize(data.size());
     std::copy(data.begin(), data.end(), chars.begin());
@@ -279,8 +325,7 @@ TEST(ConstIterator, StdCopy) {
 
 TEST(ConstIterator, StdReverseCopy) {
     std::vector<char> chars;
-    const char rawData[] = "This is some raw data.";
-    StringData data(rawData, StringData::LiteralTag());
+    auto data = "This is some raw data."_sd;
 
     chars.resize(data.size());
     std::reverse_copy(data.begin(), data.end(), chars.begin());
@@ -294,8 +339,7 @@ TEST(ConstIterator, StdReverseCopy) {
 
 TEST(ConstIterator, StdReplaceCopy) {
     std::vector<char> chars;
-    const char rawData[] = "This is some raw data.";
-    StringData data(rawData, StringData::LiteralTag());
+    auto data = "This is some raw data."_sd;
 
     chars.resize(data.size());
     std::replace_copy(data.begin(), data.end(), chars.begin(), ' ', '_');
@@ -307,4 +351,47 @@ TEST(ConstIterator, StdReplaceCopy) {
     }
 }
 
-}  // unnamed namespace
+TEST(StringDataFmt, Fmt) {
+    using namespace fmt::literals;
+    ASSERT_EQUALS(fmt::format("-{}-", "abc"_sd), "-abc-");
+    ASSERT_EQUALS("-{}-"_format("abc"_sd), "-abc-");
+}
+
+TEST(Ostream, StringDataMatchesStdString) {
+    const std::string s = "xyz";
+    struct TestCase {
+        int line;
+        std::function<void(std::ostream&)> manip;
+    };
+    const TestCase testCases[] = {
+        {__LINE__, [](std::ostream& os) {}},
+        {__LINE__, [](std::ostream& os) { os << std::setw(5); }},
+        {__LINE__, [](std::ostream& os) { os << std::left << std::setw(5); }},
+        {__LINE__, [](std::ostream& os) { os << std::right << std::setw(5); }},
+        {__LINE__, [](std::ostream& os) { os << std::setfill('.') << std::left << std::setw(5); }},
+        {__LINE__, [](std::ostream& os) { os << std::setfill('.') << std::right << std::setw(5); }},
+    };
+    for (const auto& testCase : testCases) {
+        const std::string location = std::string(" at line:") + std::to_string(testCase.line);
+        struct Experiment {
+            Experiment(std::function<void(std::ostream&)> f) : putter(f) {}
+            std::function<void(std::ostream&)> putter;
+            std::ostringstream os;
+        };
+        Experiment expected{[&](std::ostream& os) { os << s; }};
+        Experiment actual{[&](std::ostream& os) { os << StringData(s); }};
+        for (auto& x : {&expected, &actual}) {
+            x->os << ">>";
+            testCase.manip(x->os);
+            x->putter(x->os);
+        }
+        // ASSERT_EQ(expected.os.str(), actual.os.str()) << location;
+        for (auto& x : {&expected, &actual}) {
+            x->os << "<<";
+        }
+        ASSERT_EQ(expected.os.str(), actual.os.str()) << location;
+    }
+}
+
+}  // namespace
+}  // namespace mongo

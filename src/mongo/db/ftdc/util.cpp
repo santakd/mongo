@@ -1,32 +1,33 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -41,9 +42,9 @@
 #include "mongo/db/ftdc/constants.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -63,7 +64,7 @@ const char kFTDCDocsField[] = "docs";
 const char kFTDCCollectStartField[] = "start";
 const char kFTDCCollectEndField[] = "end";
 
-const std::uint64_t FTDCConfig::kPeriodMillisDefault = 1000;
+const std::int64_t FTDCConfig::kPeriodMillisDefault = 1000;
 
 const std::size_t kMaxRecursion = 10;
 
@@ -103,12 +104,66 @@ Date_t roundTime(Date_t now, Milliseconds period) {
     return Date_t::fromMillisSinceEpoch(next_time);
 }
 
+boost::filesystem::path getMongoSPath(const boost::filesystem::path& logFile) {
+    auto base = logFile;
+
+    // Keep stripping file extensions until we are only left with the file name
+    while (base.has_extension()) {
+        auto full_path = base.generic_string();
+        base = full_path.substr(0, full_path.size() - base.extension().size());
+    }
+
+    base += "." + kFTDCDefaultDirectory.toString();
+    return base;
+}
+
 }  // namespace FTDCUtil
 
 
 namespace FTDCBSONUtil {
 
 namespace {
+
+/**
+ * Iterate a BSONObj but only return fields that have types that FTDC cares about.
+ */
+class FTDCBSONObjIterator {
+public:
+    FTDCBSONObjIterator(const BSONObj& obj) : _iterator(obj) {
+        advance();
+    }
+
+    bool more() {
+        return !_current.eoo();
+    }
+
+    BSONElement next() {
+        auto ret = _current;
+        advance();
+        return ret;
+    }
+
+private:
+    /**
+     * Find the next element that is a valid FTDC type.
+     */
+    void advance() {
+        _current = BSONElement();
+
+        while (_iterator.more()) {
+
+            auto elem = _iterator.next();
+            if (isFTDCType(elem.type())) {
+                _current = elem;
+                break;
+            }
+        }
+    }
+
+private:
+    BSONObjIterator _iterator;
+    BSONElement _current;
+};
 
 StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
                                             const BSONObj& currentDoc,
@@ -119,15 +174,16 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
         return {ErrorCodes::BadValue, "Recursion limit reached."};
     }
 
-    BSONObjIterator itCurrent(currentDoc);
-    BSONObjIterator itReference(referenceDoc);
+    FTDCBSONObjIterator itCurrent(currentDoc);
+    FTDCBSONObjIterator itReference(referenceDoc);
 
     while (itCurrent.more()) {
         // Schema mismatch if current document is longer than reference document
         if (matches && !itReference.more()) {
-            LOG(4) << "full-time diagnostic data capture schema change: currrent document is "
-                      "longer than "
-                      "reference document";
+            LOGV2_DEBUG(20633,
+                        4,
+                        "full-time diagnostic data capture schema change: current document is "
+                        "longer than reference document");
             matches = false;
         }
 
@@ -137,10 +193,11 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
         if (matches) {
             // Check for matching field names
             if (referenceElement.fieldNameStringData() != currentElement.fieldNameStringData()) {
-                LOG(4)
-                    << "full-time diagnostic data capture schema change: field name change - from '"
-                    << referenceElement.fieldNameStringData() << "' to '"
-                    << currentElement.fieldNameStringData() << "'";
+                LOGV2_DEBUG(20634,
+                            4,
+                            "full-time diagnostic data capture schema change: field name change",
+                            "from"_attr = referenceElement.fieldNameStringData(),
+                            "to"_attr = currentElement.fieldNameStringData());
                 matches = false;
             }
 
@@ -151,10 +208,12 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
             if ((currentElement.type() != referenceElement.type()) &&
                 !(referenceElement.isNumber() == true &&
                   currentElement.isNumber() == referenceElement.isNumber())) {
-                LOG(4) << "full-time diagnostic data capture  schema change: field type change for "
-                          "field '" << referenceElement.fieldNameStringData() << "' from '"
-                       << static_cast<int>(referenceElement.type()) << "' to '"
-                       << static_cast<int>(currentElement.type()) << "'";
+                LOGV2_DEBUG(20635,
+                            4,
+                            "full-time diagnostic data capture schema change: field type change",
+                            "fieldName"_attr = referenceElement.fieldNameStringData(),
+                            "oldType"_attr = static_cast<int>(referenceElement.type()),
+                            "newType"_attr = static_cast<int>(currentElement.type()));
                 matches = false;
             }
         }
@@ -163,7 +222,25 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
             // all numeric types are extracted as long (int64)
             // this supports the loose schema matching mentioned above,
             // but does create a range issue for doubles, and requires doubles to be integer
-            case NumberDouble:
+            // Doubles and Decimal that fall out of the range of int64 are converted to:
+            // NaN -> 0
+            // Inf -> MAX
+            // -Inf -> MIN
+            case NumberDouble: {
+                double value = currentElement.numberDouble();
+                long long newValue = 0;
+                if (std::isnan(value)) {
+                    newValue = 0;
+                } else if (!(value < BSONElement::kLongLongMaxPlusOneAsDouble)) {
+                    newValue = std::numeric_limits<long long>::max();
+                } else if (value < std::numeric_limits<long long>::min()) {
+                    newValue = std::numeric_limits<long long>::min();
+                } else {
+                    newValue = static_cast<long long>(value);
+                }
+                metrics->emplace_back(newValue);
+                break;
+            }
             case NumberInt:
             case NumberLong:
             case NumberDecimal:
@@ -206,8 +283,10 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
 
     // schema mismatch if ref is longer than curr
     if (matches && itReference.more()) {
-        LOG(4) << "full-time diagnostic data capture schema change: reference document is longer "
-                  "then current";
+        LOGV2_DEBUG(20636,
+                    4,
+                    "full-time diagnostic data capture schema change: reference document is longer "
+                    "than current");
         matches = false;
     }
 
@@ -215,6 +294,24 @@ StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
 }
 
 }  // namespace
+
+bool isFTDCType(BSONType type) {
+    switch (type) {
+        case NumberDouble:
+        case NumberInt:
+        case NumberLong:
+        case NumberDecimal:
+        case Bool:
+        case Date:
+        case bsonTimestamp:
+        case Object:
+        case Array:
+            return true;
+
+        default:
+            return false;
+    }
+}
 
 StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
                                             const BSONObj& currentDoc,

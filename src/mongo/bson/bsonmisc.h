@@ -1,30 +1,30 @@
-// @file bsonmisc.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -34,36 +34,22 @@
 
 namespace mongo {
 
-int getGtLtOp(const BSONElement& e);
-
-struct BSONElementCmpWithoutField {
-    bool operator()(const BSONElement& l, const BSONElement& r) const {
-        return l.woCompare(r, false) < 0;
-    }
-};
-
-class BSONObjCmp {
+class BSONElementCmpWithoutField {
 public:
-    BSONObjCmp(const BSONObj& order = BSONObj()) : _order(order) {}
-    bool operator()(const BSONObj& l, const BSONObj& r) const {
-        return l.woCompare(r, _order) < 0;
-    }
-    BSONObj order() const {
-        return _order;
+    /**
+     * If 'stringComparator' is null, the default binary comparator will be used for comparing
+     * string elements.  A custom string comparator may be provided, but it must outlive the
+     * constructed BSONElementCmpWithoutField.
+     */
+    BSONElementCmpWithoutField(const StringData::ComparatorInterface* stringComparator = nullptr)
+        : _stringComparator(stringComparator) {}
+
+    bool operator()(const BSONElement& l, const BSONElement& r) const {
+        return l.woCompare(r, false, _stringComparator) < 0;
     }
 
 private:
-    BSONObj _order;
-};
-
-typedef std::set<BSONObj, BSONObjCmp> BSONObjSet;
-
-enum FieldCompareResult {
-    LEFT_SUBFIELD = -2,
-    LEFT_BEFORE = -1,
-    SAME = 0,
-    RIGHT_BEFORE = 1,
-    RIGHT_SUBFIELD = 2
+    const StringData::ComparatorInterface* _stringComparator;
 };
 
 /** Use BSON macro to build a BSONObj from a stream
@@ -151,42 +137,47 @@ private:
 
 // Utility class to allow adding a std::string to BSON as a Symbol
 struct BSONSymbol {
+    BSONSymbol() = default;
     explicit BSONSymbol(StringData sym) : symbol(sym) {}
-    StringData symbol;
+    StringData symbol = "";
 };
 
 // Utility class to allow adding a std::string to BSON as Code
 struct BSONCode {
+    BSONCode() = default;
     explicit BSONCode(StringData str) : code(str) {}
-    StringData code;
+    StringData code = "";
 };
 
 // Utility class to allow adding CodeWScope to BSON
 struct BSONCodeWScope {
+    BSONCodeWScope() = default;
     explicit BSONCodeWScope(StringData str, const BSONObj& obj) : code(str), scope(obj) {}
-    StringData code;
-    BSONObj scope;
+    StringData code = "";
+    BSONObj scope = {};
 };
 
 // Utility class to allow adding a RegEx to BSON
 struct BSONRegEx {
-    explicit BSONRegEx(StringData pat, StringData f = "") : pattern(pat), flags(f) {}
+    explicit BSONRegEx(StringData pat = "", StringData f = "") : pattern(pat), flags(f) {}
     StringData pattern;
     StringData flags;
 };
 
 // Utility class to allow adding binary data to BSON
 struct BSONBinData {
+    BSONBinData() = default;
     BSONBinData(const void* d, int l, BinDataType t) : data(d), length(l), type(t) {}
-    const void* data;
-    int length;
-    BinDataType type;
+    const void* data = nullptr;
+    int length = 0;
+    BinDataType type = BinDataGeneral;
 };
 
 // Utility class to allow adding deprecated DBRef type to BSON
 struct BSONDBRef {
+    BSONDBRef() = default;
     BSONDBRef(StringData nameSpace, const OID& o) : ns(nameSpace), oid(o) {}
-    StringData ns;
+    StringData ns = "";
     OID oid;
 };
 
@@ -198,25 +189,12 @@ extern Labeler::Label NE;
 extern Labeler::Label NIN;
 extern Labeler::Label BSIZE;
 
-
-// $or helper: OR(BSON("x" << GT << 7), BSON("y" << LT << 6));
-// becomes   : {$or: [{x: {$gt: 7}}, {y: {$lt: 6}}]}
-inline BSONObj OR(const BSONObj& a, const BSONObj& b);
-inline BSONObj OR(const BSONObj& a, const BSONObj& b, const BSONObj& c);
-inline BSONObj OR(const BSONObj& a, const BSONObj& b, const BSONObj& c, const BSONObj& d);
-inline BSONObj OR(
-    const BSONObj& a, const BSONObj& b, const BSONObj& c, const BSONObj& d, const BSONObj& e);
-inline BSONObj OR(const BSONObj& a,
-                  const BSONObj& b,
-                  const BSONObj& c,
-                  const BSONObj& d,
-                  const BSONObj& e,
-                  const BSONObj& f);
 // definitions in bsonobjbuilder.h b/c of incomplete types
 
 // Utility class to implement BSON( key << val ) as described above.
 class BSONObjBuilderValueStream {
-    MONGO_DISALLOW_COPYING(BSONObjBuilderValueStream);
+    BSONObjBuilderValueStream(const BSONObjBuilderValueStream&) = delete;
+    BSONObjBuilderValueStream& operator=(const BSONObjBuilderValueStream&) = delete;
 
 public:
     friend class Labeler;
@@ -239,7 +217,7 @@ public:
 
     void endField(StringData nextFieldName = StringData());
     bool subobjStarted() const {
-        return _fieldName != 0;
+        return _fieldName != nullptr;
     }
 
     // The following methods provide API compatibility with BSONArrayBuilder
@@ -253,12 +231,17 @@ public:
         return *_builder;
     }
 
+    /**
+     * Restores this object to its empty state.
+     */
+    void reset();
+
 private:
     StringData _fieldName;
     BSONObjBuilder* _builder;
 
     bool haveSubobj() const {
-        return _subobj.get() != 0;
+        return _subobj.get() != nullptr;
     }
     BSONObjBuilder* subobj();
     std::unique_ptr<BSONObjBuilder> _subobj;
@@ -303,4 +286,4 @@ private:
 
 // considers order
 bool fieldsMatch(const BSONObj& lhs, const BSONObj& rhs);
-}
+}  // namespace mongo

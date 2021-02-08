@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,10 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
-#include "mongo/db/commands.h"
+#include "mongo/db/audit.h"
+#include "mongo/db/client.h"
 #include "mongo/db/cursor_id.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/kill_cursors_gen.h"
+#include "mongo/db/read_concern_support_result.h"
 
 namespace mongo {
 
@@ -37,16 +41,13 @@ namespace mongo {
  * Base class for the killCursors command, which attempts to kill all given cursors.  Contains code
  * common to mongos and mongod implementations.
  */
-class KillCursorsCmdBase : public Command {
+template <typename Impl>
+class KillCursorsCmdBase : public KillCursorsCmdVersion1Gen<KillCursorsCmdBase<Impl>> {
 public:
-    KillCursorsCmdBase() : Command("killCursors") {}
+    using KCV1Gen = KillCursorsCmdVersion1Gen<KillCursorsCmdBase<Impl>>;
 
-    bool isWriteCommandForConfigServer() const final {
-        return false;
-    }
-
-    bool slaveOk() const final {
-        return true;
+    BasicCommand::AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return BasicCommand::AllowedOnSecondary::kAlways;
     }
 
     bool maintenanceOk() const final {
@@ -57,35 +58,81 @@ public:
         return false;
     }
 
-    void help(std::stringstream& help) const final {
-        help << "kill a list of cursor ids";
+    std::string help() const final {
+        return "Kill a list of cursor ids";
     }
 
     bool shouldAffectCommandCounter() const final {
         return true;
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) final;
+    class Invocation : public KCV1Gen::InvocationBaseGen {
+    public:
+        using KCV1Gen::InvocationBaseGen::InvocationBaseGen;
 
-    bool run(OperationContext* txn,
-             const std::string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
-             BSONObjBuilder& result) final;
+        bool supportsWriteConcern() const final {
+            return false;
+        }
 
-private:
-    /**
-     * Kill the cursor with id 'cursorId' in namespace 'nss'. Use 'txn' if necessary.
-     *
-     * Returns Status::OK() if the cursor was killed, or ErrorCodes::CursorNotFound if there is no
-     * such cursor, or ErrorCodes::OperationFailed if the cursor cannot be killed.
-     */
-    virtual Status _killCursor(OperationContext* txn,
-                               const NamespaceString& nss,
-                               CursorId cursorId) = 0;
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
+            if constexpr (Impl::supportsReadConcern) {
+                return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+            } else {
+                return KCV1Gen::InvocationBaseGen::supportsReadConcern(level);
+            }
+        }
+
+        NamespaceString ns() const final {
+            return this->request().getNamespace();
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            auto killCursorsRequest = this->request();
+
+            const auto& nss = killCursorsRequest.getNamespace();
+            for (CursorId id : killCursorsRequest.getCursorIds()) {
+                auto status = Impl::doCheckAuth(opCtx, nss, id);
+                if (!status.isOK()) {
+                    if (status.code() == ErrorCodes::CursorNotFound) {
+                        // Not found isn't an authorization issue.
+                        // run() will raise it as a return value.
+                        continue;
+                    }
+                    audit::logKillCursorsAuthzCheck(opCtx->getClient(), nss, id, status.code());
+                    uassertStatusOK(status);  // throws
+                }
+            }
+        }
+
+        KillCursorsReply typedRun(OperationContext* opCtx) final {
+            auto killCursorsRequest = this->request();
+
+            std::vector<CursorId> cursorsKilled;
+            std::vector<CursorId> cursorsNotFound;
+            std::vector<CursorId> cursorsAlive;
+
+            for (CursorId id : killCursorsRequest.getCursorIds()) {
+                auto status = Impl::doKillCursor(opCtx, killCursorsRequest.getNamespace(), id);
+                if (status.isOK()) {
+                    cursorsKilled.push_back(id);
+                } else if (status.code() == ErrorCodes::CursorNotFound) {
+                    cursorsNotFound.push_back(id);
+                } else {
+                    cursorsAlive.push_back(id);
+                }
+
+                audit::logKillCursorsAuthzCheck(
+                    opCtx->getClient(), killCursorsRequest.getNamespace(), id, status.code());
+            }
+
+            KillCursorsReply reply;
+            reply.setCursorsKilled(std::move(cursorsKilled));
+            reply.setCursorsNotFound(std::move(cursorsNotFound));
+            reply.setCursorsAlive(std::move(cursorsAlive));
+            reply.setCursorsUnknown({});
+            return reply;
+        }
+    };
 };
 
 }  // namespace mongo

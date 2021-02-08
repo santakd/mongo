@@ -1,39 +1,42 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <cstddef>
 #include <algorithm>
+#include <cstddef>
 #include <vector>
 
+#include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/bson/mutable/const_element.h"
 #include "mongo/bson/mutable/element.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mutablebson {
@@ -139,9 +142,9 @@ void sortChildren(Element parent, Comparator comp) {
     const std::vector<Element>::iterator end = children.end();
     for (; where != end; ++where) {
         // Detach from its current location.
-        where->remove();
+        where->remove().transitional_ignore();
         // Make it the new rightmost element.
-        parent.pushBack(*where);
+        parent.pushBack(*where).transitional_ignore();
     }
 }
 
@@ -155,7 +158,7 @@ void deduplicateChildren(Element parent, EqualityComparator equal) {
     while (current.ok()) {
         Element next = current.rightSibling();
         if (next.ok() && equal(current, next)) {
-            next.remove();
+            next.remove().transitional_ignore();
         } else {
             current = next;
         }
@@ -166,13 +169,15 @@ void deduplicateChildren(Element parent, EqualityComparator equal) {
 class woLess {
     // TODO: This should possibly derive from std::binary_function.
 public:
-    woLess(bool considerFieldName = true) : _considerFieldName(considerFieldName) {}
+    woLess(const StringData::ComparatorInterface* comparator, bool considerFieldName = true)
+        : _comp(comparator), _considerFieldName(considerFieldName) {}
 
     inline bool operator()(const ConstElement& left, const ConstElement& right) const {
-        return left.compareWithElement(right, _considerFieldName) < 0;
+        return left.compareWithElement(right, _comp, _considerFieldName) < 0;
     }
 
 private:
+    const StringData::ComparatorInterface* _comp = nullptr;
     const bool _considerFieldName;
 };
 
@@ -180,13 +185,15 @@ private:
 class woGreater {
     // TODO: This should possibly derive from std::binary_function.
 public:
-    woGreater(bool considerFieldName = true) : _considerFieldName(considerFieldName) {}
+    woGreater(const StringData::ComparatorInterface* comparator, bool considerFieldName = true)
+        : _comp(comparator), _considerFieldName(considerFieldName) {}
 
     inline bool operator()(const ConstElement& left, const ConstElement& right) const {
-        return left.compareWithElement(right, _considerFieldName) > 0;
+        return left.compareWithElement(right, _comp, _considerFieldName) > 0;
     }
 
 private:
+    const StringData::ComparatorInterface* _comp = nullptr;
     const bool _considerFieldName;
 };
 
@@ -194,13 +201,15 @@ private:
 class woEqual {
     // TODO: This should possibly derive from std::binary_function.
 public:
-    woEqual(bool considerFieldName = true) : _considerFieldName(considerFieldName) {}
+    woEqual(const StringData::ComparatorInterface* comparator, bool considerFieldName = true)
+        : _comp(comparator), _considerFieldName(considerFieldName) {}
 
     inline bool operator()(const ConstElement& left, const ConstElement& right) const {
-        return left.compareWithElement(right, _considerFieldName) == 0;
+        return left.compareWithElement(right, _comp, _considerFieldName) == 0;
     }
 
 private:
+    const StringData::ComparatorInterface* _comp = nullptr;
     const bool _considerFieldName;
 };
 
@@ -208,15 +217,18 @@ private:
 class woEqualTo {
     // TODO: This should possibly derive from std::binary_function.
 public:
-    woEqualTo(const ConstElement& value, bool considerFieldName = true)
-        : _value(value), _considerFieldName(considerFieldName) {}
+    woEqualTo(const ConstElement& value,
+              const StringData::ComparatorInterface* comparator,
+              bool considerFieldName = true)
+        : _value(value), _comp(comparator), _considerFieldName(considerFieldName) {}
 
     inline bool operator()(const ConstElement& elt) const {
-        return _value.compareWithElement(elt, _considerFieldName) == 0;
+        return _value.compareWithElement(elt, _comp, _considerFieldName) == 0;
     }
 
 private:
-    const ConstElement& _value;
+    const ConstElement _value;
+    const StringData::ComparatorInterface* _comp = nullptr;
     const bool _considerFieldName;
 };
 
@@ -278,7 +290,7 @@ std::string getFullName(ElementType element, char delim = '.') {
         curr = curr.parent();
     }
 
-    mongoutils::str::stream name;
+    str::stream name;
     bool first = true;
     for (std::vector<StringData>::reverse_iterator it = names.rbegin(); it != names.rend(); ++it) {
         if (!first)

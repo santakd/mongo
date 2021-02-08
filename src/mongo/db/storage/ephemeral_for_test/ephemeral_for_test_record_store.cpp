@@ -1,26 +1,24 @@
-// ephemeral_for_test_record_store.cpp
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,246 +27,67 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store.h"
 
+#include <cstring>
+#include <memory>
+#include <utility>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/namespace_string.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_radix_store.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_visibility_manager.h"
+#include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/oplog_hack.h"
-#include "mongo/db/storage/recovery_unit.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/unowned_ptr.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/util/hex.h"
 
 namespace mongo {
+namespace ephemeral_for_test {
+namespace {
+Ordering allAscending = Ordering::make(BSONObj());
+auto const version = KeyString::Version::kLatestVersion;
+BSONObj const sample = BSON(""
+                            << "s"
+                            << "" << (int64_t)0);
 
-using std::shared_ptr;
+std::string createKey(StringData ident, int64_t recordId) {
+    KeyString::Builder ks(version, BSON("" << ident << "" << recordId), allAscending);
+    return std::string(ks.getBuffer(), ks.getSize());
+}
 
-class EphemeralForTestRecordStore::InsertChange : public RecoveryUnit::Change {
-public:
-    InsertChange(Data* data, RecordId loc) : _data(data), _loc(loc) {}
-    virtual void commit() {}
-    virtual void rollback() {
-        Records::iterator it = _data->records.find(_loc);
-        if (it != _data->records.end()) {
-            _data->dataSize -= it->second.size;
-            _data->records.erase(it);
-        }
-    }
+RecordId extractRecordId(const std::string& keyStr) {
+    KeyString::Builder ks(version, sample, allAscending);
+    ks.resetFromBuffer(keyStr.c_str(), keyStr.size());
+    BSONObj obj = KeyString::toBson(keyStr.c_str(), keyStr.size(), allAscending, ks.getTypeBits());
+    auto it = BSONObjIterator(obj);
+    ++it;
+    return RecordId((*it).Long());
+}
+}  // namespace
 
-private:
-    Data* const _data;
-    const RecordId _loc;
-};
-
-// Works for both removes and updates
-class EphemeralForTestRecordStore::RemoveChange : public RecoveryUnit::Change {
-public:
-    RemoveChange(Data* data, RecordId loc, const EphemeralForTestRecord& rec)
-        : _data(data), _loc(loc), _rec(rec) {}
-
-    virtual void commit() {}
-    virtual void rollback() {
-        Records::iterator it = _data->records.find(_loc);
-        if (it != _data->records.end()) {
-            _data->dataSize -= it->second.size;
-        }
-
-        _data->dataSize += _rec.size;
-        _data->records[_loc] = _rec;
-    }
-
-private:
-    Data* const _data;
-    const RecordId _loc;
-    const EphemeralForTestRecord _rec;
-};
-
-class EphemeralForTestRecordStore::TruncateChange : public RecoveryUnit::Change {
-public:
-    TruncateChange(Data* data) : _data(data), _dataSize(0) {
-        using std::swap;
-        swap(_dataSize, _data->dataSize);
-        swap(_records, _data->records);
-    }
-
-    virtual void commit() {}
-    virtual void rollback() {
-        using std::swap;
-        swap(_dataSize, _data->dataSize);
-        swap(_records, _data->records);
-    }
-
-private:
-    Data* const _data;
-    int64_t _dataSize;
-    Records _records;
-};
-
-class EphemeralForTestRecordStore::Cursor final : public SeekableRecordCursor {
-public:
-    Cursor(OperationContext* txn, const EphemeralForTestRecordStore& rs)
-        : _records(rs._data->records), _isCapped(rs.isCapped()) {}
-
-    boost::optional<Record> next() final {
-        if (_needFirstSeek) {
-            _needFirstSeek = false;
-            _it = _records.begin();
-        } else if (!_lastMoveWasRestore && _it != _records.end()) {
-            ++_it;
-        }
-        _lastMoveWasRestore = false;
-
-        if (_it == _records.end())
-            return {};
-        return {{_it->first, _it->second.toRecordData()}};
-    }
-
-    boost::optional<Record> seekExact(const RecordId& id) final {
-        _lastMoveWasRestore = false;
-        _needFirstSeek = false;
-        _it = _records.find(id);
-        if (_it == _records.end())
-            return {};
-        return {{_it->first, _it->second.toRecordData()}};
-    }
-
-    void save() final {
-        if (!_needFirstSeek && !_lastMoveWasRestore)
-            _savedId = _it == _records.end() ? RecordId() : _it->first;
-    }
-
-    void saveUnpositioned() final {
-        _savedId = RecordId();
-    }
-
-    bool restore() final {
-        if (_savedId.isNull()) {
-            _it = _records.end();
-            return true;
-        }
-
-        _it = _records.lower_bound(_savedId);
-        _lastMoveWasRestore = _it == _records.end() || _it->first != _savedId;
-
-        // Capped iterators die on invalidation rather than advancing.
-        return !(_isCapped && _lastMoveWasRestore);
-    }
-
-    void detachFromOperationContext() final {}
-    void reattachToOperationContext(OperationContext* txn) final {}
-
-private:
-    Records::const_iterator _it;
-    bool _needFirstSeek = true;
-    bool _lastMoveWasRestore = false;
-    RecordId _savedId;  // Location to restore() to. Null means EOF.
-
-    const EphemeralForTestRecordStore::Records& _records;
-    const bool _isCapped;
-};
-
-class EphemeralForTestRecordStore::ReverseCursor final : public SeekableRecordCursor {
-public:
-    ReverseCursor(OperationContext* txn, const EphemeralForTestRecordStore& rs)
-        : _records(rs._data->records), _isCapped(rs.isCapped()) {}
-
-    boost::optional<Record> next() final {
-        if (_needFirstSeek) {
-            _needFirstSeek = false;
-            _it = _records.rbegin();
-        } else if (!_lastMoveWasRestore && _it != _records.rend()) {
-            ++_it;
-        }
-        _lastMoveWasRestore = false;
-
-        if (_it == _records.rend())
-            return {};
-        return {{_it->first, _it->second.toRecordData()}};
-    }
-
-    boost::optional<Record> seekExact(const RecordId& id) final {
-        _lastMoveWasRestore = false;
-        _needFirstSeek = false;
-
-        auto forwardIt = _records.find(id);
-        if (forwardIt == _records.end()) {
-            _it = _records.rend();
-            return {};
-        }
-
-        // The reverse_iterator will point to the preceding element, so increment the base
-        // iterator to make it point past the found element.
-        ++forwardIt;
-        _it = Records::const_reverse_iterator(forwardIt);
-        dassert(_it != _records.rend());
-        dassert(_it->first == id);
-        return {{_it->first, _it->second.toRecordData()}};
-    }
-
-    void save() final {
-        if (!_needFirstSeek && !_lastMoveWasRestore)
-            _savedId = _it == _records.rend() ? RecordId() : _it->first;
-    }
-
-    void saveUnpositioned() final {
-        _savedId = RecordId();
-    }
-
-    bool restore() final {
-        if (_savedId.isNull()) {
-            _it = _records.rend();
-            return true;
-        }
-
-        // Note: upper_bound returns the first entry > _savedId and reverse_iterators
-        // dereference to the element before their base iterator. This combine to make this
-        // dereference to the first element <= _savedId which is what we want here.
-        _it = Records::const_reverse_iterator(_records.upper_bound(_savedId));
-        _lastMoveWasRestore = _it == _records.rend() || _it->first != _savedId;
-
-        // Capped iterators die on invalidation rather than advancing.
-        return !(_isCapped && _lastMoveWasRestore);
-    }
-
-    void detachFromOperationContext() final {}
-    void reattachToOperationContext(OperationContext* txn) final {}
-
-private:
-    Records::const_reverse_iterator _it;
-    bool _needFirstSeek = true;
-    bool _lastMoveWasRestore = false;
-    RecordId _savedId;  // Location to restore() to. Null means EOF.
-    const EphemeralForTestRecordStore::Records& _records;
-    const bool _isCapped;
-};
-
-
-//
-// RecordStore
-//
-
-EphemeralForTestRecordStore::EphemeralForTestRecordStore(StringData ns,
-                                                         std::shared_ptr<void>* dataInOut,
-                                                         bool isCapped,
-                                                         int64_t cappedMaxSize,
-                                                         int64_t cappedMaxDocs,
-                                                         CappedCallback* cappedCallback)
-    : RecordStore(ns),
+RecordStore::RecordStore(StringData ns,
+                         StringData ident,
+                         bool isCapped,
+                         int64_t cappedMaxSize,
+                         int64_t cappedMaxDocs,
+                         CappedCallback* cappedCallback,
+                         VisibilityManager* visibilityManager)
+    : mongo::RecordStore(ns, ident),
       _isCapped(isCapped),
       _cappedMaxSize(cappedMaxSize),
       _cappedMaxDocs(cappedMaxDocs),
+      _ident(getIdent().data(), getIdent().size()),
+      _prefix(createKey(_ident, std::numeric_limits<int64_t>::min())),
+      _postfix(createKey(_ident, std::numeric_limits<int64_t>::max())),
       _cappedCallback(cappedCallback),
-      _data(*dataInOut ? static_cast<Data*>(dataInOut->get())
-                       : new Data(NamespaceString::oplog(ns))) {
-    if (!*dataInOut) {
-        dataInOut->reset(_data);  // takes ownership
-    }
-
+      _isOplog(NamespaceString::oplog(ns)),
+      _visibilityManager(visibilityManager) {
     if (_isCapped) {
         invariant(_cappedMaxSize > 0);
         invariant(_cappedMaxDocs == -1 || _cappedMaxDocs > 0);
@@ -278,281 +97,196 @@ EphemeralForTestRecordStore::EphemeralForTestRecordStore(StringData ns,
     }
 }
 
-const char* EphemeralForTestRecordStore::name() const {
-    return "EphemeralForTest";
+const char* RecordStore::name() const {
+    return kEngineName;
 }
 
-RecordData EphemeralForTestRecordStore::dataFor(OperationContext* txn, const RecordId& loc) const {
-    return recordFor(loc)->toRecordData();
+long long RecordStore::dataSize(OperationContext* opCtx) const {
+    return _dataSize.load();
 }
 
-const EphemeralForTestRecordStore::EphemeralForTestRecord* EphemeralForTestRecordStore::recordFor(
-    const RecordId& loc) const {
-    Records::const_iterator it = _data->records.find(loc);
-    if (it == _data->records.end()) {
-        error() << "EphemeralForTestRecordStore::recordFor cannot find record for " << ns() << ":"
-                << loc;
-    }
-    invariant(it != _data->records.end());
-    return &it->second;
+long long RecordStore::numRecords(OperationContext* opCtx) const {
+    return static_cast<long long>(_numRecords.load());
 }
 
-EphemeralForTestRecordStore::EphemeralForTestRecord* EphemeralForTestRecordStore::recordFor(
-    const RecordId& loc) {
-    Records::iterator it = _data->records.find(loc);
-    if (it == _data->records.end()) {
-        error() << "EphemeralForTestRecordStore::recordFor cannot find record for " << ns() << ":"
-                << loc;
-    }
-    invariant(it != _data->records.end());
-    return &it->second;
+bool RecordStore::isCapped() const {
+    return _isCapped;
 }
 
-bool EphemeralForTestRecordStore::findRecord(OperationContext* txn,
-                                             const RecordId& loc,
-                                             RecordData* rd) const {
-    Records::const_iterator it = _data->records.find(loc);
-    if (it == _data->records.end()) {
+void RecordStore::setCappedCallback(CappedCallback* cb) {
+    stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
+    _cappedCallback = cb;
+}
+
+int64_t RecordStore::storageSize(OperationContext* opCtx,
+                                 BSONObjBuilder* extraInfo,
+                                 int infoLevel) const {
+    return dataSize(opCtx);
+}
+
+bool RecordStore::findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const {
+    StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
+    auto it = workingCopy->find(createKey(_ident, loc.as<int64_t>()));
+    if (it == workingCopy->end()) {
         return false;
     }
-    *rd = it->second.toRecordData();
+    *rd = RecordData(it->second.c_str(), it->second.length()).getOwned();
     return true;
 }
 
-void EphemeralForTestRecordStore::deleteRecord(OperationContext* txn, const RecordId& loc) {
-    EphemeralForTestRecord* rec = recordFor(loc);
-    txn->recoveryUnit()->registerChange(new RemoveChange(_data, loc, *rec));
-    _data->dataSize -= rec->size;
-    invariant(_data->records.erase(loc) == 1);
+void RecordStore::deleteRecord(OperationContext* opCtx, const RecordId& dl) {
+    _initHighestIdIfNeeded(opCtx);
+    auto ru = RecoveryUnit::get(opCtx);
+    StringStore* workingCopy(ru->getHead());
+    SizeAdjuster adjuster(opCtx, this);
+    invariant(workingCopy->erase(createKey(_ident, dl.as<int64_t>())));
+    ru->makeDirty();
 }
 
-bool EphemeralForTestRecordStore::cappedAndNeedDelete(OperationContext* txn) const {
-    if (!_isCapped)
-        return false;
+Status RecordStore::insertRecords(OperationContext* opCtx,
+                                  std::vector<Record>* inOutRecords,
+                                  const std::vector<Timestamp>& timestamps) {
+    int64_t totalSize = 0;
+    for (auto& record : *inOutRecords)
+        totalSize += record.data.size();
 
-    if (_data->dataSize > _cappedMaxSize)
-        return true;
+    // Caller will retry one element at a time.
+    if (_isCapped && totalSize > _cappedMaxSize)
+        return Status(ErrorCodes::BadValue, "object to insert exceeds cappedMaxSize");
 
-    if ((_cappedMaxDocs != -1) && (numRecords(txn) > _cappedMaxDocs))
-        return true;
+    auto ru = RecoveryUnit::get(opCtx);
+    StringStore* workingCopy(ru->getHead());
+    {
+        SizeAdjuster adjuster(opCtx, this);
+        for (auto& record : *inOutRecords) {
+            int64_t thisRecordId = 0;
+            if (_isOplog) {
+                StatusWith<RecordId> status =
+                    oploghack::extractKey(record.data.data(), record.data.size());
+                if (!status.isOK())
+                    return status.getStatus();
+                thisRecordId = status.getValue().as<int64_t>();
+                _visibilityManager->addUncommittedRecord(opCtx, this, RecordId(thisRecordId));
+            } else {
+                thisRecordId = _nextRecordId(opCtx);
+            }
+            workingCopy->insert(
+                StringStore::value_type{createKey(_ident, thisRecordId),
+                                        std::string(record.data.data(), record.data.size())});
+            record.id = RecordId(thisRecordId);
+        }
+    }
+    ru->makeDirty();
+    _cappedDeleteAsNeeded(opCtx, workingCopy);
+    return Status::OK();
+}
 
+Status RecordStore::updateRecord(OperationContext* opCtx,
+                                 const RecordId& oldLocation,
+                                 const char* data,
+                                 int len) {
+    StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
+    SizeAdjuster adjuster(opCtx, this);
+    {
+        std::string key = createKey(_ident, oldLocation.as<int64_t>());
+        StringStore::const_iterator it = workingCopy->find(key);
+        invariant(it != workingCopy->end());
+        workingCopy->update(StringStore::value_type{key, std::string(data, len)});
+    }
+    _cappedDeleteAsNeeded(opCtx, workingCopy);
+    RecoveryUnit::get(opCtx)->makeDirty();
+
+    return Status::OK();
+}
+
+bool RecordStore::updateWithDamagesSupported() const {
+    // TODO: enable updateWithDamages after writable pointers are complete.
     return false;
 }
 
-void EphemeralForTestRecordStore::cappedDeleteAsNeeded(OperationContext* txn) {
-    while (cappedAndNeedDelete(txn)) {
-        invariant(!_data->records.empty());
-
-        Records::iterator oldest = _data->records.begin();
-        RecordId id = oldest->first;
-        RecordData data = oldest->second.toRecordData();
-
-        if (_cappedCallback)
-            uassertStatusOK(_cappedCallback->aboutToDeleteCapped(txn, id, data));
-
-        deleteRecord(txn, id);
-    }
+StatusWith<RecordData> RecordStore::updateWithDamages(OperationContext* opCtx,
+                                                      const RecordId& loc,
+                                                      const RecordData& oldRec,
+                                                      const char* damageSource,
+                                                      const mutablebson::DamageVector& damages) {
+    return RecordData();
 }
 
-StatusWith<RecordId> EphemeralForTestRecordStore::extractAndCheckLocForOplog(const char* data,
-                                                                             int len) const {
-    StatusWith<RecordId> status = oploghack::extractKey(data, len);
-    if (!status.isOK())
-        return status;
-
-    if (!_data->records.empty() && status.getValue() <= _data->records.rbegin()->first)
-        return StatusWith<RecordId>(ErrorCodes::BadValue, "ts not higher than highest");
-
-    return status;
-}
-
-StatusWith<RecordId> EphemeralForTestRecordStore::insertRecord(OperationContext* txn,
-                                                               const char* data,
-                                                               int len,
-                                                               bool enforceQuota) {
-    if (_isCapped && len > _cappedMaxSize) {
-        // We use dataSize for capped rollover and we don't want to delete everything if we know
-        // this won't fit.
-        return StatusWith<RecordId>(ErrorCodes::BadValue, "object to insert exceeds cappedMaxSize");
-    }
-
-    EphemeralForTestRecord rec(len);
-    memcpy(rec.data.get(), data, len);
-
-    RecordId loc;
-    if (_data->isOplog) {
-        StatusWith<RecordId> status = extractAndCheckLocForOplog(data, len);
-        if (!status.isOK())
-            return status;
-        loc = status.getValue();
-    } else {
-        loc = allocateLoc();
-    }
-
-    txn->recoveryUnit()->registerChange(new InsertChange(_data, loc));
-    _data->dataSize += len;
-    _data->records[loc] = rec;
-
-    cappedDeleteAsNeeded(txn);
-
-    return StatusWith<RecordId>(loc);
-}
-
-StatusWith<RecordId> EphemeralForTestRecordStore::insertRecord(OperationContext* txn,
-                                                               const DocWriter* doc,
-                                                               bool enforceQuota) {
-    const int len = doc->documentSize();
-    if (_isCapped && len > _cappedMaxSize) {
-        // We use dataSize for capped rollover and we don't want to delete everything if we know
-        // this won't fit.
-        return StatusWith<RecordId>(ErrorCodes::BadValue, "object to insert exceeds cappedMaxSize");
-    }
-
-    EphemeralForTestRecord rec(len);
-    doc->writeDocument(rec.data.get());
-
-    RecordId loc;
-    if (_data->isOplog) {
-        StatusWith<RecordId> status = extractAndCheckLocForOplog(rec.data.get(), len);
-        if (!status.isOK())
-            return status;
-        loc = status.getValue();
-    } else {
-        loc = allocateLoc();
-    }
-
-    txn->recoveryUnit()->registerChange(new InsertChange(_data, loc));
-    _data->dataSize += len;
-    _data->records[loc] = rec;
-
-    cappedDeleteAsNeeded(txn);
-
-    return StatusWith<RecordId>(loc);
-}
-
-StatusWith<RecordId> EphemeralForTestRecordStore::updateRecord(OperationContext* txn,
-                                                               const RecordId& loc,
-                                                               const char* data,
-                                                               int len,
-                                                               bool enforceQuota,
-                                                               UpdateNotifier* notifier) {
-    EphemeralForTestRecord* oldRecord = recordFor(loc);
-    int oldLen = oldRecord->size;
-
-    // Documents in capped collections cannot change size. We check that above the storage layer.
-    invariant(!_isCapped || len == oldLen);
-
-    if (notifier) {
-        // The in-memory KV engine uses the invalidation framework (does not support
-        // doc-locking), and therefore must notify that it is updating a document.
-        Status callbackStatus = notifier->recordStoreGoingToUpdateInPlace(txn, loc);
-        if (!callbackStatus.isOK()) {
-            return StatusWith<RecordId>(callbackStatus);
-        }
-    }
-
-    EphemeralForTestRecord newRecord(len);
-    memcpy(newRecord.data.get(), data, len);
-
-    txn->recoveryUnit()->registerChange(new RemoveChange(_data, loc, *oldRecord));
-    _data->dataSize += len - oldLen;
-    *oldRecord = newRecord;
-
-    cappedDeleteAsNeeded(txn);
-
-    return StatusWith<RecordId>(loc);
-}
-
-bool EphemeralForTestRecordStore::updateWithDamagesSupported() const {
-    return true;
-}
-
-StatusWith<RecordData> EphemeralForTestRecordStore::updateWithDamages(
-    OperationContext* txn,
-    const RecordId& loc,
-    const RecordData& oldRec,
-    const char* damageSource,
-    const mutablebson::DamageVector& damages) {
-    EphemeralForTestRecord* oldRecord = recordFor(loc);
-    const int len = oldRecord->size;
-
-    EphemeralForTestRecord newRecord(len);
-    memcpy(newRecord.data.get(), oldRecord->data.get(), len);
-
-    txn->recoveryUnit()->registerChange(new RemoveChange(_data, loc, *oldRecord));
-    *oldRecord = newRecord;
-
-    cappedDeleteAsNeeded(txn);
-
-    char* root = newRecord.data.get();
-    mutablebson::DamageVector::const_iterator where = damages.begin();
-    const mutablebson::DamageVector::const_iterator end = damages.end();
-    for (; where != end; ++where) {
-        const char* sourcePtr = damageSource + where->sourceOffset;
-        char* targetPtr = root + where->targetOffset;
-        std::memcpy(targetPtr, sourcePtr, where->size);
-    }
-
-    *oldRecord = newRecord;
-
-    return newRecord.toRecordData();
-}
-
-std::unique_ptr<SeekableRecordCursor> EphemeralForTestRecordStore::getCursor(OperationContext* txn,
-                                                                             bool forward) const {
+std::unique_ptr<SeekableRecordCursor> RecordStore::getCursor(OperationContext* opCtx,
+                                                             bool forward) const {
     if (forward)
-        return stdx::make_unique<Cursor>(txn, *this);
-    return stdx::make_unique<ReverseCursor>(txn, *this);
+        return std::make_unique<Cursor>(opCtx, *this, _visibilityManager);
+    return std::make_unique<ReverseCursor>(opCtx, *this, _visibilityManager);
 }
 
-Status EphemeralForTestRecordStore::truncate(OperationContext* txn) {
-    // Unlike other changes, TruncateChange mutates _data on construction to perform the
-    // truncate
-    txn->recoveryUnit()->registerChange(new TruncateChange(_data));
+Status RecordStore::truncate(OperationContext* opCtx) {
+    SizeAdjuster adjuster(opCtx, this);
+    StatusWith<int64_t> s = truncateWithoutUpdatingCount(
+        checked_cast<ephemeral_for_test::RecoveryUnit*>(opCtx->recoveryUnit()));
+    if (!s.isOK())
+        return s.getStatus();
+
     return Status::OK();
 }
 
-void EphemeralForTestRecordStore::temp_cappedTruncateAfter(OperationContext* txn,
-                                                           RecordId end,
-                                                           bool inclusive) {
-    Records::iterator it =
-        inclusive ? _data->records.lower_bound(end) : _data->records.upper_bound(end);
-    while (it != _data->records.end()) {
-        txn->recoveryUnit()->registerChange(new RemoveChange(_data, it->first, it->second));
-        _data->dataSize -= it->second.size;
-        _data->records.erase(it++);
+StatusWith<int64_t> RecordStore::truncateWithoutUpdatingCount(mongo::RecoveryUnit* ru) {
+    auto bRu = checked_cast<ephemeral_for_test::RecoveryUnit*>(ru);
+    StringStore* workingCopy(bRu->getHead());
+    StringStore::const_iterator end = workingCopy->upper_bound(_postfix);
+    std::vector<std::string> toDelete;
+
+    for (auto it = workingCopy->lower_bound(_prefix); it != end; ++it) {
+        toDelete.push_back(it->first);
     }
+
+    if (toDelete.empty())
+        return 0;
+
+    for (const auto& key : toDelete)
+        workingCopy->erase(key);
+
+    bRu->makeDirty();
+
+    return static_cast<int64_t>(toDelete.size());
 }
 
-Status EphemeralForTestRecordStore::validate(OperationContext* txn,
-                                             bool full,
-                                             bool scanData,
-                                             ValidateAdaptor* adaptor,
-                                             ValidateResults* results,
-                                             BSONObjBuilder* output) {
-    results->valid = true;
-    if (scanData && full) {
-        for (Records::const_iterator it = _data->records.begin(); it != _data->records.end();
-             ++it) {
-            const EphemeralForTestRecord& rec = it->second;
-            size_t dataSize;
-            const Status status = adaptor->validate(rec.toRecordData(), &dataSize);
-            if (!status.isOK()) {
-                results->valid = false;
-                results->errors.push_back("invalid object detected (see logs)");
-                log() << "Invalid object detected in " << _ns << ": " << status.reason();
-            }
+void RecordStore::cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {
+    auto ru = RecoveryUnit::get(opCtx);
+    StringStore* workingCopy(ru->getHead());
+    WriteUnitOfWork wuow(opCtx);
+    const auto recordKey = createKey(_ident, end.as<int64_t>());
+    auto recordIt =
+        inclusive ? workingCopy->lower_bound(recordKey) : workingCopy->upper_bound(recordKey);
+    auto endIt = workingCopy->upper_bound(_postfix);
+
+    while (recordIt != endIt) {
+        stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
+        if (_cappedCallback) {
+            // Documents are guaranteed to have a RecordId at the end of the KeyString, unlike
+            // unique indexes.
+            RecordId rid = extractRecordId(recordIt->first);
+            RecordData rd = RecordData(recordIt->second.c_str(), recordIt->second.length());
+            uassertStatusOK(_cappedCallback->aboutToDeleteCapped(opCtx, rid, rd));
         }
+        // Important to scope adjuster until after capped callback, as that changes indexes and
+        // would result in those changes being reflected in RecordStore count/size.
+        SizeAdjuster adjuster(opCtx, this);
+
+        // Don't need to increment the iterator because the iterator gets revalidated and placed on
+        // the next item after the erase.
+        workingCopy->erase(recordIt->first);
+
+        // Tree modifications are bound to happen here so we need to reposition our end cursor.
+        endIt.repositionIfChanged();
+        ru->makeDirty();
     }
 
-    output->appendNumber("nrecords", _data->records.size());
-
-    return Status::OK();
+    wuow.commit();
 }
 
-void EphemeralForTestRecordStore::appendCustomStats(OperationContext* txn,
-                                                    BSONObjBuilder* result,
-                                                    double scale) const {
+void RecordStore::appendCustomStats(OperationContext* opCtx,
+                                    BSONObjBuilder* result,
+                                    double scale) const {
     result->appendBool("capped", _isCapped);
     if (_isCapped) {
         result->appendIntOrLL("max", _cappedMaxDocs);
@@ -560,50 +294,316 @@ void EphemeralForTestRecordStore::appendCustomStats(OperationContext* txn,
     }
 }
 
-Status EphemeralForTestRecordStore::touch(OperationContext* txn, BSONObjBuilder* output) const {
-    if (output) {
-        output->append("numRanges", 1);
-        output->append("millis", 0);
+void RecordStore::updateStatsAfterRepair(OperationContext* opCtx,
+                                         long long numRecords,
+                                         long long dataSize) {
+    // SERVER-38883 This storage engine should instead be able to invariant that stats are correct.
+    _numRecords.store(numRecords);
+    _dataSize.store(dataSize);
+}
+
+void RecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const {
+    _visibilityManager->waitForAllEarlierOplogWritesToBeVisible(opCtx);
+}
+
+boost::optional<RecordId> RecordStore::oplogStartHack(OperationContext* opCtx,
+                                                      const RecordId& startingPosition) const {
+    if (!_isOplog)
+        return boost::none;
+
+    if (numRecords(opCtx) == 0)
+        return RecordId();
+
+    StringStore* workingCopy{RecoveryUnit::get(opCtx)->getHead()};
+
+    std::string key = createKey(_ident, startingPosition.as<int64_t>());
+    StringStore::const_reverse_iterator it(workingCopy->upper_bound(key));
+
+    if (it == workingCopy->rend())
+        return RecordId();
+
+    RecordId rid = RecordId(extractRecordId(it->first));
+    if (rid > startingPosition)
+        return RecordId();
+
+    return rid;
+}
+
+Status RecordStore::oplogDiskLocRegister(OperationContext* opCtx,
+                                         const Timestamp& opTime,
+                                         bool orderedCommit) {
+    if (!orderedCommit) {
+        return opCtx->recoveryUnit()->setTimestamp(opTime);
     }
+
     return Status::OK();
 }
 
-void EphemeralForTestRecordStore::increaseStorageSize(OperationContext* txn,
-                                                      int size,
-                                                      bool enforceQuota) {
-    // unclear what this would mean for this class. For now, just error if called.
-    invariant(!"increaseStorageSize not yet implemented");
+void RecordStore::_initHighestIdIfNeeded(OperationContext* opCtx) {
+    // In the normal case, this will already be initialized, so use a weak load. Since this value
+    // will only change from 0 to a positive integer, the only risk is reading an outdated value, 0,
+    // and having to take the mutex.
+    if (_highestRecordId.loadRelaxed() > 0) {
+        return;
+    }
+
+    // Only one thread needs to do this.
+    stdx::lock_guard<Latch> lk(_initHighestIdMutex);
+    if (_highestRecordId.load() > 0) {
+        return;
+    }
+
+    // Need to start at 1 so we are always higher than RecordId::min<int64_t>()
+    int64_t nextId = 1;
+
+    // Find the largest RecordId currently in use.
+    std::unique_ptr<SeekableRecordCursor> cursor = getCursor(opCtx, /*forward=*/false);
+    if (auto record = cursor->next()) {
+        nextId = record->id.as<int64_t>() + 1;
+    }
+
+    _highestRecordId.store(nextId);
+};
+
+int64_t RecordStore::_nextRecordId(OperationContext* opCtx) {
+    _initHighestIdIfNeeded(opCtx);
+    return _highestRecordId.fetchAndAdd(1);
 }
 
-int64_t EphemeralForTestRecordStore::storageSize(OperationContext* txn,
-                                                 BSONObjBuilder* extraInfo,
-                                                 int infoLevel) const {
-    // Note: not making use of extraInfo or infoLevel since we don't have extents
-    const int64_t recordOverhead = numRecords(txn) * sizeof(EphemeralForTestRecord);
-    return _data->dataSize + recordOverhead;
+bool RecordStore::_cappedAndNeedDelete(OperationContext* opCtx, StringStore* workingCopy) {
+    if (!_isCapped)
+        return false;
+
+    if (dataSize(opCtx) > _cappedMaxSize)
+        return true;
+
+    if ((_cappedMaxDocs != -1) && numRecords(opCtx) > _cappedMaxDocs)
+        return true;
+    return false;
 }
 
-RecordId EphemeralForTestRecordStore::allocateLoc() {
-    RecordId out = RecordId(_data->nextId++);
-    invariant(out < RecordId::max());
-    return out;
+void RecordStore::_cappedDeleteAsNeeded(OperationContext* opCtx, StringStore* workingCopy) {
+    if (!_isCapped)
+        return;
+
+    // Create the lowest key for this identifier and use lower_bound() to get to the first one.
+    auto recordIt = workingCopy->lower_bound(_prefix);
+
+    // Ensure only one thread at a time can do deletes, otherwise they'll conflict.
+    stdx::lock_guard<Latch> cappedDeleterLock(_cappedDeleterMutex);
+
+    while (_cappedAndNeedDelete(opCtx, workingCopy)) {
+
+        stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
+        RecordId rid = RecordId(extractRecordId(recordIt->first));
+
+        if (_isOplog && _visibilityManager->isFirstHidden(rid)) {
+            // We have a record that hasn't been committed yet, so we shouldn't truncate anymore
+            // until it gets committed.
+            return;
+        }
+
+        if (_cappedCallback) {
+            RecordData rd = RecordData(recordIt->second.c_str(), recordIt->second.length());
+            uassertStatusOK(_cappedCallback->aboutToDeleteCapped(opCtx, rid, rd));
+        }
+
+        SizeAdjuster adjuster(opCtx, this);
+        invariant(numRecords(opCtx) > 0, str::stream() << numRecords(opCtx));
+
+        // Don't need to increment the iterator because the iterator gets revalidated and placed on
+        // the next item after the erase.
+        workingCopy->erase(recordIt->first);
+        auto ru = RecoveryUnit::get(opCtx);
+        ru->makeDirty();
+    }
 }
 
-boost::optional<RecordId> EphemeralForTestRecordStore::oplogStartHack(
-    OperationContext* txn, const RecordId& startingPosition) const {
-    if (!_data->isOplog)
+RecordStore::Cursor::Cursor(OperationContext* opCtx,
+                            const RecordStore& rs,
+                            VisibilityManager* visibilityManager)
+    : opCtx(opCtx), _rs(rs), _visibilityManager(visibilityManager) {
+    if (_rs._isOplog) {
+        _oplogVisibility = _visibilityManager->getAllCommittedRecord();
+    }
+}
+
+boost::optional<Record> RecordStore::Cursor::next() {
+    _savedPosition = boost::none;
+    StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
+    if (_needFirstSeek) {
+        _needFirstSeek = false;
+        it = workingCopy->lower_bound(_rs._prefix);
+    } else if (it != workingCopy->end() && !_lastMoveWasRestore) {
+        ++it;
+    }
+    _lastMoveWasRestore = false;
+    if (it != workingCopy->end() && inPrefix(it->first)) {
+        _savedPosition = it->first;
+        Record nextRecord;
+        nextRecord.id = RecordId(extractRecordId(it->first));
+        nextRecord.data = RecordData(it->second.c_str(), it->second.length());
+
+        if (_rs._isOplog && nextRecord.id > _oplogVisibility) {
+            return boost::none;
+        }
+
+        return nextRecord;
+    }
+    return boost::none;
+}
+
+boost::optional<Record> RecordStore::Cursor::seekExact(const RecordId& id) {
+    _savedPosition = boost::none;
+    _lastMoveWasRestore = false;
+    StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
+    std::string key = createKey(_rs._ident, id.as<int64_t>());
+    it = workingCopy->find(key);
+
+    if (it == workingCopy->end() || !inPrefix(it->first))
         return boost::none;
 
-    const Records& records = _data->records;
+    if (_rs._isOplog && id > _oplogVisibility) {
+        return boost::none;
+    }
 
-    if (records.empty())
-        return RecordId();
-
-    Records::const_iterator it = records.lower_bound(startingPosition);
-    if (it == records.end() || it->first > startingPosition)
-        --it;
-
-    return it->first;
+    _needFirstSeek = false;
+    _savedPosition = it->first;
+    return Record{id, RecordData(it->second.c_str(), it->second.length())};
 }
 
+// Positions are saved as we go.
+void RecordStore::Cursor::save() {}
+void RecordStore::Cursor::saveUnpositioned() {}
+
+bool RecordStore::Cursor::restore() {
+    if (!_savedPosition)
+        return true;
+
+    // Get oplog visibility before forking working tree to guarantee that nothing gets committed
+    // after we've forked that would update oplog visibility
+    if (_rs._isOplog) {
+        _oplogVisibility = _visibilityManager->getAllCommittedRecord();
+    }
+
+    StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
+    it = workingCopy->lower_bound(_savedPosition.value());
+    _lastMoveWasRestore = it == workingCopy->end() || it->first != _savedPosition.value();
+
+    // Capped iterators die on invalidation rather than advancing.
+    return !(_rs._isCapped && _lastMoveWasRestore);
+}
+
+void RecordStore::Cursor::detachFromOperationContext() {
+    invariant(opCtx != nullptr);
+    opCtx = nullptr;
+}
+
+void RecordStore::Cursor::reattachToOperationContext(OperationContext* opCtx) {
+    invariant(opCtx != nullptr);
+    this->opCtx = opCtx;
+}
+
+bool RecordStore::Cursor::inPrefix(const std::string& key_string) {
+    return (key_string > _rs._prefix) && (key_string < _rs._postfix);
+}
+
+RecordStore::ReverseCursor::ReverseCursor(OperationContext* opCtx,
+                                          const RecordStore& rs,
+                                          VisibilityManager* visibilityManager)
+    : opCtx(opCtx), _rs(rs), _visibilityManager(visibilityManager) {
+    _savedPosition = boost::none;
+}
+
+boost::optional<Record> RecordStore::ReverseCursor::next() {
+    _savedPosition = boost::none;
+    StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
+    if (_needFirstSeek) {
+        _needFirstSeek = false;
+        it = StringStore::const_reverse_iterator(workingCopy->upper_bound(_rs._postfix));
+    } else if (it != workingCopy->rend() && !_lastMoveWasRestore) {
+        ++it;
+    }
+    _lastMoveWasRestore = false;
+
+    if (it != workingCopy->rend() && inPrefix(it->first)) {
+        _savedPosition = it->first;
+        Record nextRecord;
+        nextRecord.id = RecordId(extractRecordId(it->first));
+        nextRecord.data = RecordData(it->second.c_str(), it->second.length());
+
+        return nextRecord;
+    }
+    return boost::none;
+}
+
+boost::optional<Record> RecordStore::ReverseCursor::seekExact(const RecordId& id) {
+    _needFirstSeek = false;
+    _savedPosition = boost::none;
+    StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
+    std::string key = createKey(_rs._ident, id.as<int64_t>());
+    StringStore::const_iterator canFind = workingCopy->find(key);
+    if (canFind == workingCopy->end() || !inPrefix(canFind->first)) {
+        it = workingCopy->rend();
+        return boost::none;
+    }
+
+    it = StringStore::const_reverse_iterator(++canFind);  // reverse iterator returns item 1 before
+    _savedPosition = it->first;
+    return Record{id, RecordData(it->second.c_str(), it->second.length())};
+}
+
+void RecordStore::ReverseCursor::save() {}
+void RecordStore::ReverseCursor::saveUnpositioned() {}
+
+bool RecordStore::ReverseCursor::restore() {
+    if (!_savedPosition)
+        return true;
+
+    StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
+    it = StringStore::const_reverse_iterator(workingCopy->upper_bound(_savedPosition.value()));
+    _lastMoveWasRestore = (it == workingCopy->rend() || it->first != _savedPosition.value());
+
+    // Capped iterators die on invalidation rather than advancing.
+    return !(_rs._isCapped && _lastMoveWasRestore);
+}
+
+void RecordStore::ReverseCursor::detachFromOperationContext() {
+    invariant(opCtx != nullptr);
+    opCtx = nullptr;
+}
+
+void RecordStore::ReverseCursor::reattachToOperationContext(OperationContext* opCtx) {
+    invariant(opCtx != nullptr);
+    this->opCtx = opCtx;
+}
+
+bool RecordStore::ReverseCursor::inPrefix(const std::string& key_string) {
+    return (key_string > _rs._prefix) && (key_string < _rs._postfix);
+}
+
+RecordStore::SizeAdjuster::SizeAdjuster(OperationContext* opCtx, RecordStore* rs)
+    : _opCtx(opCtx),
+      _rs(rs),
+      _workingCopy(ephemeral_for_test::RecoveryUnit::get(opCtx)->getHead()),
+      _origNumRecords(_workingCopy->size()),
+      _origDataSize(_workingCopy->dataSize()) {}
+
+RecordStore::SizeAdjuster::~SizeAdjuster() {
+    // SERVER-48981 This implementation of fastcount results in inaccurate values. This storage
+    // engine emits write conflict exceptions at commit-time leading to the fastcount to be
+    // inaccurate until the rollback happens.
+    // If proper local isolation is implemented, SERVER-38883 can also be fulfulled for this storage
+    // engine where we can invariant for correct fastcount in updateStatsAfterRepair()
+    int64_t deltaNumRecords = _workingCopy->size() - _origNumRecords;
+    int64_t deltaDataSize = _workingCopy->dataSize() - _origDataSize;
+    _rs->_numRecords.fetchAndAdd(deltaNumRecords);
+    _rs->_dataSize.fetchAndAdd(deltaDataSize);
+    RecoveryUnit::get(_opCtx)->onRollback([rs = _rs, deltaNumRecords, deltaDataSize]() {
+        rs->_numRecords.fetchAndSubtract(deltaNumRecords);
+        rs->_dataSize.fetchAndSubtract(deltaDataSize);
+    });
+}
+
+}  // namespace ephemeral_for_test
 }  // namespace mongo

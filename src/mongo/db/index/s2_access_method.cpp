@@ -1,55 +1,59 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/s2_access_method.h"
 
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/db/geo/geoparser.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/geo/geoconstants.h"
-#include "mongo/db/index_names.h"
+#include "mongo/db/geo/geoparser.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
 static const string kIndexVersionFieldName("2dsphereIndexVersion");
 
-S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : IndexAccessMethod(btreeState, btree) {
+S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState,
+                               std::unique_ptr<SortedDataInterface> btree)
+    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
 
-    ExpressionParams::parse2dsphereParams(descriptor->infoObj(), &_params);
+    ExpressionParams::initialize2dsphereParams(
+        descriptor->infoObj(), btreeState->getCollator(), &_params);
 
     int geoFields = 0;
 
@@ -73,13 +77,15 @@ S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterfac
             geoFields >= 1);
 
     if (descriptor->isSparse()) {
-        warning() << "Sparse option ignored for index spec " << descriptor->keyPattern().toString()
-                  << "\n";
+        LOGV2_WARNING(23742,
+                      "Sparse option ignored for index spec {descriptor_keyPattern}",
+                      "Sparse option ignored for index spec",
+                      "indexSpec"_attr = descriptor->keyPattern());
     }
 }
 
 // static
-BSONObj S2AccessMethod::fixSpec(const BSONObj& specObj) {
+StatusWith<BSONObj> S2AccessMethod::fixSpec(const BSONObj& specObj) {
     // If the spec object has the field "2dsphereIndexVersion", validate it.  If it doesn't, add
     // {2dsphereIndexVersion: 3}, which is the default for newly-built indexes.
 
@@ -91,19 +97,52 @@ BSONObj S2AccessMethod::fixSpec(const BSONObj& specObj) {
         return bob.obj();
     }
 
-    const int indexVersion = indexVersionElt.numberInt();
-    uassert(17394,
-            str::stream() << "unsupported geo index version { " << kIndexVersionFieldName << " : "
-                          << indexVersionElt << " }, only support versions: [" << S2_INDEX_VERSION_1
-                          << "," << S2_INDEX_VERSION_2 << "," << S2_INDEX_VERSION_3 << "]",
-            indexVersionElt.isNumber() &&
-                (indexVersion == S2_INDEX_VERSION_3 || indexVersion == S2_INDEX_VERSION_2 ||
-                 indexVersion == S2_INDEX_VERSION_1));
+    if (!indexVersionElt.isNumber()) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "Invalid type for geo index version { " << kIndexVersionFieldName
+                              << " : " << indexVersionElt << " }, only versions: ["
+                              << S2_INDEX_VERSION_1 << "," << S2_INDEX_VERSION_2 << ","
+                              << S2_INDEX_VERSION_3 << "] are supported"};
+    }
+
+    if (indexVersionElt.type() == BSONType::NumberDouble &&
+        !std::isnormal(indexVersionElt.numberDouble())) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "Invalid value for geo index version { " << kIndexVersionFieldName
+                              << " : " << indexVersionElt << " }, only versions: ["
+                              << S2_INDEX_VERSION_1 << "," << S2_INDEX_VERSION_2 << ","
+                              << S2_INDEX_VERSION_3 << "] are supported"};
+    }
+
+    const auto indexVersion = indexVersionElt.numberLong();
+    if (indexVersion != S2_INDEX_VERSION_1 && indexVersion != S2_INDEX_VERSION_2 &&
+        indexVersion != S2_INDEX_VERSION_3) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "unsupported geo index version { " << kIndexVersionFieldName
+                              << " : " << indexVersionElt << " }, only versions: ["
+                              << S2_INDEX_VERSION_1 << "," << S2_INDEX_VERSION_2 << ","
+                              << S2_INDEX_VERSION_3 << "] are supported"};
+    }
+
     return specObj;
 }
 
-void S2AccessMethod::getKeys(const BSONObj& obj, BSONObjSet* keys) const {
-    ExpressionKeysPrivate::getS2Keys(obj, _descriptor->keyPattern(), _params, keys);
+void S2AccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                               const BSONObj& obj,
+                               GetKeysContext context,
+                               KeyStringSet* keys,
+                               KeyStringSet* multikeyMetadataKeys,
+                               MultikeyPaths* multikeyPaths,
+                               boost::optional<RecordId> id) const {
+    ExpressionKeysPrivate::getS2Keys(pooledBufferBuilder,
+                                     obj,
+                                     _descriptor->keyPattern(),
+                                     _params,
+                                     keys,
+                                     multikeyPaths,
+                                     getSortedDataInterface()->getKeyStringVersion(),
+                                     getSortedDataInterface()->getOrdering(),
+                                     id);
 }
 
 }  // namespace mongo

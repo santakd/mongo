@@ -1,71 +1,85 @@
-// engine.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/engine.h"
 
-#include <cctype>
+#include <algorithm>
 #include <boost/filesystem/operations.hpp>
 
-#include "mongo/client/dbclientcursor.h"
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/db/service_context.h"
+#include "mongo/base/string_data.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/scripting/dbdirectclient_factory.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
 
-using std::endl;
 using std::set;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 
-AtomicInt64 Scope::_lastVersion(1);
+AtomicWord<long long> Scope::_lastVersion(1);
+
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(mr_killop_test_fp);
 // 2 GB is the largest support Javascript file size.
 const fileofs kMaxJsFileLength = fileofs(2) * 1024 * 1024 * 1024;
+
+const ServiceContext::Decoration<std::unique_ptr<ScriptEngine>> forService =
+    ServiceContext::declareDecoration<std::unique_ptr<ScriptEngine>>();
+static std::unique_ptr<ScriptEngine> globalScriptEngine;
+
 }  // namespace
 
-ScriptEngine::ScriptEngine() : _scopeInitCallback() {}
+ScriptEngine::ScriptEngine(bool disableLoadStored)
+    : _disableLoadStored(disableLoadStored), _scopeInitCallback() {}
 
 ScriptEngine::~ScriptEngine() {}
 
 Scope::Scope()
-    : _localDBName(""), _loadedVersion(0), _numTimesUsed(0), _lastRetIsNativeCode(false) {}
+    : _localDBName(""),
+      _loadedVersion(0),
+      _createTime(Date_t::now()),
+      _lastRetIsNativeCode(false) {}
 
 Scope::~Scope() {}
 
@@ -101,9 +115,8 @@ void Scope::append(BSONObjBuilder& builder, const char* fieldName, const char* s
             builder.appendNull(fieldName);
             break;
         case Date:
-            builder.appendDate(
-                fieldName,
-                Date_t::fromMillisSinceEpoch(static_cast<long long>(getNumber(scopeName))));
+            builder.appendDate(fieldName,
+                               Date_t::fromMillisSinceEpoch(getNumberLongLong(scopeName)));
             break;
         case Code:
             builder.appendCode(fieldName, getString(scopeName));
@@ -126,7 +139,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
     boost::filesystem::path p(filename);
 #endif
     if (!exists(p)) {
-        error() << "file [" << filename << "] doesn't exist" << endl;
+        LOGV2_ERROR(22779, "file [{filename}] doesn't exist", "filename"_attr = filename);
         return false;
     }
 
@@ -145,7 +158,9 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
         }
 
         if (empty) {
-            error() << "directory [" << filename << "] doesn't have any *.js files" << endl;
+            LOGV2_ERROR(22780,
+                        "directory [{filename}] doesn't have any *.js files",
+                        "filename"_attr = filename);
             return false;
         }
 
@@ -160,7 +175,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
 
     fileofs fo = f.len();
     if (fo > kMaxJsFileLength) {
-        warning() << "attempted to execute javascript file larger than 2GB" << endl;
+        LOGV2_WARNING(22778, "attempted to execute javascript file larger than 2GB");
         return false;
     }
     unsigned len = static_cast<unsigned>(fo);
@@ -182,23 +197,27 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
 
 class Scope::StoredFuncModLogOpHandler : public RecoveryUnit::Change {
 public:
-    void commit() {
+    void commit(boost::optional<Timestamp>) {
         _lastVersion.fetchAndAdd(1);
     }
     void rollback() {}
 };
 
-void Scope::storedFuncMod(OperationContext* txn) {
-    txn->recoveryUnit()->registerChange(new StoredFuncModLogOpHandler());
+void Scope::storedFuncMod(OperationContext* opCtx) {
+    opCtx->recoveryUnit()->registerChange(std::make_unique<StoredFuncModLogOpHandler>());
 }
 
 void Scope::validateObjectIdString(const string& str) {
     uassert(10448, "invalid object id: length", str.size() == 24);
-    for (size_t i = 0; i < str.size(); i++)
-        uassert(10430, "invalid object id: not hex", std::isxdigit(str.at(i)));
+    auto isAllHex = [](StringData s) {
+        return std::all_of(s.begin(), s.end(), [](char c) { return ctype::isXdigit(c); });
+    };
+    uassert(10430, "invalid object id: not hex", isAllHex(str));
 }
 
-void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
+void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
+    if (!getGlobalScriptEngine()->_disableLoadStored)
+        return;
     if (_localDBName.size() == 0) {
         if (ignoreNotConnected)
             return;
@@ -209,12 +228,12 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
     if (_loadedVersion == lastVersion)
         return;
 
-    _loadedVersion = lastVersion;
-    string coll = _localDBName + ".system.js";
+    NamespaceString coll(_localDBName, "system.js");
 
-    unique_ptr<DBClientBase> directDBClient(createDirectClient(txn));
+    auto directDBClient = DBDirectClientFactory::get(opCtx).create(opCtx);
+
     unique_ptr<DBClientCursor> c =
-        directDBClient->query(coll, Query(), 0, 0, NULL, QueryOption_SlaveOk, 0);
+        directDBClient->query(coll, Query(), 0, 0, nullptr, QueryOption_SecondaryOk, 0);
     massert(16669, "unable to get db client cursor from query", c.get());
 
     set<string> thisTime;
@@ -223,16 +242,39 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
         BSONElement n = o["_id"];
         BSONElement v = o["value"];
 
-        uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
-        uassert(10210, "value has to be set", v.type() != EOO);
+        uassert(
+            10209, str::stream() << "name has to be a string: " << n, n.type() == BSONType::String);
+        uassert(10210, "value has to be set", v.type() != BSONType::EOO);
+
+        uassert(4546000,
+                str::stream() << "BSON type 'CodeWithScope' not supported in system.js scripts. As "
+                                 "an alternative use 'Code'. Script _id value: '"
+                              << n.String() << "'",
+                v.type() != BSONType::CodeWScope);
+
+        if (MONGO_unlikely(mr_killop_test_fp.shouldFail())) {
+            LOGV2(5062200, "Pausing mr_killop_test_fp for system.js entry", "entryName"_attr = n);
+
+            /* This thread sleep makes the interrupts in the test come in at a time
+             *  where the js misses the interrupt and throw an exception instead of
+             *  being interrupted
+             */
+            stdx::this_thread::sleep_for(stdx::chrono::seconds(1));
+        }
 
         try {
             setElement(n.valuestr(), v, o);
             thisTime.insert(n.valuestr());
             _storedNames.insert(n.valuestr());
         } catch (const DBException& setElemEx) {
-            error() << "unable to load stored JavaScript function " << n.valuestr()
-                    << "(): " << setElemEx.what() << endl;
+            if (setElemEx.code() == ErrorCodes::Interrupted) {
+                throw;
+            }
+
+            LOGV2_ERROR(22781,
+                        "unable to load stored JavaScript function {n_valuestr}(): {setElemEx}",
+                        "n_valuestr"_attr = n.valuestr(),
+                        "setElemEx"_attr = redact(setElemEx));
         }
     }
 
@@ -246,6 +288,10 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
             ++i;
         }
     }
+
+    // Only update _loadedVersion if loading system.js completed successfully.
+    // If any one operation failed or was interrupted we will start over next time.
+    _loadedVersion = lastVersion;
 }
 
 ScriptingFunction Scope::createFunction(const char* code) {
@@ -263,31 +309,29 @@ ScriptingFunction Scope::createFunction(const char* code) {
     FunctionCacheMap::iterator i = _cachedFunctions.find(code);
     if (i != _cachedFunctions.end())
         return i->second;
-    // NB: we calculate the function number for v8 so the cache can be utilized to
-    //     lookup the source on an exception, but SpiderMonkey uses the value
-    //     returned by JS_CompileFunction.
-    ScriptingFunction defaultFunctionNumber = getFunctionCache().size() + 1;
-    ScriptingFunction actualFunctionNumber = _createFunction(code, defaultFunctionNumber);
-    _cachedFunctions[code] = actualFunctionNumber;
-    return actualFunctionNumber;
+
+    // Get a function number, so the cache can be utilized to lookup the source on an exception
+    ScriptingFunction functionNumber = _createFunction(code);
+    _cachedFunctions[code] = functionNumber;
+    return functionNumber;
 }
 
 namespace JSFiles {
 extern const JSFile collection;
+extern const JSFile check_log;
 extern const JSFile crud_api;
 extern const JSFile db;
 extern const JSFile explain_query;
 extern const JSFile explainable;
 extern const JSFile mongo;
-extern const JSFile mr;
+extern const JSFile session;
 extern const JSFile query;
-extern const JSFile upgrade_check;
 extern const JSFile utils;
 extern const JSFile utils_sh;
 extern const JSFile utils_auth;
 extern const JSFile bulk_api;
 extern const JSFile error_codes;
-}
+}  // namespace JSFiles
 
 void Scope::execCoreFiles() {
     execSetup(JSFiles::utils);
@@ -295,35 +339,37 @@ void Scope::execCoreFiles() {
     execSetup(JSFiles::utils_auth);
     execSetup(JSFiles::db);
     execSetup(JSFiles::mongo);
-    execSetup(JSFiles::mr);
+    execSetup(JSFiles::session);
     execSetup(JSFiles::query);
     execSetup(JSFiles::bulk_api);
     execSetup(JSFiles::error_codes);
+    execSetup(JSFiles::check_log);
     execSetup(JSFiles::collection);
     execSetup(JSFiles::crud_api);
     execSetup(JSFiles::explain_query);
     execSetup(JSFiles::explainable);
-    execSetup(JSFiles::upgrade_check);
 }
 
 namespace {
 class ScopeCache {
 public:
     void release(const string& poolName, const std::shared_ptr<Scope>& scope) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         if (scope->hasOutOfMemoryException()) {
             // make some room
-            log() << "Clearing all idle JS contexts due to out of memory" << endl;
+            LOGV2_INFO(22777, "Clearing all idle JS contexts due to out of memory");
             _pools.clear();
             return;
         }
 
-        if (scope->getTimesUsed() > kMaxScopeReuse)
-            return;  // used too many times to save
+        if (Date_t::now() - scope->getCreateTime() > kMaxScopeReuseTime) {
+            return;  // too old to save
+        }
 
-        if (!scope->getError().empty())
+        if (!scope->getError().empty()) {
             return;  // not saving errored scopes
+        }
 
         if (_pools.size() >= kMaxPoolSize) {
             // prefer to keep recently-used scopes
@@ -335,16 +381,15 @@ public:
         _pools.push_front(toStore);
     }
 
-    std::shared_ptr<Scope> tryAcquire(OperationContext* txn, const string& poolName) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+    std::shared_ptr<Scope> tryAcquire(OperationContext* opCtx, const string& poolName) {
+        stdx::lock_guard<Latch> lk(_mutex);
 
         for (Pools::iterator it = _pools.begin(); it != _pools.end(); ++it) {
             if (it->poolName == poolName) {
                 std::shared_ptr<Scope> scope = it->scope;
                 _pools.erase(it);
-                scope->incTimesUsed();
                 scope->reset();
-                scope->registerOperation(txn);
+                scope->registerOperation(opCtx);
                 return scope;
             }
         }
@@ -353,7 +398,7 @@ public:
     }
 
     void clear() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         _pools.clear();
     }
@@ -366,11 +411,11 @@ private:
 
     // Note: if these numbers change, reconsider choice of datastructure for _pools
     static const unsigned kMaxPoolSize = 10;
-    static const int kMaxScopeReuse = 10;
+    constexpr static inline Seconds kMaxScopeReuseTime = Seconds(10);
 
     typedef std::deque<ScopeAndPool> Pools;  // More-recently used Scopes are kept at the front.
     Pools _pools;                            // protected by _mutex
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ScopeCache::_mutex");
 };
 
 ScopeCache scopeCache;
@@ -386,15 +431,22 @@ public:
         : _pool(pool), _real(real) {}
 
     virtual ~PooledScope() {
-        scopeCache.release(_pool, _real);
+        // SERVER-53671: Sometimes, ScopeCache::release() will generate an 'InterruptedAtShutdown'
+        // exception. We catch and ignore such exceptions here to prevent them from crashing the
+        // server while it is shutting down.
+        try {
+            scopeCache.release(_pool, _real);
+        } catch (const ExceptionFor<ErrorCodes::InterruptedAtShutdown>&) {
+            LOGV2(5367100, "Interrupted at shutdown during ~PooledScope()");
+        }
     }
 
     // wrappers for the derived (_real) scope
     void reset() {
         _real->reset();
     }
-    void registerOperation(OperationContext* txn) {
-        _real->registerOperation(txn);
+    void registerOperation(OperationContext* opCtx) {
+        _real->registerOperation(opCtx);
     }
     void unregisterOperation() {
         _real->unregisterOperation();
@@ -402,14 +454,11 @@ public:
     void init(const BSONObj* data) {
         _real->init(data);
     }
-    void localConnectForDbEval(OperationContext* txn, const char* dbName) {
-        invariant(!"localConnectForDbEval should only be called from dbEval");
-    }
-    void setLocalDB(const string& dbName) {
+    void setLocalDB(StringData dbName) {
         _real->setLocalDB(dbName);
     }
-    void loadStored(OperationContext* txn, bool ignoreNotConnected = false) {
-        _real->loadStored(txn, ignoreNotConnected);
+    void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false) {
+        _real->loadStored(opCtx, ignoreNotConnected);
     }
     void externalSetup() {
         _real->externalSetup();
@@ -419,6 +468,12 @@ public:
     }
     void advanceGeneration() {
         _real->advanceGeneration();
+    }
+    void requireOwnedObjects() override {
+        _real->requireOwnedObjects();
+    }
+    void kill() {
+        _real->kill();
     }
     bool isKillPending() const {
         return _real->isKillPending();
@@ -437,6 +492,12 @@ public:
     }
     double getNumber(const char* field) {
         return _real->getNumber(field);
+    }
+    int getNumberInt(const char* field) {
+        return _real->getNumberInt(field);
+    }
+    long long getNumberLongLong(const char* field) {
+        return _real->getNumberLongLong(field);
     }
     Decimal128 getNumberDecimal(const char* field) {
         return _real->getNumberDecimal(field);
@@ -503,12 +564,8 @@ public:
     }
 
 protected:
-    FunctionCacheMap& getFunctionCache() {
-        return _real->getFunctionCache();
-    }
-
-    ScriptingFunction _createFunction(const char* code, ScriptingFunction functionNumber = 0) {
-        return _real->_createFunction(code, functionNumber);
+    ScriptingFunction _createFunction(const char* code) {
+        return _real->_createFunction(code);
     }
 
 private:
@@ -517,25 +574,38 @@ private:
 };
 
 /** Get a scope from the pool of scopes matching the supplied pool name */
-unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* txn,
+unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* opCtx,
                                                const string& db,
                                                const string& scopeType) {
     const string fullPoolName = db + scopeType;
-    std::shared_ptr<Scope> s = scopeCache.tryAcquire(txn, fullPoolName);
+    std::shared_ptr<Scope> s = scopeCache.tryAcquire(opCtx, fullPoolName);
     if (!s) {
         s.reset(newScope());
-        s->registerOperation(txn);
+        s->registerOperation(opCtx);
     }
 
     unique_ptr<Scope> p;
     p.reset(new PooledScope(fullPoolName, s));
     p->setLocalDB(db);
-    p->loadStored(txn, true);
+    p->loadStored(opCtx, true);
     return p;
 }
 
-void (*ScriptEngine::_connectCallback)(DBClientWithCommands&) = 0;
-ScriptEngine* globalScriptEngine = 0;
+void (*ScriptEngine::_connectCallback)(DBClientBase&, StringData) = nullptr;
+
+ScriptEngine* getGlobalScriptEngine() {
+    if (hasGlobalServiceContext())
+        return forService(getGlobalServiceContext()).get();
+    else
+        return globalScriptEngine.get();
+}
+
+void setGlobalScriptEngine(ScriptEngine* impl) {
+    if (hasGlobalServiceContext())
+        forService(getGlobalServiceContext()).reset(impl);
+    else
+        globalScriptEngine.reset(impl);
+}
 
 bool hasJSReturn(const string& code) {
     size_t x = code.find("return");
@@ -558,12 +628,13 @@ bool hasJSReturn(const string& code) {
 
     // return is at start OR preceded by space
     // AND return is not followed by digit or letter
-    return (x == 0 || isspace(code[x - 1])) && !(isalpha(code[x + 6]) || isdigit(code[x + 6]));
+    return (x == 0 || ctype::isSpace(code[x - 1])) &&
+        !(ctype::isAlpha(code[x + 6]) || ctype::isDigit(code[x + 6]));
 }
 
 const char* jsSkipWhiteSpace(const char* raw) {
     while (raw[0]) {
-        while (isspace(*raw)) {
+        while (ctype::isSpace(*raw)) {
             ++raw;
         }
         if (raw[0] != '/' || raw[1] != '/')
@@ -573,4 +644,4 @@ const char* jsSkipWhiteSpace(const char* raw) {
     }
     return raw;
 }
-}
+}  // namespace mongo

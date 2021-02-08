@@ -1,44 +1,49 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/data_view.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/platform/random.h"
+#include "mongo/bson/bson_depth.h"
 #include "mongo/bson/bson_validate.h"
-#include "mongo/util/log.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/random.h"
+#include "mongo/unittest/unittest.h"
 
 namespace {
 
 using namespace mongo;
-using std::unique_ptr;
 using std::endl;
+using std::unique_ptr;
 
 void appendInvalidStringElement(const char* fieldName, BufBuilder* bb) {
     // like a BSONObj string, but without a NUL terminator.
@@ -90,9 +95,12 @@ TEST(BSONValidate, RandomData) {
         delete[] x;
     }
 
-    log() << "RandomData: didn't crash valid/total: " << numValid << "/" << numToRun
-          << " (want few valid ones)"
-          << " jsonSize: " << jsonSize << endl;
+    LOGV2(20104,
+          "RandomData: didn't crash valid/total: {numValid}/{numToRun} (want few valid ones) "
+          "jsonSize: {jsonSize}",
+          "numValid"_attr = numValid,
+          "numToRun"_attr = numToRun,
+          "jsonSize"_attr = jsonSize);
 }
 
 TEST(BSONValidate, MuckingData1) {
@@ -124,7 +132,7 @@ TEST(BSONValidate, MuckingData1) {
 
         char* data = const_cast<char*>(mine.objdata());
 
-        data[i] = 200;
+        data[i] = 0xc8U;
 
         numToRun++;
         if (mine.valid()) {
@@ -136,21 +144,25 @@ TEST(BSONValidate, MuckingData1) {
         }
     }
 
-    log() << "MuckingData1: didn't crash valid/total: " << numValid << "/" << numToRun
-          << " (want few valid ones) "
-          << " jsonSize: " << jsonSize << endl;
+    LOGV2(20105,
+          "MuckingData1: didn't crash valid/total: {numValid}/{numToRun} (want few valid ones)  "
+          "jsonSize: {jsonSize}",
+          "numValid"_attr = numValid,
+          "numToRun"_attr = numToRun,
+          "jsonSize"_attr = jsonSize);
 }
 
 TEST(BSONValidate, Fuzz) {
-    int64_t seed = time(0);
-    log() << "BSONValidate Fuzz random seed: " << seed << endl;
+    int64_t seed = time(nullptr);
+    LOGV2(20106, "BSONValidate Fuzz random seed: {seed}", "seed"_attr = seed);
     PseudoRandom randomSource(seed);
 
     BSONObj original =
         BSON("one" << 3 << "two" << 5 << "three" << BSONObj() << "four"
-                   << BSON("five" << BSON("six" << 11)) << "seven" << BSON_ARRAY("a"
-                                                                                 << "bb"
-                                                                                 << "ccc" << 5)
+                   << BSON("five" << BSON("six" << 11)) << "seven"
+                   << BSON_ARRAY("a"
+                                 << "bb"
+                                 << "ccc" << 5)
                    << "eight" << BSONDBRef("rrr", OID("01234567890123456789aaaa")) << "_id"
                    << OID("deadbeefdeadbeefdeadbeef") << "nine"
                    << BSONBinData("\x69\xb7", 2, BinDataGeneral) << "ten"
@@ -176,8 +188,11 @@ TEST(BSONValidate, Fuzz) {
         }
         BSONObj fuzzed(buffer.get());
 
-        // Check that the two validation implementations agree (and neither crashes).
-        ASSERT_EQUALS(fuzzed.valid(), validateBSON(fuzzed.objdata(), fuzzed.objsize()).isOK());
+        // There is no assert here because there is no other BSON validator oracle
+        // to compare outputs against (BSONObj::valid() is a wrapper for validateBSON()).
+        // Thus, the reason for this test is to ensure that validateBSON() doesn't trip
+        // any ASAN or UBSAN check when fed fuzzed input.
+        validateBSON(fuzzed.objdata(), fuzzed.objsize()).isOK();
     }
 }
 
@@ -230,10 +245,39 @@ TEST(BSONValidateFast, Simple3) {
 }
 
 TEST(BSONValidateFast, NestedObject) {
-    BSONObj x = BSON("a" << 1 << "b" << BSON("c" << 2 << "d" << BSONArrayBuilder().obj() << "e"
-                                                 << BSON_ARRAY("1" << 2 << 3)));
+    BSONObj x = BSON("a" << 1 << "b"
+                         << BSON("c" << 2 << "d" << BSONArrayBuilder().obj() << "e"
+                                     << BSON_ARRAY("1" << 2 << 3)));
     ASSERT_OK(validateBSON(x.objdata(), x.objsize()));
     ASSERT_NOT_OK(validateBSON(x.objdata(), x.objsize() / 2));
+}
+
+TEST(BSONValidateFast, AllTypesSimple) {
+    BSONObj x = BSON(
+        "1float" << 1.5  // 64-bit binary floating point
+                 << "2string"
+                 << "Hello"                                           // UTF-8 string
+                 << "3document" << BSON("a" << 1)                     // Embedded document
+                 << "4array" << BSON_ARRAY(1 << 2)                    // Array
+                 << "5bindata" << BSONBinData("", 0, BinDataGeneral)  // Binary data
+                 << "6undefined" << BSONUndefined  // Undefined (value) -- Deprecated
+                 << "7objectid" << OID("deadbeefdeadbeefdeadbeef")  // ObjectId
+                 << "8boolean" << true                              // Boolean
+                 << "9datetime" << DATENOW                          // UTC datetime
+                 << "10null" << BSONNULL                            // Null value
+                 << "11regex" << BSONRegEx("reg.ex")                // Regular Expression
+                 << "12dbref"
+                 << BSONDBRef("db", OID("dbdbdbdbdbdbdbdbdbdbdbdb"))  // DBPointer -- Deprecated
+                 << "13code" << BSONCode("(function(){})();")         // JavaScript code
+                 << "14symbol" << BSONSymbol("symbol")                // Symbol. Deprecated
+                 << "15code_w_s"
+                 << BSONCodeWScope("(function(){})();", BSON("a" << 1))  // JavaScript code w/ scope
+                 << "16int" << 42                                        // 32-bit integer
+                 << "17timestamp" << Timestamp(1, 2)                     // Timestamp
+                 << "18long" << 0x0123456789abcdefll                     // 64-bit integer
+                 << "19decimal" << Decimal128("0.30")  // 128-bit decimal floating point
+    );
+    ASSERT_OK(validateBSON(x.objdata(), x.objsize()));
 }
 
 TEST(BSONValidateFast, ErrorWithId) {
@@ -244,7 +288,9 @@ TEST(BSONValidateFast, ErrorWithId) {
     const BSONObj x = ob.done();
     const Status status = validateBSON(x.objdata(), x.objsize());
     ASSERT_NOT_OK(status);
-    ASSERT_EQUALS(status.reason(), "not null terminated string in object with _id: 1");
+    ASSERT_EQUALS(
+        status.reason(),
+        "Not null terminated string in element with field name 'not_id' in object with _id: 1");
 }
 
 TEST(BSONValidateFast, ErrorBeforeId) {
@@ -255,7 +301,9 @@ TEST(BSONValidateFast, ErrorBeforeId) {
     const BSONObj x = ob.done();
     const Status status = validateBSON(x.objdata(), x.objsize());
     ASSERT_NOT_OK(status);
-    ASSERT_EQUALS(status.reason(), "not null terminated string in object with unknown _id");
+    ASSERT_EQUALS(status.reason(),
+                  "Not null terminated string in element with field name 'not_id' in object with "
+                  "unknown _id");
 }
 
 TEST(BSONValidateFast, ErrorNoId) {
@@ -265,7 +313,9 @@ TEST(BSONValidateFast, ErrorNoId) {
     const BSONObj x = ob.done();
     const Status status = validateBSON(x.objdata(), x.objsize());
     ASSERT_NOT_OK(status);
-    ASSERT_EQUALS(status.reason(), "not null terminated string in object with unknown _id");
+    ASSERT_EQUALS(status.reason(),
+                  "Not null terminated string in element with field name 'not_id' in object with "
+                  "unknown _id");
 }
 
 TEST(BSONValidateFast, ErrorIsInId) {
@@ -275,7 +325,9 @@ TEST(BSONValidateFast, ErrorIsInId) {
     const BSONObj x = ob.done();
     const Status status = validateBSON(x.objdata(), x.objsize());
     ASSERT_NOT_OK(status);
-    ASSERT_EQUALS(status.reason(), "not null terminated string in object with unknown _id");
+    ASSERT_EQUALS(
+        status.reason(),
+        "Not null terminated string in element with field name '_id' in object with unknown _id");
 }
 
 TEST(BSONValidateFast, NonTopLevelId) {
@@ -288,7 +340,25 @@ TEST(BSONValidateFast, NonTopLevelId) {
     const BSONObj x = ob.done();
     const Status status = validateBSON(x.objdata(), x.objsize());
     ASSERT_NOT_OK(status);
-    ASSERT_EQUALS(status.reason(), "not null terminated string in object with unknown _id");
+    ASSERT_EQUALS(status.reason(),
+                  "Not null terminated string in element with field name 'not_id2' in object with "
+                  "unknown _id");
+}
+
+TEST(BSONValidateFast, ErrorInNestedObjectWithId) {
+    BufBuilder bb;
+    BSONObjBuilder ob(bb);
+    ob.append("x", 2.0);
+    appendInvalidStringElement("invalid", &bb);
+    const BSONObj nestedInvalid = ob.done();
+    const BSONObj x = BSON("_id" << 1 << "nested"
+                                 << BSON_ARRAY("a"
+                                               << "b" << nestedInvalid));
+    const Status status = validateBSON(x.objdata(), x.objsize());
+    ASSERT_NOT_OK(status);
+    ASSERT_EQUALS(status.reason(),
+                  "Not null terminated string in element with field name 'nested.2.invalid' "
+                  "in object with _id: 1");
 }
 
 TEST(BSONValidateFast, StringHasSomething) {
@@ -298,19 +368,16 @@ TEST(BSONValidateFast, StringHasSomething) {
     bb.appendStr("x", /*withNUL*/ true);
     bb.appendNum(0);
     const BSONObj x = ob.done();
-    ASSERT_EQUALS(5  // overhead
-                      +
-                      1  // type
-                      +
-                      2  // name
-                      +
-                      4  // size
+    ASSERT_EQUALS(5        // overhead
+                      + 1  // type
+                      + 2  // name
+                      + 4  // size
                   ,
                   x.objsize());
     ASSERT_NOT_OK(validateBSON(x.objdata(), x.objsize()));
 }
 
-TEST(BSONValidateBool, BoolValuesAreValidated) {
+TEST(BSONValidateFast, BoolValuesAreValidated) {
     BSONObjBuilder bob;
     bob.append("x", false);
     const BSONObj obj = bob.done();
@@ -331,4 +398,37 @@ TEST(BSONValidateBool, BoolValuesAreValidated) {
     }
 }
 
+TEST(BSONValidateFast, InvalidType) {
+    // Encode an invalid BSON Object with an invalid type, x90.
+    const char* buffer = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00";
+
+    // Constructing the object is fine, but validating should fail.
+    BSONObj obj(buffer);
+
+    // Validate fails.
+    ASSERT_NOT_OK(validateBSON(obj.objdata(), obj.objsize()));
+
+    // Make sure the binary buffer above indeed has the invalid type.
+    ASSERT_THROWS_CODE(obj.woCompare(BSON("A" << 1)), DBException, 10320);
+}
+
+TEST(BSONValidateFast, ValidCodeWScope) {
+    BSONObj obj = BSON("a" << BSONCodeWScope("code", BSON("c" << BSONObj())));
+    ASSERT_OK(validateBSON(obj.objdata(), obj.objsize()));
+    obj = BSON("a" << BSONCodeWScope("code", BSON("c" << BSONArray() << "d" << BSONArray())));
+    ASSERT_OK(validateBSON(obj.objdata(), obj.objsize()));
+}
+
+BSONObj nest(int nesting) {
+    return nesting < 1 ? BSON("i" << nesting) : BSON("i" << nesting << "o" << nest(nesting - 1));
+}
+
+TEST(BSONValidateFast, MaxNestingDepth) {
+    BSONObj maxNesting = nest(BSONDepth::getMaxAllowableDepth());
+    ASSERT_OK(validateBSON(maxNesting.objdata(), maxNesting.objsize()));
+
+    BSONObj tooDeepNesting = nest(BSONDepth::getMaxAllowableDepth() + 1);
+    Status status = validateBSON(tooDeepNesting.objdata(), tooDeepNesting.objsize());
+    ASSERT_EQ(status.code(), ErrorCodes::Overflow);
+}
 }  // namespace

@@ -1,30 +1,32 @@
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
 
 #include "mongo/platform/basic.h"
 
@@ -33,153 +35,50 @@
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <cstdio>
+#include <pcrecpp.h>
+#include <utility>
 #include <vector>
 
+#include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/hasher.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/variable_validation.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/platform/bits.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/regex_util.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/summation.h"
 
 namespace mongo {
 using Parser = Expression::Parser;
 
-using namespace mongoutils;
-
 using boost::intrusive_ptr;
+using std::map;
+using std::move;
+using std::pair;
 using std::set;
 using std::string;
 using std::vector;
 
 /// Helper function to easily wrap constants with $const.
 static Value serializeConstant(Value val) {
+    if (val.missing()) {
+        return Value("$$REMOVE"_sd);
+    }
+
     return Value(DOC("$const" << val));
-}
-
-void Variables::uassertValidNameForUserWrite(StringData varName) {
-    // System variables users allowed to write to (currently just one)
-    if (varName == "CURRENT") {
-        return;
-    }
-
-    uassert(16866, "empty variable names are not allowed", !varName.empty());
-
-    const bool firstCharIsValid =
-        (varName[0] >= 'a' && varName[0] <= 'z') || (varName[0] & '\x80')  // non-ascii
-        ;
-
-    uassert(16867,
-            str::stream() << "'" << varName
-                          << "' starts with an invalid character for a user variable name",
-            firstCharIsValid);
-
-    for (size_t i = 1; i < varName.size(); i++) {
-        const bool charIsValid = (varName[i] >= 'a' && varName[i] <= 'z') ||
-            (varName[i] >= 'A' && varName[i] <= 'Z') || (varName[i] >= '0' && varName[i] <= '9') ||
-            (varName[i] == '_') || (varName[i] & '\x80')  // non-ascii
-            ;
-
-        uassert(16868,
-                str::stream() << "'" << varName << "' contains an invalid character "
-                              << "for a variable name: '" << varName[i] << "'",
-                charIsValid);
-    }
-}
-
-void Variables::uassertValidNameForUserRead(StringData varName) {
-    uassert(16869, "empty variable names are not allowed", !varName.empty());
-
-    const bool firstCharIsValid = (varName[0] >= 'a' && varName[0] <= 'z') ||
-        (varName[0] >= 'A' && varName[0] <= 'Z') || (varName[0] & '\x80')  // non-ascii
-        ;
-
-    uassert(16870,
-            str::stream() << "'" << varName
-                          << "' starts with an invalid character for a variable name",
-            firstCharIsValid);
-
-    for (size_t i = 1; i < varName.size(); i++) {
-        const bool charIsValid = (varName[i] >= 'a' && varName[i] <= 'z') ||
-            (varName[i] >= 'A' && varName[i] <= 'Z') || (varName[i] >= '0' && varName[i] <= '9') ||
-            (varName[i] == '_') || (varName[i] & '\x80')  // non-ascii
-            ;
-
-        uassert(16871,
-                str::stream() << "'" << varName << "' contains an invalid character "
-                              << "for a variable name: '" << varName[i] << "'",
-                charIsValid);
-    }
-}
-
-void Variables::setValue(Id id, const Value& value) {
-    massert(17199, "can't use Variables::setValue to set ROOT", id != ROOT_ID);
-
-    verify(id < _numVars);
-    _rest[id] = value;
-}
-
-Value Variables::getValue(Id id) const {
-    if (id == ROOT_ID)
-        return Value(_root);
-
-    verify(id < _numVars);
-    return _rest[id];
-}
-
-Document Variables::getDocument(Id id) const {
-    if (id == ROOT_ID)
-        return _root;
-
-    verify(id < _numVars);
-    const Value var = _rest[id];
-    if (var.getType() == Object)
-        return var.getDocument();
-
-    return Document();
-}
-
-Variables::Id VariablesParseState::defineVariable(StringData name) {
-    // caller should have validated before hand by using Variables::uassertValidNameForUserWrite
-    massert(17275, "Can't redefine ROOT", name != "ROOT");
-
-    Variables::Id id = _idGenerator->generateId();
-    _variables[name] = id;
-    return id;
-}
-
-Variables::Id VariablesParseState::getVariable(StringData name) const {
-    StringMap<Variables::Id>::const_iterator it = _variables.find(name);
-    if (it != _variables.end())
-        return it->second;
-
-    uassert(17276,
-            str::stream() << "Use of undefined variable: " << name,
-            name == "ROOT" || name == "CURRENT");
-
-    return Variables::ROOT_ID;
 }
 
 /* --------------------------- Expression ------------------------------ */
 
-Expression::ObjectCtx::ObjectCtx(int theOptions) : options(theOptions) {}
-
-bool Expression::ObjectCtx::documentOk() const {
-    return ((options & DOCUMENT_OK) != 0);
-}
-
-bool Expression::ObjectCtx::topLevel() const {
-    return ((options & TOP_LEVEL) != 0);
-}
-
-bool Expression::ObjectCtx::inclusionOk() const {
-    return ((options & INCLUSION_OK) != 0);
-}
-
 string Expression::removeFieldPrefix(const string& prefixedField) {
     uassert(16419,
-            str::stream() << "field path must not contain embedded null characters"
-                          << prefixedField.find("\0") << ",",
+            str::stream() << "field path must not contain embedded null characters",
             prefixedField.find('\0') == string::npos);
 
     const char* pPrefixedField = prefixedField.c_str();
@@ -191,171 +90,124 @@ string Expression::removeFieldPrefix(const string& prefixedField) {
     return string(pPrefixedField + 1);
 }
 
-intrusive_ptr<Expression> Expression::parseObject(BSONObj obj,
-                                                  ObjectCtx* pCtx,
+intrusive_ptr<Expression> Expression::parseObject(ExpressionContext* const expCtx,
+                                                  BSONObj obj,
                                                   const VariablesParseState& vps) {
-    /*
-      An object expression can take any of the following forms:
-
-      f0: {f1: ..., f2: ..., f3: ...}
-      f0: {$operator:[operand1, operand2, ...]}
-    */
-
-    intrusive_ptr<Expression> pExpression;              // the result
-    intrusive_ptr<ExpressionObject> pExpressionObject;  // alt result
-    enum { UNKNOWN, NOTOPERATOR, OPERATOR } kind = UNKNOWN;
-
-    if (obj.isEmpty())
-        return ExpressionObject::create();
-    BSONObjIterator iter(obj);
-
-    for (size_t fieldCount = 0; iter.more(); ++fieldCount) {
-        BSONElement fieldElement(iter.next());
-        const char* pFieldName = fieldElement.fieldName();
-
-        if (pFieldName[0] == '$') {
-            uassert(
-                15983,
-                str::stream() << "the operator must be the only field in a pipeline object (at '"
-                              << pFieldName << "'",
-                fieldCount == 0);
-
-            uassert(16404,
-                    "$expressions are not allowed at the top-level of $project",
-                    !pCtx->topLevel());
-
-            /* we've determined this "object" is an operator expression */
-            kind = OPERATOR;
-
-            pExpression = parseExpression(fieldElement, vps);
-        } else {
-            uassert(15990,
-                    str::stream() << "this object is already an operator expression, and can't be "
-                                     "used as a document expression (at '" << pFieldName << "')",
-                    kind != OPERATOR);
-
-            uassert(16405,
-                    "dotted field names are only allowed at the top level",
-                    pCtx->topLevel() || !str::contains(pFieldName, '.'));
-
-            /* if it's our first time, create the document expression */
-            if (!pExpression.get()) {
-                verify(pCtx->documentOk());
-                // CW TODO error: document not allowed in this context
-
-                pExpressionObject =
-                    pCtx->topLevel() ? ExpressionObject::createRoot() : ExpressionObject::create();
-                pExpression = pExpressionObject;
-
-                /* this "object" is not an operator expression */
-                kind = NOTOPERATOR;
-            }
-
-            BSONType fieldType = fieldElement.type();
-            string fieldName(pFieldName);
-            switch (fieldType) {
-                case Object: {
-                    /* it's a nested document */
-                    ObjectCtx oCtx((pCtx->documentOk() ? ObjectCtx::DOCUMENT_OK : 0) |
-                                   (pCtx->inclusionOk() ? ObjectCtx::INCLUSION_OK : 0));
-
-                    pExpressionObject->addField(fieldName,
-                                                parseObject(fieldElement.Obj(), &oCtx, vps));
-                    break;
-                }
-                case String: {
-                    /* it's a renamed field */
-                    // CW TODO could also be a constant
-                    pExpressionObject->addField(
-                        fieldName, ExpressionFieldPath::parse(fieldElement.str(), vps));
-                    break;
-                }
-                case Array:
-                    pExpressionObject->addField(fieldName,
-                                                ExpressionArray::parse(fieldElement, vps));
-                    break;
-                case Bool:
-                case NumberDouble:
-                case NumberLong:
-                case NumberInt: {
-                    /* it's an inclusion specification */
-                    if (fieldElement.trueValue()) {
-                        uassert(16420,
-                                "field inclusion is not allowed inside of $expressions",
-                                pCtx->inclusionOk());
-                        pExpressionObject->includePath(fieldName);
-                    } else {
-                        uassert(16406,
-                                "The top-level _id field is the only field currently supported for "
-                                "exclusion",
-                                pCtx->topLevel() && fieldName == "_id");
-                        pExpressionObject->excludeId(true);
-                    }
-                    break;
-                }
-                default:
-                    uassert(15992,
-                            str::stream() << "disallowed field type " << typeName(fieldType)
-                                          << " in object expression (at '" << fieldName << "')",
-                            false);
-            }
-        }
+    if (obj.isEmpty()) {
+        return ExpressionObject::create(expCtx, {});
     }
 
-    return pExpression;
+    if (obj.firstElementFieldName()[0] == '$') {
+        // Assume this is an expression like {$add: [...]}.
+        return parseExpression(expCtx, obj, vps);
+    }
+
+    return ExpressionObject::parse(expCtx, obj, vps);
 }
 
 namespace {
-StringMap<Parser> parserMap;
-}
+struct ParserRegistration {
+    Parser parser;
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion;
+};
 
-void Expression::registerExpression(string key, Parser parser) {
+StringMap<ParserRegistration> parserMap;
+}  // namespace
+
+void Expression::registerExpression(
+    string key,
+    Parser parser,
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion) {
     auto op = parserMap.find(key);
     massert(17064,
             str::stream() << "Duplicate expression (" << key << ") registered.",
             op == parserMap.end());
-    parserMap[key] = parser;
+    parserMap[key] = {parser, requiredMinVersion};
 }
 
-intrusive_ptr<Expression> Expression::parseExpression(BSONElement exprElement,
+intrusive_ptr<Expression> Expression::parseExpression(ExpressionContext* const expCtx,
+                                                      BSONObj obj,
                                                       const VariablesParseState& vps) {
-    const char* opName = exprElement.fieldName();
-    auto op = parserMap.find(opName);
-    uassert(15999, str::stream() << "invalid operator '" << opName << "'", op != parserMap.end());
-    return op->second(exprElement, vps);
+    uassert(15983,
+            str::stream() << "An object representing an expression must have exactly one "
+                             "field: "
+                          << obj.toString(),
+            obj.nFields() == 1);
+
+    // Look up the parser associated with the expression name.
+    const char* opName = obj.firstElementFieldName();
+    auto it = parserMap.find(opName);
+    uassert(ErrorCodes::InvalidPipelineOperator,
+            str::stream() << "Unrecognized expression '" << opName << "'",
+            it != parserMap.end());
+
+    // Make sure we are allowed to use this expression under the current feature compatibility
+    // version.
+    auto& entry = it->second;
+    uassert(ErrorCodes::QueryFeatureNotAllowed,
+            // We would like to include the current version and the required minimum version in this
+            // error message, but using FeatureCompatibilityVersion::toString() would introduce a
+            // dependency cycle (see SERVER-31968).
+            str::stream() << opName
+                          << " is not allowed in the current feature compatibility version. See "
+                          << feature_compatibility_version_documentation::kCompatibilityLink
+                          << " for more information.",
+            !expCtx->maxFeatureCompatibilityVersion || !entry.requiredMinVersion ||
+                (*entry.requiredMinVersion <= *expCtx->maxFeatureCompatibilityVersion));
+    return entry.parser(expCtx, obj.firstElement(), vps);
 }
 
-Expression::ExpressionVector ExpressionNary::parseArguments(BSONElement exprElement,
+Expression::ExpressionVector ExpressionNary::parseArguments(ExpressionContext* const expCtx,
+                                                            BSONElement exprElement,
                                                             const VariablesParseState& vps) {
     ExpressionVector out;
     if (exprElement.type() == Array) {
         BSONForEach(elem, exprElement.Obj()) {
-            out.push_back(Expression::parseOperand(elem, vps));
+            out.push_back(Expression::parseOperand(expCtx, elem, vps));
         }
-    } else {  // assume it's an atomic operand
-        out.push_back(Expression::parseOperand(exprElement, vps));
+    } else {  // Assume it's an operand that accepts a single argument.
+        out.push_back(Expression::parseOperand(expCtx, exprElement, vps));
     }
 
     return out;
 }
 
-intrusive_ptr<Expression> Expression::parseOperand(BSONElement exprElement,
+intrusive_ptr<Expression> Expression::parseOperand(ExpressionContext* const expCtx,
+                                                   BSONElement exprElement,
                                                    const VariablesParseState& vps) {
     BSONType type = exprElement.type();
 
     if (type == String && exprElement.valuestr()[0] == '$') {
         /* if we got here, this is a field path expression */
-        return ExpressionFieldPath::parse(exprElement.str(), vps);
+        return ExpressionFieldPath::parse(expCtx, exprElement.str(), vps);
     } else if (type == Object) {
-        ObjectCtx oCtx(ObjectCtx::DOCUMENT_OK);
-        return Expression::parseObject(exprElement.Obj(), &oCtx, vps);
+        return Expression::parseObject(expCtx, exprElement.Obj(), vps);
     } else if (type == Array) {
-        return ExpressionArray::parse(exprElement, vps);
+        return ExpressionArray::parse(expCtx, exprElement, vps);
     } else {
-        return ExpressionConstant::parse(exprElement, vps);
+        return ExpressionConstant::parse(expCtx, exprElement, vps);
     }
 }
 
+bool Expression::isExpressionName(StringData name) {
+    return parserMap.find(name) != parserMap.end();
+}
+
+/* ------------------------- Register Date Expressions ----------------------------- */
+
+REGISTER_EXPRESSION(dayOfMonth, ExpressionDayOfMonth::parse);
+REGISTER_EXPRESSION(dayOfWeek, ExpressionDayOfWeek::parse);
+REGISTER_EXPRESSION(dayOfYear, ExpressionDayOfYear::parse);
+REGISTER_EXPRESSION(hour, ExpressionHour::parse);
+REGISTER_EXPRESSION(isoDayOfWeek, ExpressionIsoDayOfWeek::parse);
+REGISTER_EXPRESSION(isoWeek, ExpressionIsoWeek::parse);
+REGISTER_EXPRESSION(isoWeekYear, ExpressionIsoWeekYear::parse);
+REGISTER_EXPRESSION(millisecond, ExpressionMillisecond::parse);
+REGISTER_EXPRESSION(minute, ExpressionMinute::parse);
+REGISTER_EXPRESSION(month, ExpressionMonth::parse);
+REGISTER_EXPRESSION(second, ExpressionSecond::parse);
+REGISTER_EXPRESSION(week, ExpressionWeek::parse);
+REGISTER_EXPRESSION(year, ExpressionYear::parse);
 
 /* ----------------------- ExpressionAbs ---------------------------- */
 
@@ -363,6 +215,8 @@ Value ExpressionAbs::evaluateNumericArg(const Value& numericArg) const {
     BSONType type = numericArg.getType();
     if (type == NumberDouble) {
         return Value(std::abs(numericArg.getDouble()));
+    } else if (type == NumberDecimal) {
+        return Value(numericArg.getDecimal().toAbs());
     } else {
         long long num = numericArg.getLong();
         uassert(28680,
@@ -380,56 +234,78 @@ const char* ExpressionAbs::getOpName() const {
 
 /* ------------------------- ExpressionAdd ----------------------------- */
 
-Value ExpressionAdd::evaluateInternal(Variables* vars) const {
-    /*
-      We'll try to return the narrowest possible result value.  To do that
-      without creating intermediate Values, do the arithmetic for double
-      and integral types in parallel, tracking the current narrowest
-      type.
-     */
-    double doubleTotal = 0;
-    long long longTotal = 0;
+Value ExpressionAdd::evaluate(const Document& root, Variables* variables) const {
+    // We'll try to return the narrowest possible result value while avoiding overflow, loss
+    // of precision due to intermediate rounding or implicit use of decimal types. To do that,
+    // compute a compensated sum for non-decimal values and a separate decimal sum for decimal
+    // values, and track the current narrowest type.
+    DoubleDoubleSummation nonDecimalTotal;
+    Decimal128 decimalTotal;
     BSONType totalType = NumberInt;
     bool haveDate = false;
 
-    const size_t n = vpOperand.size();
+    const size_t n = _children.size();
     for (size_t i = 0; i < n; ++i) {
-        Value val = vpOperand[i]->evaluateInternal(vars);
+        Value val = _children[i]->evaluate(root, variables);
 
-        if (val.numeric()) {
-            totalType = Value::getWidestNumeric(totalType, val.getType());
-
-            doubleTotal += val.coerceToDouble();
-            longTotal += val.coerceToLong();
-        } else if (val.getType() == Date) {
-            uassert(16612, "only one Date allowed in an $add expression", !haveDate);
-            haveDate = true;
-
-            // We don't manipulate totalType here.
-
-            longTotal += val.getDate();
-            doubleTotal += val.getDate();
-        } else if (val.nullish()) {
-            return Value(BSONNULL);
-        } else {
-            uasserted(16554,
-                      str::stream() << "$add only supports numeric or date types, not "
-                                    << typeName(val.getType()));
+        switch (val.getType()) {
+            case NumberDecimal:
+                decimalTotal = decimalTotal.add(val.getDecimal());
+                totalType = NumberDecimal;
+                break;
+            case NumberDouble:
+                nonDecimalTotal.addDouble(val.getDouble());
+                if (totalType != NumberDecimal)
+                    totalType = NumberDouble;
+                break;
+            case NumberLong:
+                nonDecimalTotal.addLong(val.getLong());
+                if (totalType == NumberInt)
+                    totalType = NumberLong;
+                break;
+            case NumberInt:
+                nonDecimalTotal.addDouble(val.getInt());
+                break;
+            case Date:
+                uassert(16612, "only one date allowed in an $add expression", !haveDate);
+                haveDate = true;
+                nonDecimalTotal.addLong(val.getDate().toMillisSinceEpoch());
+                break;
+            default:
+                uassert(16554,
+                        str::stream() << "$add only supports numeric or date types, not "
+                                      << typeName(val.getType()),
+                        val.nullish());
+                return Value(BSONNULL);
         }
     }
 
     if (haveDate) {
-        if (totalType == NumberDouble)
-            longTotal = static_cast<long long>(doubleTotal);
+        int64_t longTotal;
+        if (totalType == NumberDecimal) {
+            longTotal = decimalTotal.add(nonDecimalTotal.getDecimal()).toLong();
+        } else {
+            uassert(ErrorCodes::Overflow, "date overflow in $add", nonDecimalTotal.fitsLong());
+            longTotal = nonDecimalTotal.getLong();
+        }
         return Value(Date_t::fromMillisSinceEpoch(longTotal));
-    } else if (totalType == NumberLong) {
-        return Value(longTotal);
-    } else if (totalType == NumberDouble) {
-        return Value(doubleTotal);
-    } else if (totalType == NumberInt) {
-        return Value::createIntOrLong(longTotal);
-    } else {
-        massert(16417, "$add resulted in a non-numeric type", false);
+    }
+    switch (totalType) {
+        case NumberDecimal:
+            return Value(decimalTotal.add(nonDecimalTotal.getDecimal()));
+        case NumberLong:
+            dassert(nonDecimalTotal.isInteger());
+            if (nonDecimalTotal.fitsLong())
+                return Value(nonDecimalTotal.getLong());
+        // Fallthrough.
+        case NumberInt:
+            if (nonDecimalTotal.fitsLong())
+                return Value::createIntOrLong(nonDecimalTotal.getLong());
+        // Fallthrough.
+        case NumberDouble:
+            return Value(nonDecimalTotal.getDouble());
+        default:
+            massert(16417, "$add resulted in a non-numeric type", false);
     }
 }
 
@@ -440,12 +316,12 @@ const char* ExpressionAdd::getOpName() const {
 
 /* ------------------------- ExpressionAllElementsTrue -------------------------- */
 
-Value ExpressionAllElementsTrue::evaluateInternal(Variables* vars) const {
-    const Value arr = vpOperand[0]->evaluateInternal(vars);
+Value ExpressionAllElementsTrue::evaluate(const Document& root, Variables* variables) const {
+    const Value arr = _children[0]->evaluate(root, variables);
     uassert(17040,
             str::stream() << getOpName() << "'s argument must be an array, but is "
                           << typeName(arr.getType()),
-            arr.getType() == Array);
+            arr.isArray());
     const vector<Value>& array = arr.getArray();
     for (vector<Value>::const_iterator it = array.begin(); it != array.end(); ++it) {
         if (!it->coerceToBool()) {
@@ -476,10 +352,10 @@ intrusive_ptr<Expression> ExpressionAnd::optimize() {
       promised by ExpressionNary::optimize(),) then there's nothing
       we can do.
     */
-    const size_t n = pAnd->vpOperand.size();
+    const size_t n = pAnd->_children.size();
     // ExpressionNary::optimize() generates an ExpressionConstant for {$and:[]}.
     verify(n > 0);
-    intrusive_ptr<Expression> pLast(pAnd->vpOperand[n - 1]);
+    intrusive_ptr<Expression> pLast(pAnd->_children[n - 1]);
     const ExpressionConstant* pConst = dynamic_cast<ExpressionConstant*>(pLast.get());
     if (!pConst)
         return pE;
@@ -490,7 +366,8 @@ intrusive_ptr<Expression> ExpressionAnd::optimize() {
      */
     bool last = pConst->getValue().coerceToBool();
     if (!last) {
-        intrusive_ptr<ExpressionConstant> pFinal(ExpressionConstant::create(Value(false)));
+        intrusive_ptr<ExpressionConstant> pFinal(
+            ExpressionConstant::create(getExpressionContext(), Value(false)));
         return pFinal;
     }
 
@@ -501,7 +378,8 @@ intrusive_ptr<Expression> ExpressionAnd::optimize() {
       the result will be a boolean.
      */
     if (n == 2) {
-        intrusive_ptr<Expression> pFinal(ExpressionCoerceToBool::create(pAnd->vpOperand[0]));
+        intrusive_ptr<Expression> pFinal(
+            ExpressionCoerceToBool::create(getExpressionContext(), std::move(pAnd->_children[0])));
         return pFinal;
     }
 
@@ -512,14 +390,14 @@ intrusive_ptr<Expression> ExpressionAnd::optimize() {
       Note that because of any implicit conversions, we may need to
       apply an implicit boolean conversion.
     */
-    pAnd->vpOperand.resize(n - 1);
+    pAnd->_children.resize(n - 1);
     return pE;
 }
 
-Value ExpressionAnd::evaluateInternal(Variables* vars) const {
-    const size_t n = vpOperand.size();
+Value ExpressionAnd::evaluate(const Document& root, Variables* variables) const {
+    const size_t n = _children.size();
     for (size_t i = 0; i < n; ++i) {
-        Value pValue(vpOperand[i]->evaluateInternal(vars));
+        Value pValue(_children[i]->evaluate(root, variables));
         if (!pValue.coerceToBool())
             return Value(false);
     }
@@ -534,12 +412,12 @@ const char* ExpressionAnd::getOpName() const {
 
 /* ------------------------- ExpressionAnyElementTrue -------------------------- */
 
-Value ExpressionAnyElementTrue::evaluateInternal(Variables* vars) const {
-    const Value arr = vpOperand[0]->evaluateInternal(vars);
+Value ExpressionAnyElementTrue::evaluate(const Document& root, Variables* variables) const {
+    const Value arr = _children[0]->evaluate(root, variables);
     uassert(17041,
             str::stream() << getOpName() << "'s argument must be an array, but is "
                           << typeName(arr.getType()),
-            arr.getType() == Array);
+            arr.isArray());
     const vector<Value>& array = arr.getArray();
     for (vector<Value>::const_iterator it = array.begin(); it != array.end(); ++it) {
         if (it->coerceToBool()) {
@@ -556,11 +434,11 @@ const char* ExpressionAnyElementTrue::getOpName() const {
 
 /* ---------------------- ExpressionArray --------------------------- */
 
-Value ExpressionArray::evaluateInternal(Variables* vars) const {
+Value ExpressionArray::evaluate(const Document& root, Variables* variables) const {
     vector<Value> values;
-    values.reserve(vpOperand.size());
-    for (auto&& expr : vpOperand) {
-        Value elemVal = expr->evaluateInternal(vars);
+    values.reserve(_children.size());
+    for (auto&& expr : _children) {
+        Value elemVal = expr->evaluate(root, variables);
         values.push_back(elemVal.missing() ? Value(BSONNULL) : std::move(elemVal));
     }
     return Value(std::move(values));
@@ -568,11 +446,29 @@ Value ExpressionArray::evaluateInternal(Variables* vars) const {
 
 Value ExpressionArray::serialize(bool explain) const {
     vector<Value> expressions;
-    expressions.reserve(vpOperand.size());
-    for (auto&& expr : vpOperand) {
+    expressions.reserve(_children.size());
+    for (auto&& expr : _children) {
         expressions.push_back(expr->serialize(explain));
     }
     return Value(std::move(expressions));
+}
+
+intrusive_ptr<Expression> ExpressionArray::optimize() {
+    bool allValuesConstant = true;
+
+    for (auto&& expr : _children) {
+        expr = expr->optimize();
+        if (!dynamic_cast<ExpressionConstant*>(expr.get())) {
+            allValuesConstant = false;
+        }
+    }
+
+    // If all values in ExpressionArray are constant evaluate to ExpressionConstant.
+    if (allValuesConstant) {
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document(), &(getExpressionContext()->variables)));
+    }
+    return this;
 }
 
 const char* ExpressionArray::getOpName() const {
@@ -582,24 +478,24 @@ const char* ExpressionArray::getOpName() const {
 
 /* ------------------------- ExpressionArrayElemAt -------------------------- */
 
-Value ExpressionArrayElemAt::evaluateInternal(Variables* vars) const {
-    const Value array = vpOperand[0]->evaluateInternal(vars);
-    const Value indexArg = vpOperand[1]->evaluateInternal(vars);
-
+namespace {
+Value arrayElemAt(const ExpressionNary* self, Value array, Value indexArg) {
     if (array.nullish() || indexArg.nullish()) {
         return Value(BSONNULL);
     }
 
+    size_t arity = self->getOperandList().size();
     uassert(28689,
-            str::stream() << getOpName() << "'s first argument must be an array, but is "
-                          << typeName(array.getType()),
-            array.getType() == Array);
+            str::stream() << self->getOpName() << "'s "
+                          << (arity == 1 ? "argument" : "first argument")
+                          << " must be an array, but is " << typeName(array.getType()),
+            array.isArray());
     uassert(28690,
-            str::stream() << getOpName() << "'s second argument must be a numeric value,"
+            str::stream() << self->getOpName() << "'s second argument must be a numeric value,"
                           << " but is " << typeName(indexArg.getType()),
             indexArg.numeric());
     uassert(28691,
-            str::stream() << getOpName() << "'s second argument must be representable as"
+            str::stream() << self->getOpName() << "'s second argument must be representable as"
                           << " a 32-bit integer: " << indexArg.coerceToDouble(),
             indexArg.integral());
 
@@ -614,18 +510,221 @@ Value ExpressionArrayElemAt::evaluateInternal(Variables* vars) const {
     const size_t index = static_cast<size_t>(i);
     return array[index];
 }
+}  // namespace
+
+Value ExpressionArrayElemAt::evaluate(const Document& root, Variables* variables) const {
+    const Value array = _children[0]->evaluate(root, variables);
+    const Value indexArg = _children[1]->evaluate(root, variables);
+    return arrayElemAt(this, array, indexArg);
+}
 
 REGISTER_EXPRESSION(arrayElemAt, ExpressionArrayElemAt::parse);
 const char* ExpressionArrayElemAt::getOpName() const {
     return "$arrayElemAt";
 }
 
+/* ------------------------- ExpressionFirst -------------------------- */
+
+Value ExpressionFirst::evaluate(const Document& root, Variables* variables) const {
+    const Value array = _children[0]->evaluate(root, variables);
+    return arrayElemAt(this, array, Value(0));
+}
+
+REGISTER_EXPRESSION(first, ExpressionFirst::parse);
+
+const char* ExpressionFirst::getOpName() const {
+    return "$first";
+}
+
+/* ------------------------- ExpressionLast -------------------------- */
+
+Value ExpressionLast::evaluate(const Document& root, Variables* variables) const {
+    const Value array = _children[0]->evaluate(root, variables);
+    return arrayElemAt(this, array, Value(-1));
+}
+
+REGISTER_EXPRESSION(last, ExpressionLast::parse);
+
+const char* ExpressionLast::getOpName() const {
+    return "$last";
+}
+
+/* ------------------------- ExpressionObjectToArray -------------------------- */
+
+Value ExpressionObjectToArray::evaluate(const Document& root, Variables* variables) const {
+    const Value targetVal = _children[0]->evaluate(root, variables);
+
+    if (targetVal.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40390,
+            str::stream() << "$objectToArray requires a document input, found: "
+                          << typeName(targetVal.getType()),
+            (targetVal.getType() == BSONType::Object));
+
+    vector<Value> output;
+
+    FieldIterator iter = targetVal.getDocument().fieldIterator();
+    while (iter.more()) {
+        Document::FieldPair pair = iter.next();
+        MutableDocument keyvalue;
+        keyvalue.addField("k", Value(pair.first));
+        keyvalue.addField("v", pair.second);
+        output.push_back(keyvalue.freezeToValue());
+    }
+
+    return Value(output);
+}
+
+REGISTER_EXPRESSION(objectToArray, ExpressionObjectToArray::parse);
+const char* ExpressionObjectToArray::getOpName() const {
+    return "$objectToArray";
+}
+
+/* ------------------------- ExpressionArrayToObject -------------------------- */
+Value ExpressionArrayToObject::evaluate(const Document& root, Variables* variables) const {
+    const Value input = _children[0]->evaluate(root, variables);
+    if (input.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40386,
+            str::stream() << "$arrayToObject requires an array input, found: "
+                          << typeName(input.getType()),
+            input.isArray());
+
+    MutableDocument output;
+    const vector<Value>& array = input.getArray();
+    if (array.empty()) {
+        return output.freezeToValue();
+    }
+
+    // There are two accepted input formats in an array: [ [key, val] ] or [ {k:key, v:val} ]. The
+    // first array element determines the format for the rest of the array. Mixing input formats is
+    // not allowed.
+    bool inputArrayFormat;
+    if (array[0].isArray()) {
+        inputArrayFormat = true;
+    } else if (array[0].getType() == BSONType::Object) {
+        inputArrayFormat = false;
+    } else {
+        uasserted(40398,
+                  str::stream() << "Unrecognised input type format for $arrayToObject: "
+                                << typeName(array[0].getType()));
+    }
+
+    for (auto&& elem : array) {
+        if (inputArrayFormat == true) {
+            uassert(
+                40396,
+                str::stream() << "$arrayToObject requires a consistent input format. Elements must"
+                                 "all be arrays or all be objects. Array was detected, now found: "
+                              << typeName(elem.getType()),
+                elem.isArray());
+
+            const vector<Value>& valArray = elem.getArray();
+
+            uassert(40397,
+                    str::stream() << "$arrayToObject requires an array of size 2 arrays,"
+                                     "found array of size: "
+                                  << valArray.size(),
+                    (valArray.size() == 2));
+
+            uassert(40395,
+                    str::stream() << "$arrayToObject requires an array of key-value pairs, where "
+                                     "the key must be of type string. Found key type: "
+                                  << typeName(valArray[0].getType()),
+                    (valArray[0].getType() == BSONType::String));
+
+            auto keyName = valArray[0].getStringData();
+
+            uassert(4940400,
+                    "Key field cannot contain an embedded null byte",
+                    keyName.find('\0') == std::string::npos);
+
+            output[keyName] = valArray[1];
+
+        } else {
+            uassert(
+                40391,
+                str::stream() << "$arrayToObject requires a consistent input format. Elements must"
+                                 "all be arrays or all be objects. Object was detected, now found: "
+                              << typeName(elem.getType()),
+                (elem.getType() == BSONType::Object));
+
+            uassert(40392,
+                    str::stream() << "$arrayToObject requires an object keys of 'k' and 'v'. "
+                                     "Found incorrect number of keys:"
+                                  << elem.getDocument().computeSize(),
+                    (elem.getDocument().computeSize() == 2));
+
+            Value key = elem.getDocument().getField("k");
+            Value value = elem.getDocument().getField("v");
+
+            uassert(40393,
+                    str::stream() << "$arrayToObject requires an object with keys 'k' and 'v'. "
+                                     "Missing either or both keys from: "
+                                  << elem.toString(),
+                    (!key.missing() && !value.missing()));
+
+            uassert(
+                40394,
+                str::stream() << "$arrayToObject requires an object with keys 'k' and 'v', where "
+                                 "the value of 'k' must be of type string. Found type: "
+                              << typeName(key.getType()),
+                (key.getType() == BSONType::String));
+
+            auto keyName = key.getStringData();
+
+            uassert(4940401,
+                    "Key field cannot contain an embedded null byte",
+                    keyName.find('\0') == std::string::npos);
+
+            output[keyName] = value;
+        }
+    }
+
+    return output.freezeToValue();
+}
+
+REGISTER_EXPRESSION(arrayToObject, ExpressionArrayToObject::parse);
+const char* ExpressionArrayToObject::getOpName() const {
+    return "$arrayToObject";
+}
+
+/* ------------------------- ExpressionBsonSize -------------------------- */
+
+REGISTER_EXPRESSION(bsonSize, ExpressionBsonSize::parse);
+
+Value ExpressionBsonSize::evaluate(const Document& root, Variables* variables) const {
+    Value arg = _children[0]->evaluate(root, variables);
+
+    if (arg.nullish())
+        return Value(BSONNULL);
+
+    uassert(31393,
+            str::stream() << "$bsonSize requires a document input, found: "
+                          << typeName(arg.getType()),
+            arg.getType() == BSONType::Object);
+
+    return Value(arg.getDocument().toBson().objsize());
+}
+
 /* ------------------------- ExpressionCeil -------------------------- */
 
 Value ExpressionCeil::evaluateNumericArg(const Value& numericArg) const {
     // There's no point in taking the ceiling of integers or longs, it will have no effect.
-    return numericArg.getType() == NumberDouble ? Value(std::ceil(numericArg.getDouble()))
-                                                : numericArg;
+    switch (numericArg.getType()) {
+        case NumberDouble:
+            return Value(std::ceil(numericArg.getDouble()));
+        case NumberDecimal:
+            // Round toward the nearest decimal with a zero exponent in the positive direction.
+            return Value(numericArg.getDecimal().quantize(Decimal128::kNormalizedZero,
+                                                          Decimal128::kRoundTowardPositive));
+        default:
+            return numericArg;
+    }
 }
 
 REGISTER_EXPRESSION(ceil, ExpressionCeil::parse);
@@ -636,13 +735,13 @@ const char* ExpressionCeil::getOpName() const {
 /* -------------------- ExpressionCoerceToBool ------------------------- */
 
 intrusive_ptr<ExpressionCoerceToBool> ExpressionCoerceToBool::create(
-    const intrusive_ptr<Expression>& pExpression) {
-    intrusive_ptr<ExpressionCoerceToBool> pNew(new ExpressionCoerceToBool(pExpression));
-    return pNew;
+    ExpressionContext* const expCtx, intrusive_ptr<Expression> pExpression) {
+    return new ExpressionCoerceToBool(expCtx, std::move(pExpression));
 }
 
-ExpressionCoerceToBool::ExpressionCoerceToBool(const intrusive_ptr<Expression>& pTheExpression)
-    : Expression(), pExpression(pTheExpression) {}
+ExpressionCoerceToBool::ExpressionCoerceToBool(ExpressionContext* const expCtx,
+                                               intrusive_ptr<Expression> pExpression)
+    : Expression(expCtx, {std::move(pExpression)}), pExpression(_children[0]) {}
 
 intrusive_ptr<Expression> ExpressionCoerceToBool::optimize() {
     /* optimize the operand */
@@ -658,12 +757,12 @@ intrusive_ptr<Expression> ExpressionCoerceToBool::optimize() {
     return intrusive_ptr<Expression>(this);
 }
 
-void ExpressionCoerceToBool::addDependencies(DepsTracker* deps, vector<string>* path) const {
+void ExpressionCoerceToBool::_doAddDependencies(DepsTracker* deps) const {
     pExpression->addDependencies(deps);
 }
 
-Value ExpressionCoerceToBool::evaluateInternal(Variables* vars) const {
-    Value pResult(pExpression->evaluateInternal(vars));
+Value ExpressionCoerceToBool::evaluate(const Document& root, Variables* variables) const {
+    Value pResult(pExpression->evaluate(root, variables));
     bool b = pResult.coerceToBool();
     if (b)
         return Value(true);
@@ -679,52 +778,46 @@ Value ExpressionCoerceToBool::serialize(bool explain) const {
 
 /* ----------------------- ExpressionCompare --------------------------- */
 
-REGISTER_EXPRESSION(cmp,
-                    stdx::bind(ExpressionCompare::parse,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2,
-                               ExpressionCompare::CMP));
-REGISTER_EXPRESSION(eq,
-                    stdx::bind(ExpressionCompare::parse,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2,
-                               ExpressionCompare::EQ));
-REGISTER_EXPRESSION(gt,
-                    stdx::bind(ExpressionCompare::parse,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2,
-                               ExpressionCompare::GT));
-REGISTER_EXPRESSION(gte,
-                    stdx::bind(ExpressionCompare::parse,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2,
-                               ExpressionCompare::GTE));
-REGISTER_EXPRESSION(lt,
-                    stdx::bind(ExpressionCompare::parse,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2,
-                               ExpressionCompare::LT));
-REGISTER_EXPRESSION(lte,
-                    stdx::bind(ExpressionCompare::parse,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2,
-                               ExpressionCompare::LTE));
-REGISTER_EXPRESSION(ne,
-                    stdx::bind(ExpressionCompare::parse,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2,
-                               ExpressionCompare::NE));
-intrusive_ptr<Expression> ExpressionCompare::parse(BSONElement bsonExpr,
+namespace {
+struct BoundOp {
+    ExpressionCompare::CmpOp op;
+
+    auto operator()(ExpressionContext* const expCtx,
+                    BSONElement bsonExpr,
+                    const VariablesParseState& vps) const {
+        return ExpressionCompare::parse(expCtx, std::move(bsonExpr), vps, op);
+    }
+};
+}  // namespace
+
+REGISTER_EXPRESSION(cmp, BoundOp{ExpressionCompare::CMP});
+REGISTER_EXPRESSION(eq, BoundOp{ExpressionCompare::EQ});
+REGISTER_EXPRESSION(gt, BoundOp{ExpressionCompare::GT});
+REGISTER_EXPRESSION(gte, BoundOp{ExpressionCompare::GTE});
+REGISTER_EXPRESSION(lt, BoundOp{ExpressionCompare::LT});
+REGISTER_EXPRESSION(lte, BoundOp{ExpressionCompare::LTE});
+REGISTER_EXPRESSION(ne, BoundOp{ExpressionCompare::NE});
+
+intrusive_ptr<Expression> ExpressionCompare::parse(ExpressionContext* const expCtx,
+                                                   BSONElement bsonExpr,
                                                    const VariablesParseState& vps,
                                                    CmpOp op) {
-    intrusive_ptr<ExpressionCompare> expr = new ExpressionCompare(op);
-    ExpressionVector args = parseArguments(bsonExpr, vps);
+    intrusive_ptr<ExpressionCompare> expr = new ExpressionCompare(expCtx, op);
+    ExpressionVector args = parseArguments(expCtx, bsonExpr, vps);
     expr->validateArguments(args);
-    expr->vpOperand = args;
+    expr->_children = args;
     return expr;
 }
 
-ExpressionCompare::ExpressionCompare(CmpOp theCmpOp) : cmpOp(theCmpOp) {}
+boost::intrusive_ptr<ExpressionCompare> ExpressionCompare::create(
+    ExpressionContext* const expCtx,
+    CmpOp cmpOp,
+    const boost::intrusive_ptr<Expression>& exprLeft,
+    const boost::intrusive_ptr<Expression>& exprRight) {
+    boost::intrusive_ptr<ExpressionCompare> expr = new ExpressionCompare(expCtx, cmpOp);
+    expr->_children = {exprLeft, exprRight};
+    return expr;
+}
 
 namespace {
 // Lookup table for truth value returns
@@ -745,13 +838,13 @@ static const CmpLookup cmpLookup[7] = {
     // CMP is special. Only name is used.
     /* CMP */ {{false, false, false}, ExpressionCompare::CMP, "$cmp"},
 };
-}
+}  // namespace
 
-Value ExpressionCompare::evaluateInternal(Variables* vars) const {
-    Value pLeft(vpOperand[0]->evaluateInternal(vars));
-    Value pRight(vpOperand[1]->evaluateInternal(vars));
+Value ExpressionCompare::evaluate(const Document& root, Variables* variables) const {
+    Value pLeft(_children[0]->evaluate(root, variables));
+    Value pRight(_children[1]->evaluate(root, variables));
 
-    int cmp = Value::compare(pLeft, pRight);
+    int cmp = getExpressionContext()->getValueComparator().compare(pLeft, pRight);
 
     // Make cmp one of 1, 0, or -1.
     if (cmp == 0) {
@@ -775,12 +868,12 @@ const char* ExpressionCompare::getOpName() const {
 
 /* ------------------------- ExpressionConcat ----------------------------- */
 
-Value ExpressionConcat::evaluateInternal(Variables* vars) const {
-    const size_t n = vpOperand.size();
+Value ExpressionConcat::evaluate(const Document& root, Variables* variables) const {
+    const size_t n = _children.size();
 
     StringBuilder result;
     for (size_t i = 0; i < n; ++i) {
-        Value val = vpOperand[i]->evaluateInternal(vars);
+        Value val = _children[i]->evaluate(root, variables);
         if (val.nullish())
             return Value(BSONNULL);
 
@@ -801,12 +894,12 @@ const char* ExpressionConcat::getOpName() const {
 
 /* ------------------------- ExpressionConcatArrays ----------------------------- */
 
-Value ExpressionConcatArrays::evaluateInternal(Variables* vars) const {
-    const size_t n = vpOperand.size();
+Value ExpressionConcatArrays::evaluate(const Document& root, Variables* variables) const {
+    const size_t n = _children.size();
     vector<Value> values;
 
     for (size_t i = 0; i < n; ++i) {
-        Value val = vpOperand[i]->evaluateInternal(vars);
+        Value val = _children[i]->evaluate(root, variables);
         if (val.nullish()) {
             return Value(BSONNULL);
         }
@@ -814,7 +907,7 @@ Value ExpressionConcatArrays::evaluateInternal(Variables* vars) const {
         uassert(28664,
                 str::stream() << "$concatArrays only supports arrays, not "
                               << typeName(val.getType()),
-                val.getType() == Array);
+                val.isArray());
 
         const auto& subValues = val.getArray();
         values.insert(values.end(), subValues.begin(), subValues.end());
@@ -829,38 +922,40 @@ const char* ExpressionConcatArrays::getOpName() const {
 
 /* ----------------------- ExpressionCond ------------------------------ */
 
-Value ExpressionCond::evaluateInternal(Variables* vars) const {
-    Value pCond(vpOperand[0]->evaluateInternal(vars));
+Value ExpressionCond::evaluate(const Document& root, Variables* variables) const {
+    Value pCond(_children[0]->evaluate(root, variables));
     int idx = pCond.coerceToBool() ? 1 : 2;
-    return vpOperand[idx]->evaluateInternal(vars);
+    return _children[idx]->evaluate(root, variables);
 }
 
-intrusive_ptr<Expression> ExpressionCond::parse(BSONElement expr, const VariablesParseState& vps) {
+intrusive_ptr<Expression> ExpressionCond::parse(ExpressionContext* const expCtx,
+                                                BSONElement expr,
+                                                const VariablesParseState& vps) {
     if (expr.type() != Object) {
-        return Base::parse(expr, vps);
+        return Base::parse(expCtx, expr, vps);
     }
-    verify(str::equals(expr.fieldName(), "$cond"));
+    verify(expr.fieldNameStringData() == "$cond");
 
-    intrusive_ptr<ExpressionCond> ret = new ExpressionCond();
-    ret->vpOperand.resize(3);
+    intrusive_ptr<ExpressionCond> ret = new ExpressionCond(expCtx);
+    ret->_children.resize(3);
 
     const BSONObj args = expr.embeddedObject();
     BSONForEach(arg, args) {
-        if (str::equals(arg.fieldName(), "if")) {
-            ret->vpOperand[0] = parseOperand(arg, vps);
-        } else if (str::equals(arg.fieldName(), "then")) {
-            ret->vpOperand[1] = parseOperand(arg, vps);
-        } else if (str::equals(arg.fieldName(), "else")) {
-            ret->vpOperand[2] = parseOperand(arg, vps);
+        if (arg.fieldNameStringData() == "if") {
+            ret->_children[0] = parseOperand(expCtx, arg, vps);
+        } else if (arg.fieldNameStringData() == "then") {
+            ret->_children[1] = parseOperand(expCtx, arg, vps);
+        } else if (arg.fieldNameStringData() == "else") {
+            ret->_children[2] = parseOperand(expCtx, arg, vps);
         } else {
             uasserted(17083,
                       str::stream() << "Unrecognized parameter to $cond: " << arg.fieldName());
         }
     }
 
-    uassert(17080, "Missing 'if' parameter to $cond", ret->vpOperand[0]);
-    uassert(17081, "Missing 'then' parameter to $cond", ret->vpOperand[1]);
-    uassert(17082, "Missing 'else' parameter to $cond", ret->vpOperand[2]);
+    uassert(17080, "Missing 'if' parameter to $cond", ret->_children[0]);
+    uassert(17081, "Missing 'then' parameter to $cond", ret->_children[1]);
+    uassert(17082, "Missing 'else' parameter to $cond", ret->_children[2]);
 
     return ret;
 }
@@ -872,18 +967,21 @@ const char* ExpressionCond::getOpName() const {
 
 /* ---------------------- ExpressionConstant --------------------------- */
 
-intrusive_ptr<Expression> ExpressionConstant::parse(BSONElement exprElement,
+intrusive_ptr<Expression> ExpressionConstant::parse(ExpressionContext* const expCtx,
+                                                    BSONElement exprElement,
                                                     const VariablesParseState& vps) {
-    return new ExpressionConstant(Value(exprElement));
+    return new ExpressionConstant(expCtx, Value(exprElement));
 }
 
 
-intrusive_ptr<ExpressionConstant> ExpressionConstant::create(const Value& pValue) {
-    intrusive_ptr<ExpressionConstant> pEC(new ExpressionConstant(pValue));
+intrusive_ptr<ExpressionConstant> ExpressionConstant::create(ExpressionContext* const expCtx,
+                                                             const Value& value) {
+    intrusive_ptr<ExpressionConstant> pEC(new ExpressionConstant(expCtx, value));
     return pEC;
 }
 
-ExpressionConstant::ExpressionConstant(const Value& pTheValue) : pValue(pTheValue) {}
+ExpressionConstant::ExpressionConstant(ExpressionContext* const expCtx, const Value& value)
+    : Expression(expCtx), _value(value) {}
 
 
 intrusive_ptr<Expression> ExpressionConstant::optimize() {
@@ -891,16 +989,16 @@ intrusive_ptr<Expression> ExpressionConstant::optimize() {
     return intrusive_ptr<Expression>(this);
 }
 
-void ExpressionConstant::addDependencies(DepsTracker* deps, vector<string>* path) const {
+void ExpressionConstant::_doAddDependencies(DepsTracker* deps) const {
     /* nothing to do */
 }
 
-Value ExpressionConstant::evaluateInternal(Variables* vars) const {
-    return pValue;
+Value ExpressionConstant::evaluate(const Document& root, Variables* variables) const {
+    return _value;
 }
 
 Value ExpressionConstant::serialize(bool explain) const {
-    return serializeConstant(pValue);
+    return serializeConstant(_value);
 }
 
 REGISTER_EXPRESSION(const, ExpressionConstant::parse);
@@ -909,23 +1007,728 @@ const char* ExpressionConstant::getOpName() const {
     return "$const";
 }
 
+/* ---------------------- ExpressionDateFromParts ----------------------- */
+
+/* Helper functions also shared with ExpressionDateToParts */
+
+namespace {
+
+boost::optional<TimeZone> makeTimeZone(const TimeZoneDatabase* tzdb,
+                                       const Document& root,
+                                       const Expression* timeZone,
+                                       Variables* variables) {
+    invariant(tzdb);
+
+    if (!timeZone) {
+        return mongo::TimeZoneDatabase::utcZone();
+    }
+
+    auto timeZoneId = timeZone->evaluate(root, variables);
+
+    if (timeZoneId.nullish()) {
+        return boost::none;
+    }
+
+    uassert(40517,
+            str::stream() << "timezone must evaluate to a string, found "
+                          << typeName(timeZoneId.getType()),
+            timeZoneId.getType() == BSONType::String);
+
+    return tzdb->getTimeZone(timeZoneId.getString());
+}
+
+}  // namespace
+
+
+REGISTER_EXPRESSION(dateFromParts, ExpressionDateFromParts::parse);
+intrusive_ptr<Expression> ExpressionDateFromParts::parse(ExpressionContext* const expCtx,
+                                                         BSONElement expr,
+                                                         const VariablesParseState& vps) {
+
+    uassert(40519,
+            "$dateFromParts only supports an object as its argument",
+            expr.type() == BSONType::Object);
+
+    BSONElement yearElem;
+    BSONElement monthElem;
+    BSONElement dayElem;
+    BSONElement hourElem;
+    BSONElement minuteElem;
+    BSONElement secondElem;
+    BSONElement millisecondElem;
+    BSONElement isoWeekYearElem;
+    BSONElement isoWeekElem;
+    BSONElement isoDayOfWeekElem;
+    BSONElement timeZoneElem;
+
+    const BSONObj args = expr.embeddedObject();
+    for (auto&& arg : args) {
+        auto field = arg.fieldNameStringData();
+
+        if (field == "year"_sd) {
+            yearElem = arg;
+        } else if (field == "month"_sd) {
+            monthElem = arg;
+        } else if (field == "day"_sd) {
+            dayElem = arg;
+        } else if (field == "hour"_sd) {
+            hourElem = arg;
+        } else if (field == "minute"_sd) {
+            minuteElem = arg;
+        } else if (field == "second"_sd) {
+            secondElem = arg;
+        } else if (field == "millisecond"_sd) {
+            millisecondElem = arg;
+        } else if (field == "isoWeekYear"_sd) {
+            isoWeekYearElem = arg;
+        } else if (field == "isoWeek"_sd) {
+            isoWeekElem = arg;
+        } else if (field == "isoDayOfWeek"_sd) {
+            isoDayOfWeekElem = arg;
+        } else if (field == "timezone"_sd) {
+            timeZoneElem = arg;
+        } else {
+            uasserted(40518,
+                      str::stream()
+                          << "Unrecognized argument to $dateFromParts: " << arg.fieldName());
+        }
+    }
+
+    if (!yearElem && !isoWeekYearElem) {
+        uasserted(40516, "$dateFromParts requires either 'year' or 'isoWeekYear' to be present");
+    }
+
+    if (yearElem && (isoWeekYearElem || isoWeekElem || isoDayOfWeekElem)) {
+        uasserted(40489, "$dateFromParts does not allow mixing natural dates with ISO dates");
+    }
+
+    if (isoWeekYearElem && (yearElem || monthElem || dayElem)) {
+        uasserted(40525, "$dateFromParts does not allow mixing ISO dates with natural dates");
+    }
+
+    return new ExpressionDateFromParts(
+        expCtx,
+        yearElem ? parseOperand(expCtx, yearElem, vps) : nullptr,
+        monthElem ? parseOperand(expCtx, monthElem, vps) : nullptr,
+        dayElem ? parseOperand(expCtx, dayElem, vps) : nullptr,
+        hourElem ? parseOperand(expCtx, hourElem, vps) : nullptr,
+        minuteElem ? parseOperand(expCtx, minuteElem, vps) : nullptr,
+        secondElem ? parseOperand(expCtx, secondElem, vps) : nullptr,
+        millisecondElem ? parseOperand(expCtx, millisecondElem, vps) : nullptr,
+        isoWeekYearElem ? parseOperand(expCtx, isoWeekYearElem, vps) : nullptr,
+        isoWeekElem ? parseOperand(expCtx, isoWeekElem, vps) : nullptr,
+        isoDayOfWeekElem ? parseOperand(expCtx, isoDayOfWeekElem, vps) : nullptr,
+        timeZoneElem ? parseOperand(expCtx, timeZoneElem, vps) : nullptr);
+}
+
+ExpressionDateFromParts::ExpressionDateFromParts(ExpressionContext* const expCtx,
+                                                 intrusive_ptr<Expression> year,
+                                                 intrusive_ptr<Expression> month,
+                                                 intrusive_ptr<Expression> day,
+                                                 intrusive_ptr<Expression> hour,
+                                                 intrusive_ptr<Expression> minute,
+                                                 intrusive_ptr<Expression> second,
+                                                 intrusive_ptr<Expression> millisecond,
+                                                 intrusive_ptr<Expression> isoWeekYear,
+                                                 intrusive_ptr<Expression> isoWeek,
+                                                 intrusive_ptr<Expression> isoDayOfWeek,
+                                                 intrusive_ptr<Expression> timeZone)
+    : Expression(expCtx,
+                 {std::move(year),
+                  std::move(month),
+                  std::move(day),
+                  std::move(hour),
+                  std::move(minute),
+                  std::move(second),
+                  std::move(millisecond),
+                  std::move(isoWeekYear),
+                  std::move(isoWeek),
+                  std::move(isoDayOfWeek),
+                  std::move(timeZone)}),
+      _year(_children[0]),
+      _month(_children[1]),
+      _day(_children[2]),
+      _hour(_children[3]),
+      _minute(_children[4]),
+      _second(_children[5]),
+      _millisecond(_children[6]),
+      _isoWeekYear(_children[7]),
+      _isoWeek(_children[8]),
+      _isoDayOfWeek(_children[9]),
+      _timeZone(_children[10]) {}
+
+intrusive_ptr<Expression> ExpressionDateFromParts::optimize() {
+    if (_year) {
+        _year = _year->optimize();
+    }
+    if (_month) {
+        _month = _month->optimize();
+    }
+    if (_day) {
+        _day = _day->optimize();
+    }
+    if (_hour) {
+        _hour = _hour->optimize();
+    }
+    if (_minute) {
+        _minute = _minute->optimize();
+    }
+    if (_second) {
+        _second = _second->optimize();
+    }
+    if (_millisecond) {
+        _millisecond = _millisecond->optimize();
+    }
+    if (_isoWeekYear) {
+        _isoWeekYear = _isoWeekYear->optimize();
+    }
+    if (_isoWeek) {
+        _isoWeek = _isoWeek->optimize();
+    }
+    if (_isoDayOfWeek) {
+        _isoDayOfWeek = _isoDayOfWeek->optimize();
+    }
+    if (_timeZone) {
+        _timeZone = _timeZone->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant({_year,
+                                               _month,
+                                               _day,
+                                               _hour,
+                                               _minute,
+                                               _second,
+                                               _millisecond,
+                                               _isoWeekYear,
+                                               _isoWeek,
+                                               _isoDayOfWeek,
+                                               _timeZone})) {
+
+        // Everything is a constant, so we can turn into a constant.
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document{}, &(getExpressionContext()->variables)));
+    }
+
+    return this;
+}
+
+Value ExpressionDateFromParts::serialize(bool explain) const {
+    return Value(Document{
+        {"$dateFromParts",
+         Document{{"year", _year ? _year->serialize(explain) : Value()},
+                  {"month", _month ? _month->serialize(explain) : Value()},
+                  {"day", _day ? _day->serialize(explain) : Value()},
+                  {"hour", _hour ? _hour->serialize(explain) : Value()},
+                  {"minute", _minute ? _minute->serialize(explain) : Value()},
+                  {"second", _second ? _second->serialize(explain) : Value()},
+                  {"millisecond", _millisecond ? _millisecond->serialize(explain) : Value()},
+                  {"isoWeekYear", _isoWeekYear ? _isoWeekYear->serialize(explain) : Value()},
+                  {"isoWeek", _isoWeek ? _isoWeek->serialize(explain) : Value()},
+                  {"isoDayOfWeek", _isoDayOfWeek ? _isoDayOfWeek->serialize(explain) : Value()},
+                  {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()}}}});
+}
+
+bool ExpressionDateFromParts::evaluateNumberWithDefault(const Document& root,
+                                                        const Expression* field,
+                                                        StringData fieldName,
+                                                        long long defaultValue,
+                                                        long long* returnValue,
+                                                        Variables* variables) const {
+    if (!field) {
+        *returnValue = defaultValue;
+        return true;
+    }
+
+    auto fieldValue = field->evaluate(root, variables);
+
+    if (fieldValue.nullish()) {
+        return false;
+    }
+
+    uassert(40515,
+            str::stream() << "'" << fieldName << "' must evaluate to an integer, found "
+                          << typeName(fieldValue.getType()) << " with value "
+                          << fieldValue.toString(),
+            fieldValue.integral64Bit());
+
+    *returnValue = fieldValue.coerceToLong();
+
+    return true;
+}
+
+bool ExpressionDateFromParts::evaluateNumberWithDefaultAndBounds(const Document& root,
+                                                                 const Expression* field,
+                                                                 StringData fieldName,
+                                                                 long long defaultValue,
+                                                                 long long* returnValue,
+                                                                 Variables* variables) const {
+    bool result =
+        evaluateNumberWithDefault(root, field, fieldName, defaultValue, returnValue, variables);
+
+    uassert(
+        31034,
+        str::stream() << "'" << fieldName << "'"
+                      << " must evaluate to a value in the range [" << kMinValueForDatePart << ", "
+                      << kMaxValueForDatePart << "]; value " << *returnValue << " is not in range",
+        !result || (*returnValue >= kMinValueForDatePart && *returnValue <= kMaxValueForDatePart));
+
+    return result;
+}
+
+Value ExpressionDateFromParts::evaluate(const Document& root, Variables* variables) const {
+    long long hour, minute, second, millisecond;
+
+    if (!evaluateNumberWithDefaultAndBounds(root, _hour.get(), "hour"_sd, 0, &hour, variables) ||
+        !evaluateNumberWithDefaultAndBounds(
+            root, _minute.get(), "minute"_sd, 0, &minute, variables) ||
+        !evaluateNumberWithDefault(root, _second.get(), "second"_sd, 0, &second, variables) ||
+        !evaluateNumberWithDefault(
+            root, _millisecond.get(), "millisecond"_sd, 0, &millisecond, variables)) {
+        // One of the evaluated inputs in nullish.
+        return Value(BSONNULL);
+    }
+
+    auto timeZone =
+        makeTimeZone(getExpressionContext()->timeZoneDatabase, root, _timeZone.get(), variables);
+
+    if (!timeZone) {
+        return Value(BSONNULL);
+    }
+
+    if (_year) {
+        long long year, month, day;
+
+        if (!evaluateNumberWithDefault(root, _year.get(), "year"_sd, 1970, &year, variables) ||
+            !evaluateNumberWithDefaultAndBounds(
+                root, _month.get(), "month"_sd, 1, &month, variables) ||
+            !evaluateNumberWithDefaultAndBounds(root, _day.get(), "day"_sd, 1, &day, variables)) {
+            // One of the evaluated inputs in nullish.
+            return Value(BSONNULL);
+        }
+
+        uassert(40523,
+                str::stream() << "'year' must evaluate to an integer in the range " << 1 << " to "
+                              << 9999 << ", found " << year,
+                year >= 1 && year <= 9999);
+
+        return Value(
+            timeZone->createFromDateParts(year, month, day, hour, minute, second, millisecond));
+    }
+
+    if (_isoWeekYear) {
+        long long isoWeekYear, isoWeek, isoDayOfWeek;
+
+        if (!evaluateNumberWithDefault(
+                root, _isoWeekYear.get(), "isoWeekYear"_sd, 1970, &isoWeekYear, variables) ||
+            !evaluateNumberWithDefaultAndBounds(
+                root, _isoWeek.get(), "isoWeek"_sd, 1, &isoWeek, variables) ||
+            !evaluateNumberWithDefaultAndBounds(
+                root, _isoDayOfWeek.get(), "isoDayOfWeek"_sd, 1, &isoDayOfWeek, variables)) {
+            // One of the evaluated inputs in nullish.
+            return Value(BSONNULL);
+        }
+
+        uassert(31095,
+                str::stream() << "'isoWeekYear' must evaluate to an integer in the range " << 1
+                              << " to " << 9999 << ", found " << isoWeekYear,
+                isoWeekYear >= 1 && isoWeekYear <= 9999);
+
+        return Value(timeZone->createFromIso8601DateParts(
+            isoWeekYear, isoWeek, isoDayOfWeek, hour, minute, second, millisecond));
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+void ExpressionDateFromParts::_doAddDependencies(DepsTracker* deps) const {
+    if (_year) {
+        _year->addDependencies(deps);
+    }
+    if (_month) {
+        _month->addDependencies(deps);
+    }
+    if (_day) {
+        _day->addDependencies(deps);
+    }
+    if (_hour) {
+        _hour->addDependencies(deps);
+    }
+    if (_minute) {
+        _minute->addDependencies(deps);
+    }
+    if (_second) {
+        _second->addDependencies(deps);
+    }
+    if (_millisecond) {
+        _millisecond->addDependencies(deps);
+    }
+    if (_isoWeekYear) {
+        _isoWeekYear->addDependencies(deps);
+    }
+    if (_isoWeek) {
+        _isoWeek->addDependencies(deps);
+    }
+    if (_isoDayOfWeek) {
+        _isoDayOfWeek->addDependencies(deps);
+    }
+    if (_timeZone) {
+        _timeZone->addDependencies(deps);
+    }
+}
+
+/* ---------------------- ExpressionDateFromString --------------------- */
+
+REGISTER_EXPRESSION(dateFromString, ExpressionDateFromString::parse);
+intrusive_ptr<Expression> ExpressionDateFromString::parse(ExpressionContext* const expCtx,
+                                                          BSONElement expr,
+                                                          const VariablesParseState& vps) {
+
+    uassert(40540,
+            str::stream() << "$dateFromString only supports an object as an argument, found: "
+                          << typeName(expr.type()),
+            expr.type() == BSONType::Object);
+
+    BSONElement dateStringElem, timeZoneElem, formatElem, onNullElem, onErrorElem;
+
+    const BSONObj args = expr.embeddedObject();
+    for (auto&& arg : args) {
+        auto field = arg.fieldNameStringData();
+
+        if (field == "format"_sd) {
+            formatElem = arg;
+        } else if (field == "dateString"_sd) {
+            dateStringElem = arg;
+        } else if (field == "timezone"_sd) {
+            timeZoneElem = arg;
+        } else if (field == "onNull"_sd) {
+            onNullElem = arg;
+        } else if (field == "onError"_sd) {
+            onErrorElem = arg;
+        } else {
+            uasserted(40541,
+                      str::stream()
+                          << "Unrecognized argument to $dateFromString: " << arg.fieldName());
+        }
+    }
+
+    uassert(40542, "Missing 'dateString' parameter to $dateFromString", dateStringElem);
+
+    return new ExpressionDateFromString(
+        expCtx,
+        parseOperand(expCtx, dateStringElem, vps),
+        timeZoneElem ? parseOperand(expCtx, timeZoneElem, vps) : nullptr,
+        formatElem ? parseOperand(expCtx, formatElem, vps) : nullptr,
+        onNullElem ? parseOperand(expCtx, onNullElem, vps) : nullptr,
+        onErrorElem ? parseOperand(expCtx, onErrorElem, vps) : nullptr);
+}
+
+ExpressionDateFromString::ExpressionDateFromString(ExpressionContext* const expCtx,
+                                                   intrusive_ptr<Expression> dateString,
+                                                   intrusive_ptr<Expression> timeZone,
+                                                   intrusive_ptr<Expression> format,
+                                                   intrusive_ptr<Expression> onNull,
+                                                   intrusive_ptr<Expression> onError)
+    : Expression(expCtx,
+                 {std::move(dateString),
+                  std::move(timeZone),
+                  std::move(format),
+                  std::move(onNull),
+                  std::move(onError)}),
+      _dateString(_children[0]),
+      _timeZone(_children[1]),
+      _format(_children[2]),
+      _onNull(_children[3]),
+      _onError(_children[4]) {}
+
+intrusive_ptr<Expression> ExpressionDateFromString::optimize() {
+    _dateString = _dateString->optimize();
+    if (_timeZone) {
+        _timeZone = _timeZone->optimize();
+    }
+
+    if (_format) {
+        _format = _format->optimize();
+    }
+
+    if (_onNull) {
+        _onNull = _onNull->optimize();
+    }
+
+    if (_onError) {
+        _onError = _onError->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant(
+            {_dateString, _timeZone, _format, _onNull, _onError})) {
+        // Everything is a constant, so we can turn into a constant.
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document{}, &(getExpressionContext()->variables)));
+    }
+    return this;
+}
+
+Value ExpressionDateFromString::serialize(bool explain) const {
+    return Value(
+        Document{{"$dateFromString",
+                  Document{{"dateString", _dateString->serialize(explain)},
+                           {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()},
+                           {"format", _format ? _format->serialize(explain) : Value()},
+                           {"onNull", _onNull ? _onNull->serialize(explain) : Value()},
+                           {"onError", _onError ? _onError->serialize(explain) : Value()}}}});
+}
+
+Value ExpressionDateFromString::evaluate(const Document& root, Variables* variables) const {
+    const Value dateString = _dateString->evaluate(root, variables);
+    Value formatValue;
+
+    // Eagerly validate the format parameter, ignoring if nullish since the input string nullish
+    // behavior takes precedence.
+    if (_format) {
+        formatValue = _format->evaluate(root, variables);
+        if (!formatValue.nullish()) {
+            uassert(40684,
+                    str::stream() << "$dateFromString requires that 'format' be a string, found: "
+                                  << typeName(formatValue.getType()) << " with value "
+                                  << formatValue.toString(),
+                    formatValue.getType() == BSONType::String);
+
+            TimeZone::validateFromStringFormat(formatValue.getStringData());
+        }
+    }
+
+    // Evaluate the timezone parameter before checking for nullish input, as this will throw an
+    // exception for an invalid timezone string.
+    auto timeZone =
+        makeTimeZone(getExpressionContext()->timeZoneDatabase, root, _timeZone.get(), variables);
+
+    // Behavior for nullish input takes precedence over other nullish elements.
+    if (dateString.nullish()) {
+        return _onNull ? _onNull->evaluate(root, variables) : Value(BSONNULL);
+    }
+
+    try {
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "$dateFromString requires that 'dateString' be a string, found: "
+                              << typeName(dateString.getType()) << " with value "
+                              << dateString.toString(),
+                dateString.getType() == BSONType::String);
+
+        const auto dateTimeString = dateString.getStringData();
+
+        if (!timeZone) {
+            return Value(BSONNULL);
+        }
+
+        if (_format) {
+            if (formatValue.nullish()) {
+                return Value(BSONNULL);
+            }
+
+            return Value(getExpressionContext()->timeZoneDatabase->fromString(
+                dateTimeString, timeZone.get(), formatValue.getStringData()));
+        }
+
+        return Value(
+            getExpressionContext()->timeZoneDatabase->fromString(dateTimeString, timeZone.get()));
+    } catch (const ExceptionFor<ErrorCodes::ConversionFailure>&) {
+        if (_onError) {
+            return _onError->evaluate(root, variables);
+        }
+        throw;
+    }
+}
+
+void ExpressionDateFromString::_doAddDependencies(DepsTracker* deps) const {
+    _dateString->addDependencies(deps);
+    if (_timeZone) {
+        _timeZone->addDependencies(deps);
+    }
+
+    if (_format) {
+        _format->addDependencies(deps);
+    }
+
+    if (_onNull) {
+        _onNull->addDependencies(deps);
+    }
+
+    if (_onError) {
+        _onError->addDependencies(deps);
+    }
+}
+
+/* ---------------------- ExpressionDateToParts ----------------------- */
+
+REGISTER_EXPRESSION(dateToParts, ExpressionDateToParts::parse);
+intrusive_ptr<Expression> ExpressionDateToParts::parse(ExpressionContext* const expCtx,
+                                                       BSONElement expr,
+                                                       const VariablesParseState& vps) {
+
+    uassert(40524,
+            "$dateToParts only supports an object as its argument",
+            expr.type() == BSONType::Object);
+
+    BSONElement dateElem;
+    BSONElement timeZoneElem;
+    BSONElement isoDateElem;
+
+    const BSONObj args = expr.embeddedObject();
+    for (auto&& arg : args) {
+        auto field = arg.fieldNameStringData();
+
+        if (field == "date"_sd) {
+            dateElem = arg;
+        } else if (field == "timezone"_sd) {
+            timeZoneElem = arg;
+        } else if (field == "iso8601"_sd) {
+            isoDateElem = arg;
+        } else {
+            uasserted(40520,
+                      str::stream()
+                          << "Unrecognized argument to $dateToParts: " << arg.fieldName());
+        }
+    }
+
+    uassert(40522, "Missing 'date' parameter to $dateToParts", dateElem);
+
+    return new ExpressionDateToParts(
+        expCtx,
+        parseOperand(expCtx, dateElem, vps),
+        timeZoneElem ? parseOperand(expCtx, timeZoneElem, vps) : nullptr,
+        isoDateElem ? parseOperand(expCtx, isoDateElem, vps) : nullptr);
+}
+
+ExpressionDateToParts::ExpressionDateToParts(ExpressionContext* const expCtx,
+                                             intrusive_ptr<Expression> date,
+                                             intrusive_ptr<Expression> timeZone,
+                                             intrusive_ptr<Expression> iso8601)
+    : Expression(expCtx, {std::move(date), std::move(timeZone), std::move(iso8601)}),
+      _date(_children[0]),
+      _timeZone(_children[1]),
+      _iso8601(_children[2]) {}
+
+intrusive_ptr<Expression> ExpressionDateToParts::optimize() {
+    _date = _date->optimize();
+    if (_timeZone) {
+        _timeZone = _timeZone->optimize();
+    }
+    if (_iso8601) {
+        _iso8601 = _iso8601->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant({_date, _iso8601, _timeZone})) {
+        // Everything is a constant, so we can turn into a constant.
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document{}, &(getExpressionContext()->variables)));
+    }
+
+    return this;
+}
+
+Value ExpressionDateToParts::serialize(bool explain) const {
+    return Value(
+        Document{{"$dateToParts",
+                  Document{{"date", _date->serialize(explain)},
+                           {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()},
+                           {"iso8601", _iso8601 ? _iso8601->serialize(explain) : Value()}}}});
+}
+
+boost::optional<int> ExpressionDateToParts::evaluateIso8601Flag(const Document& root,
+                                                                Variables* variables) const {
+    if (!_iso8601) {
+        return false;
+    }
+
+    auto iso8601Output = _iso8601->evaluate(root, variables);
+
+    if (iso8601Output.nullish()) {
+        return boost::none;
+    }
+
+    uassert(40521,
+            str::stream() << "iso8601 must evaluate to a bool, found "
+                          << typeName(iso8601Output.getType()),
+            iso8601Output.getType() == BSONType::Bool);
+
+    return iso8601Output.getBool();
+}
+
+Value ExpressionDateToParts::evaluate(const Document& root, Variables* variables) const {
+    const Value date = _date->evaluate(root, variables);
+
+    auto timeZone =
+        makeTimeZone(getExpressionContext()->timeZoneDatabase, root, _timeZone.get(), variables);
+    if (!timeZone) {
+        return Value(BSONNULL);
+    }
+
+    auto iso8601 = evaluateIso8601Flag(root, variables);
+    if (!iso8601) {
+        return Value(BSONNULL);
+    }
+
+    if (date.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    auto dateValue = date.coerceToDate();
+
+    if (*iso8601) {
+        auto parts = timeZone->dateIso8601Parts(dateValue);
+        return Value(Document{{"isoWeekYear", parts.year},
+                              {"isoWeek", parts.weekOfYear},
+                              {"isoDayOfWeek", parts.dayOfWeek},
+                              {"hour", parts.hour},
+                              {"minute", parts.minute},
+                              {"second", parts.second},
+                              {"millisecond", parts.millisecond}});
+    } else {
+        auto parts = timeZone->dateParts(dateValue);
+        return Value(Document{{"year", parts.year},
+                              {"month", parts.month},
+                              {"day", parts.dayOfMonth},
+                              {"hour", parts.hour},
+                              {"minute", parts.minute},
+                              {"second", parts.second},
+                              {"millisecond", parts.millisecond}});
+    }
+}
+
+void ExpressionDateToParts::_doAddDependencies(DepsTracker* deps) const {
+    _date->addDependencies(deps);
+    if (_timeZone) {
+        _timeZone->addDependencies(deps);
+    }
+    if (_iso8601) {
+        _iso8601->addDependencies(deps);
+    }
+}
+
+
 /* ---------------------- ExpressionDateToString ----------------------- */
 
 REGISTER_EXPRESSION(dateToString, ExpressionDateToString::parse);
-intrusive_ptr<Expression> ExpressionDateToString::parse(BSONElement expr,
+intrusive_ptr<Expression> ExpressionDateToString::parse(ExpressionContext* const expCtx,
+                                                        BSONElement expr,
                                                         const VariablesParseState& vps) {
-    verify(str::equals(expr.fieldName(), "$dateToString"));
+    verify(expr.fieldNameStringData() == "$dateToString");
 
-    uassert(18629, "$dateToString only supports an object as its argument", expr.type() == Object);
+    uassert(18629,
+            "$dateToString only supports an object as its argument",
+            expr.type() == BSONType::Object);
 
-    BSONElement formatElem;
-    BSONElement dateElem;
-    const BSONObj args = expr.embeddedObject();
-    BSONForEach(arg, args) {
-        if (str::equals(arg.fieldName(), "format")) {
+    BSONElement formatElem, dateElem, timeZoneElem, onNullElem;
+    for (auto&& arg : expr.embeddedObject()) {
+        auto field = arg.fieldNameStringData();
+
+        if (field == "format"_sd) {
             formatElem = arg;
-        } else if (str::equals(arg.fieldName(), "date")) {
+        } else if (field == "date"_sd) {
             dateElem = arg;
+        } else if (field == "timezone"_sd) {
+            timeZoneElem = arg;
+        } else if (field == "onNull"_sd) {
+            onNullElem = arg;
         } else {
             uasserted(18534,
                       str::stream()
@@ -933,214 +1736,289 @@ intrusive_ptr<Expression> ExpressionDateToString::parse(BSONElement expr,
         }
     }
 
-    uassert(18627, "Missing 'format' parameter to $dateToString", !formatElem.eoo());
     uassert(18628, "Missing 'date' parameter to $dateToString", !dateElem.eoo());
 
-    uassert(18533,
-            "The 'format' parameter to $dateToString must be a string literal",
-            formatElem.type() == String);
-
-    const string format = formatElem.str();
-
-    validateFormat(format);
-
-    return new ExpressionDateToString(format, parseOperand(dateElem, vps));
+    return new ExpressionDateToString(expCtx,
+                                      parseOperand(expCtx, dateElem, vps),
+                                      formatElem ? parseOperand(expCtx, formatElem, vps) : nullptr,
+                                      timeZoneElem ? parseOperand(expCtx, timeZoneElem, vps)
+                                                   : nullptr,
+                                      onNullElem ? parseOperand(expCtx, onNullElem, vps) : nullptr);
 }
 
-ExpressionDateToString::ExpressionDateToString(const string& format, intrusive_ptr<Expression> date)
-    : _format(format), _date(date) {}
+ExpressionDateToString::ExpressionDateToString(ExpressionContext* const expCtx,
+                                               intrusive_ptr<Expression> date,
+                                               intrusive_ptr<Expression> format,
+                                               intrusive_ptr<Expression> timeZone,
+                                               intrusive_ptr<Expression> onNull)
+    : Expression(expCtx,
+                 {std::move(format), std::move(date), std::move(timeZone), std::move(onNull)}),
+      _format(_children[0]),
+      _date(_children[1]),
+      _timeZone(_children[2]),
+      _onNull(_children[3]) {}
 
 intrusive_ptr<Expression> ExpressionDateToString::optimize() {
     _date = _date->optimize();
+    if (_timeZone) {
+        _timeZone = _timeZone->optimize();
+    }
+
+    if (_onNull) {
+        _onNull = _onNull->optimize();
+    }
+
+    if (_format) {
+        _format = _format->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant({_date, _format, _timeZone, _onNull})) {
+        // Everything is a constant, so we can turn into a constant.
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document{}, &(getExpressionContext()->variables)));
+    }
+
     return this;
 }
 
 Value ExpressionDateToString::serialize(bool explain) const {
     return Value(
-        DOC("$dateToString" << DOC("format" << _format << "date" << _date->serialize(explain))));
+        Document{{"$dateToString",
+                  Document{{"date", _date->serialize(explain)},
+                           {"format", _format ? _format->serialize(explain) : Value()},
+                           {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()},
+                           {"onNull", _onNull ? _onNull->serialize(explain) : Value()}}}});
 }
 
-Value ExpressionDateToString::evaluateInternal(Variables* vars) const {
-    const Value date = _date->evaluateInternal(vars);
+Value ExpressionDateToString::evaluate(const Document& root, Variables* variables) const {
+    const Value date = _date->evaluate(root, variables);
+    Value formatValue;
+
+    // Eagerly validate the format parameter, ignoring if nullish since the input date nullish
+    // behavior takes precedence.
+    if (_format) {
+        formatValue = _format->evaluate(root, variables);
+        if (!formatValue.nullish()) {
+            uassert(18533,
+                    str::stream() << "$dateToString requires that 'format' be a string, found: "
+                                  << typeName(formatValue.getType()) << " with value "
+                                  << formatValue.toString(),
+                    formatValue.getType() == BSONType::String);
+
+            TimeZone::validateToStringFormat(formatValue.getStringData());
+        }
+    }
+
+    // Evaluate the timezone parameter before checking for nullish input, as this will throw an
+    // exception for an invalid timezone string.
+    auto timeZone =
+        makeTimeZone(getExpressionContext()->timeZoneDatabase, root, _timeZone.get(), variables);
 
     if (date.nullish()) {
+        return _onNull ? _onNull->evaluate(root, variables) : Value(BSONNULL);
+    }
+
+    if (!timeZone) {
         return Value(BSONNULL);
     }
 
-    return Value(formatDate(_format, date.coerceToTm(), date.coerceToDate()));
-}
-
-// verifies that any '%' is followed by a valid format character, and that
-// the format string ends with an even number of '%' symbols
-void ExpressionDateToString::validateFormat(const std::string& format) {
-    for (string::const_iterator it = format.begin(); it != format.end(); ++it) {
-        if (*it != '%') {
-            continue;
+    if (_format) {
+        if (formatValue.nullish()) {
+            return Value(BSONNULL);
         }
 
-        ++it;  // next character must be format modifier
-        uassert(18535, "Unmatched '%' at end of $dateToString format string", it != format.end());
-
-
-        switch (*it) {
-            // all of these fall through intentionally
-            case '%':
-            case 'Y':
-            case 'm':
-            case 'd':
-            case 'H':
-            case 'M':
-            case 'S':
-            case 'L':
-            case 'j':
-            case 'w':
-            case 'U':
-                break;
-            default:
-                uasserted(18536,
-                          str::stream() << "Invalid format character '%" << *it
-                                        << "' in $dateToString format string");
-        }
+        return Value(uassertStatusOK(
+            timeZone->formatDate(formatValue.getStringData(), date.coerceToDate())));
     }
+
+    return Value(uassertStatusOK(timeZone->formatDate(kISOFormatString, date.coerceToDate())));
 }
 
-string ExpressionDateToString::formatDate(const string& format,
-                                          const tm& tm,
-                                          const long long date) {
-    StringBuilder formatted;
-    for (string::const_iterator it = format.begin(); it != format.end(); ++it) {
-        if (*it != '%') {
-            formatted << *it;
-            continue;
-        }
-
-        ++it;                           // next character is format modifier
-        invariant(it != format.end());  // checked in validateFormat
-
-        switch (*it) {
-            case '%':  // Escaped literal %
-                formatted << '%';
-                break;
-            case 'Y':  // Year
-            {
-                const int year = ExpressionYear::extract(tm);
-                uassert(18537,
-                        str::stream() << "$dateToString is only defined on year 0-9999,"
-                                      << " tried to use year " << year,
-                        (year >= 0) && (year <= 9999));
-                insertPadded(formatted, year, 4);
-                break;
-            }
-            case 'm':  // Month
-                insertPadded(formatted, ExpressionMonth::extract(tm), 2);
-                break;
-            case 'd':  // Day of month
-                insertPadded(formatted, ExpressionDayOfMonth::extract(tm), 2);
-                break;
-            case 'H':  // Hour
-                insertPadded(formatted, ExpressionHour::extract(tm), 2);
-                break;
-            case 'M':  // Minute
-                insertPadded(formatted, ExpressionMinute::extract(tm), 2);
-                break;
-            case 'S':  // Second
-                insertPadded(formatted, ExpressionSecond::extract(tm), 2);
-                break;
-            case 'L':  // Millisecond
-                insertPadded(formatted, ExpressionMillisecond::extract(date), 3);
-                break;
-            case 'j':  // Day of year
-                insertPadded(formatted, ExpressionDayOfYear::extract(tm), 3);
-                break;
-            case 'w':  // Day of week
-                insertPadded(formatted, ExpressionDayOfWeek::extract(tm), 1);
-                break;
-            case 'U':  // Week
-                insertPadded(formatted, ExpressionWeek::extract(tm), 2);
-                break;
-            default:
-                // Should never happen as format is pre-validated
-                invariant(false);
-        }
-    }
-    return formatted.str();
-}
-
-// Only works with 1 <= spaces <= 4 and 0 <= number <= 9999.
-// If spaces is less than the digit count of number we simply insert the number
-// without padding.
-void ExpressionDateToString::insertPadded(StringBuilder& sb, int number, int width) {
-    invariant(width >= 1);
-    invariant(width <= 4);
-    invariant(number >= 0);
-    invariant(number <= 9999);
-
-    int digits = 1;
-
-    if (number >= 1000) {
-        digits = 4;
-    } else if (number >= 100) {
-        digits = 3;
-    } else if (number >= 10) {
-        digits = 2;
-    }
-
-    if (width > digits) {
-        sb.write("0000", width - digits);
-    }
-    sb << number;
-}
-
-void ExpressionDateToString::addDependencies(DepsTracker* deps, vector<string>* path) const {
+void ExpressionDateToString::_doAddDependencies(DepsTracker* deps) const {
     _date->addDependencies(deps);
+    if (_timeZone) {
+        _timeZone->addDependencies(deps);
+    }
+
+    if (_onNull) {
+        _onNull->addDependencies(deps);
+    }
+
+    if (_format) {
+        _format->addDependencies(deps);
+    }
 }
 
-/* ---------------------- ExpressionDayOfMonth ------------------------- */
+/* ----------------------- ExpressionDateDiff ---------------------------- */
 
-Value ExpressionDayOfMonth::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
+// TODO SERVER-53028: make the expression to be available for any FCV when 5.0 becomes last-lts.
+REGISTER_EXPRESSION_WITH_MIN_VERSION(dateDiff,
+                                     ExpressionDateDiff::parse,
+                                     ServerGlobalParams::FeatureCompatibility::Version::kVersion49);
+
+ExpressionDateDiff::ExpressionDateDiff(ExpressionContext* const expCtx,
+                                       boost::intrusive_ptr<Expression> startDate,
+                                       boost::intrusive_ptr<Expression> endDate,
+                                       boost::intrusive_ptr<Expression> unit,
+                                       boost::intrusive_ptr<Expression> timezone)
+    : Expression{expCtx,
+                 {std::move(startDate), std::move(endDate), std::move(unit), std::move(timezone)}},
+      _startDate{_children[0]},
+      _endDate{_children[1]},
+      _unit{_children[2]},
+      _timeZone{_children[3]} {}
+
+boost::intrusive_ptr<Expression> ExpressionDateDiff::parse(ExpressionContext* const expCtx,
+                                                           BSONElement expr,
+                                                           const VariablesParseState& vps) {
+    invariant(expr.fieldNameStringData() == "$dateDiff");
+    uassert(5166301,
+            "$dateDiff only supports an object as its argument",
+            expr.type() == BSONType::Object);
+    BSONElement startDateElement, endDateElement, unitElement, timezoneElem;
+    for (auto&& element : expr.embeddedObject()) {
+        auto field = element.fieldNameStringData();
+        if ("startDate"_sd == field) {
+            startDateElement = element;
+        } else if ("endDate"_sd == field) {
+            endDateElement = element;
+        } else if ("unit"_sd == field) {
+            unitElement = element;
+        } else if ("timezone"_sd == field) {
+            timezoneElem = element;
+        } else {
+            uasserted(5166302,
+                      str::stream()
+                          << "Unrecognized argument to $dateDiff: " << element.fieldName());
+        }
+    }
+    uassert(5166303, "Missing 'startDate' parameter to $dateDiff", startDateElement);
+    uassert(5166304, "Missing 'endDate' parameter to $dateDiff", endDateElement);
+    uassert(5166305, "Missing 'unit' parameter to $dateDiff", unitElement);
+    return make_intrusive<ExpressionDateDiff>(expCtx,
+                                              parseOperand(expCtx, startDateElement, vps),
+                                              parseOperand(expCtx, endDateElement, vps),
+                                              parseOperand(expCtx, unitElement, vps),
+                                              timezoneElem ? parseOperand(expCtx, timezoneElem, vps)
+                                                           : nullptr);
 }
 
-REGISTER_EXPRESSION(dayOfMonth, ExpressionDayOfMonth::parse);
-const char* ExpressionDayOfMonth::getOpName() const {
-    return "$dayOfMonth";
+boost::intrusive_ptr<Expression> ExpressionDateDiff::optimize() {
+    _startDate = _startDate->optimize();
+    _endDate = _endDate->optimize();
+    _unit = _unit->optimize();
+    if (_timeZone) {
+        _timeZone = _timeZone->optimize();
+    }
+    if (ExpressionConstant::allNullOrConstant({_startDate, _endDate, _unit, _timeZone})) {
+        // Everything is a constant, so we can turn into a constant.
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document{}, &(getExpressionContext()->variables)));
+    }
+    return this;
+};
+
+Value ExpressionDateDiff::serialize(bool explain) const {
+    return Value{
+        Document{{"$dateDiff"_sd,
+                  Document{{"startDate"_sd, _startDate->serialize(explain)},
+                           {"endDate"_sd, _endDate->serialize(explain)},
+                           {"unit"_sd, _unit->serialize(explain)},
+                           {"timezone"_sd, _timeZone ? _timeZone->serialize(explain) : Value{}}}}}};
+};
+
+Date_t ExpressionDateDiff::convertToDate(const Value& value, StringData parameterName) {
+    uassert(5166307,
+            str::stream() << "$dateDiff requires '" << parameterName << "' to be a date, but got "
+                          << typeName(value.getType()),
+            value.coercibleToDate());
+    return value.coerceToDate();
 }
 
-/* ------------------------- ExpressionDayOfWeek ----------------------------- */
-
-Value ExpressionDayOfWeek::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
+/**
+ * Calls function 'function' with zero parameters and returns the result. If AssertionException is
+ * raised during the call of 'function', adds a context 'errorContext' to the exception.
+ */
+template <typename F>
+auto addContextToAssertionException(F&& function, StringData errorContext) {
+    try {
+        return function();
+    } catch (AssertionException& exception) {
+        exception.addContext(str::stream() << errorContext);
+        throw;
+    }
 }
 
-REGISTER_EXPRESSION(dayOfWeek, ExpressionDayOfWeek::parse);
-const char* ExpressionDayOfWeek::getOpName() const {
-    return "$dayOfWeek";
+TimeUnit ExpressionDateDiff::convertToTimeUnit(const Value& value) {
+    uassert(5166306,
+            str::stream() << "$dateDiff requires 'unit' to be a string, but got "
+                          << typeName(value.getType()),
+            BSONType::String == value.getType());
+    auto valueAsString = value.getStringData();
+    return addContextToAssertionException(
+        [&]() {
+            return parseTimeUnit(std::string_view{valueAsString.rawData(), valueAsString.size()});
+        },
+        "$dateDiff parameter 'unit' value parsing failed"_sd);
 }
 
-/* ------------------------- ExpressionDayOfYear ----------------------------- */
-
-Value ExpressionDayOfYear::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
+Value ExpressionDateDiff::evaluate(const Document& root, Variables* variables) const {
+    const Value startDateValue = _startDate->evaluate(root, variables);
+    if (startDateValue.nullish()) {
+        return Value(BSONNULL);
+    }
+    const Value endDateValue = _endDate->evaluate(root, variables);
+    if (endDateValue.nullish()) {
+        return Value(BSONNULL);
+    }
+    const Value unitValue = _unit->evaluate(root, variables);
+    if (unitValue.nullish()) {
+        return Value(BSONNULL);
+    }
+    const auto timezone = addContextToAssertionException(
+        [&]() {
+            return makeTimeZone(
+                getExpressionContext()->timeZoneDatabase, root, _timeZone.get(), variables);
+        },
+        "$dateDiff parameter 'timezone' value parsing failed"_sd);
+    if (!timezone) {
+        return Value(BSONNULL);
+    }
+    const Date_t startDate = convertToDate(startDateValue, "startDate"_sd);
+    const Date_t endDate = convertToDate(endDateValue, "endDate"_sd);
+    const TimeUnit unit = convertToTimeUnit(unitValue);
+    return Value{dateDiff(startDate, endDate, unit, *timezone)};
 }
 
-REGISTER_EXPRESSION(dayOfYear, ExpressionDayOfYear::parse);
-const char* ExpressionDayOfYear::getOpName() const {
-    return "$dayOfYear";
+void ExpressionDateDiff::_doAddDependencies(DepsTracker* deps) const {
+    _startDate->addDependencies(deps);
+    _endDate->addDependencies(deps);
+    _unit->addDependencies(deps);
+    if (_timeZone) {
+        _timeZone->addDependencies(deps);
+    }
 }
 
 /* ----------------------- ExpressionDivide ---------------------------- */
 
-Value ExpressionDivide::evaluateInternal(Variables* vars) const {
-    Value lhs = vpOperand[0]->evaluateInternal(vars);
-    Value rhs = vpOperand[1]->evaluateInternal(vars);
+Value ExpressionDivide::evaluate(const Document& root, Variables* variables) const {
+    Value lhs = _children[0]->evaluate(root, variables);
+    Value rhs = _children[1]->evaluate(root, variables);
+
+    auto assertNonZero = [](bool nonZero) { uassert(16608, "can't $divide by zero", nonZero); };
 
     if (lhs.numeric() && rhs.numeric()) {
+        // If, and only if, either side is decimal, return decimal.
+        if (lhs.getType() == NumberDecimal || rhs.getType() == NumberDecimal) {
+            Decimal128 numer = lhs.coerceToDecimal();
+            Decimal128 denom = rhs.coerceToDecimal();
+            assertNonZero(!denom.isZero());
+            return Value(numer.divide(denom));
+        }
+
         double numer = lhs.coerceToDouble();
         double denom = rhs.coerceToDouble();
-        uassert(16608, "can't $divide by zero", denom != 0);
+        assertNonZero(denom != 0.0);
 
         return Value(numer / denom);
     } else if (lhs.nullish() || rhs.nullish()) {
@@ -1160,7 +2038,10 @@ const char* ExpressionDivide::getOpName() const {
 /* ----------------------- ExpressionExp ---------------------------- */
 
 Value ExpressionExp::evaluateNumericArg(const Value& numericArg) const {
-    // exp() always returns a double since e is a double.
+    // $exp always returns either a double or a decimal number, as e is irrational.
+    if (numericArg.getType() == NumberDecimal)
+        return Value(numericArg.coerceToDecimal().exponential());
+
     return Value(exp(numericArg.coerceToDouble()));
 }
 
@@ -1171,295 +2052,127 @@ const char* ExpressionExp::getOpName() const {
 
 /* ---------------------- ExpressionObject --------------------------- */
 
-intrusive_ptr<ExpressionObject> ExpressionObject::create() {
-    return new ExpressionObject(false);
+ExpressionObject::ExpressionObject(ExpressionContext* const expCtx,
+                                   std::vector<boost::intrusive_ptr<Expression>> _children,
+                                   vector<pair<string, intrusive_ptr<Expression>&>>&& expressions)
+    : Expression(expCtx, std::move(_children)), _expressions(std::move(expressions)) {}
+
+boost::intrusive_ptr<ExpressionObject> ExpressionObject::create(
+    ExpressionContext* const expCtx,
+    std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>>&&
+        expressionsWithChildrenInPlace) {
+    std::vector<boost::intrusive_ptr<Expression>> children;
+    std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>&>> expressions;
+    for (auto& [unused, expression] : expressionsWithChildrenInPlace)
+        // These 'push_back's must complete before we insert references to the 'children' vector
+        // into the 'expressions' vector since 'push_back' invalidates references.
+        children.push_back(std::move(expression));
+    std::vector<boost::intrusive_ptr<Expression>>::size_type index = 0;
+    for (auto& [fieldName, unused] : expressionsWithChildrenInPlace) {
+        expressions.emplace_back(fieldName, children[index]);
+        ++index;
+    }
+    // It is safe to 'std::move' 'children' since the standard guarantees the references are stable.
+    return new ExpressionObject(expCtx, std::move(children), std::move(expressions));
 }
 
-intrusive_ptr<ExpressionObject> ExpressionObject::createRoot() {
-    return new ExpressionObject(true);
-}
+intrusive_ptr<ExpressionObject> ExpressionObject::parse(ExpressionContext* const expCtx,
+                                                        BSONObj obj,
+                                                        const VariablesParseState& vps) {
+    // Make sure we don't have any duplicate field names.
+    stdx::unordered_set<string> specifiedFields;
 
-ExpressionObject::ExpressionObject(bool atRoot) : _excludeId(false), _atRoot(atRoot) {}
+    std::vector<boost::intrusive_ptr<Expression>> children;
+    vector<pair<string, intrusive_ptr<Expression>&>> expressions;
+    for (auto&& elem : obj) {
+        // Make sure this element has a valid field name. Use StringData here so that we can detect
+        // if the field name contains a null byte.
+        FieldPath::uassertValidFieldName(elem.fieldNameStringData());
+
+        auto fieldName = elem.fieldName();
+        uassert(16406,
+                str::stream() << "duplicate field name specified in object literal: "
+                              << obj.toString(),
+                specifiedFields.find(fieldName) == specifiedFields.end());
+        specifiedFields.insert(fieldName);
+        children.push_back(parseOperand(expCtx, elem, vps));
+    }
+
+    std::vector<boost::intrusive_ptr<Expression>>::size_type index = 0;
+    for (auto&& elem : obj) {
+        expressions.emplace_back(elem.fieldName(), children[index]);
+        ++index;
+    }
+
+    return new ExpressionObject{expCtx, std::move(children), std::move(expressions)};
+}
 
 intrusive_ptr<Expression> ExpressionObject::optimize() {
-    for (FieldMap::iterator it(_expressions.begin()); it != _expressions.end(); ++it) {
-        if (it->second)
-            it->second = it->second->optimize();
-    }
-
-    return intrusive_ptr<Expression>(this);
-}
-
-bool ExpressionObject::isSimple() {
-    for (FieldMap::iterator it(_expressions.begin()); it != _expressions.end(); ++it) {
-        if (it->second && !it->second->isSimple())
-            return false;
-    }
-    return true;
-}
-
-void ExpressionObject::addDependencies(DepsTracker* deps, vector<string>* path) const {
-    string pathStr;
-    if (path) {
-        if (path->empty()) {
-            // we are in the top level of a projection so _id is implicit
-            if (!_excludeId)
-                deps->fields.insert("_id");
-        } else {
-            FieldPath f(*path);
-            pathStr = f.getPath(false);
-            pathStr += '.';
-        }
-    } else {
-        verify(!_excludeId);
-    }
-
-
-    for (FieldMap::const_iterator it(_expressions.begin()); it != _expressions.end(); ++it) {
-        if (it->second) {
-            if (path)
-                path->push_back(it->first);
-            it->second->addDependencies(deps, path);
-            if (path)
-                path->pop_back();
-        } else {  // inclusion
-            uassert(16407, "inclusion not supported in objects nested in $expressions", path);
-
-            deps->fields.insert(pathStr + it->first);
+    bool allValuesConstant = true;
+    for (auto&& pair : _expressions) {
+        pair.second = pair.second->optimize();
+        if (!dynamic_cast<ExpressionConstant*>(pair.second.get())) {
+            allValuesConstant = false;
         }
     }
+    // If all values in ExpressionObject are constant evaluate to ExpressionConstant.
+    if (allValuesConstant) {
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document(), &(getExpressionContext()->variables)));
+    }
+    return this;
 }
 
-void ExpressionObject::addToDocument(MutableDocument& out,
-                                     const Document& currentDoc,
-                                     Variables* vars) const {
-    FieldMap::const_iterator end = _expressions.end();
-
-    // This is used to mark fields we've done so that we can add the ones we haven't
-    set<string> doneFields;
-
-    FieldIterator fields(currentDoc);
-    while (fields.more()) {
-        Document::FieldPair field(fields.next());
-
-        // TODO don't make a new string here
-        const string fieldName = field.first.toString();
-        FieldMap::const_iterator exprIter = _expressions.find(fieldName);
-
-        // This field is not supposed to be in the output (unless it is _id)
-        if (exprIter == end) {
-            if (!_excludeId && _atRoot && field.first == "_id") {
-                // _id from the root doc is always included (until exclusion is supported)
-                // not updating doneFields since "_id" isn't in _expressions
-                out.addField(field.first, field.second);
-            }
-            continue;
-        }
-
-        // make sure we don't add this field again
-        doneFields.insert(exprIter->first);
-
-        Expression* expr = exprIter->second.get();
-
-        if (!expr) {
-            // This means pull the matching field from the input document
-            out.addField(field.first, field.second);
-            continue;
-        }
-
-        ExpressionObject* exprObj = dynamic_cast<ExpressionObject*>(expr);
-        BSONType valueType = field.second.getType();
-        if ((valueType != Object && valueType != Array) || !exprObj) {
-            // This expression replace the whole field
-
-            Value pValue(expr->evaluateInternal(vars));
-
-            // don't add field if nothing was found in the subobject
-            if (exprObj && pValue.getDocument().empty())
-                continue;
-
-            /*
-               Don't add non-existent values (note:  different from NULL or Undefined);
-               this is consistent with existing selection syntax which doesn't
-               force the appearance of non-existent fields.
-               */
-            if (!pValue.missing())
-                out.addField(field.first, pValue);
-
-            continue;
-        }
-
-        /*
-            Check on the type of the input value.  If it's an
-            object, just walk down into that recursively, and
-            add it to the result.
-        */
-        if (valueType == Object) {
-            MutableDocument sub(exprObj->getSizeHint());
-            exprObj->addToDocument(sub, field.second.getDocument(), vars);
-            out.addField(field.first, sub.freezeToValue());
-        } else if (valueType == Array) {
-            /*
-                If it's an array, we have to do the same thing,
-                but to each array element.  Then, add the array
-                of results to the current document.
-            */
-            vector<Value> result;
-            const vector<Value>& input = field.second.getArray();
-            for (size_t i = 0; i < input.size(); i++) {
-                // can't look for a subfield in a non-object value.
-                if (input[i].getType() != Object)
-                    continue;
-
-                MutableDocument doc(exprObj->getSizeHint());
-                exprObj->addToDocument(doc, input[i].getDocument(), vars);
-                result.push_back(doc.freezeToValue());
-            }
-
-            out.addField(field.first, Value(std::move(result)));
-        } else {
-            verify(false);
-        }
-    }
-
-    if (doneFields.size() == _expressions.size())
-        return;
-
-    /* add any remaining fields we haven't already taken care of */
-    for (vector<string>::const_iterator i(_order.begin()); i != _order.end(); ++i) {
-        FieldMap::const_iterator it = _expressions.find(*i);
-        string fieldName(it->first);
-
-        /* if we've already dealt with this field, above, do nothing */
-        if (doneFields.count(fieldName))
-            continue;
-
-        // this is a missing inclusion field
-        if (!it->second)
-            continue;
-
-        Value pValue(it->second->evaluateInternal(vars));
-
-        /*
-          Don't add non-existent values (note:  different from NULL or Undefined);
-          this is consistent with existing selection syntax which doesn't
-          force the appearnance of non-existent fields.
-        */
-        if (pValue.missing())
-            continue;
-
-        // don't add field if nothing was found in the subobject
-        if (dynamic_cast<ExpressionObject*>(it->second.get()) && pValue.getDocument().empty())
-            continue;
-
-        out.addField(fieldName, pValue);
+void ExpressionObject::_doAddDependencies(DepsTracker* deps) const {
+    for (auto&& child : _children) {
+        child->addDependencies(deps);
     }
 }
 
-size_t ExpressionObject::getSizeHint() const {
-    // Note: this can overestimate, but that is better than underestimating
-    return _expressions.size() + (_excludeId ? 0 : 1);
-}
-
-Document ExpressionObject::evaluateDocument(Variables* vars) const {
-    /* create and populate the result */
-    MutableDocument out(getSizeHint());
-
-    addToDocument(out,
-                  Document(),  // No inclusion field matching.
-                  vars);
-    return out.freeze();
-}
-
-Value ExpressionObject::evaluateInternal(Variables* vars) const {
-    return Value(evaluateDocument(vars));
-}
-
-void ExpressionObject::addField(const FieldPath& fieldPath,
-                                const intrusive_ptr<Expression>& pExpression) {
-    const string fieldPart = fieldPath.getFieldName(0);
-    const bool haveExpr = _expressions.count(fieldPart);
-
-    intrusive_ptr<Expression>& expr = _expressions[fieldPart];  // inserts if !haveExpr
-    intrusive_ptr<ExpressionObject> subObj = dynamic_cast<ExpressionObject*>(expr.get());
-
-    if (!haveExpr) {
-        _order.push_back(fieldPart);
-    } else {  // we already have an expression or inclusion for this field
-        if (fieldPath.getPathLength() == 1) {
-            // This expression is for right here
-
-            ExpressionObject* newSubObj = dynamic_cast<ExpressionObject*>(pExpression.get());
-            uassert(16400,
-                    str::stream() << "can't add an expression for field " << fieldPart
-                                  << " because there is already an expression for that field"
-                                  << " or one of its sub-fields.",
-                    subObj && newSubObj);  // we can merge them
-
-            // Copy everything from the newSubObj to the existing subObj
-            // This is for cases like { $project:{ 'b.c':1, b:{ a:1 } } }
-            for (vector<string>::const_iterator it(newSubObj->_order.begin());
-                 it != newSubObj->_order.end();
-                 ++it) {
-                // asserts if any fields are dupes
-                subObj->addField(*it, newSubObj->_expressions[*it]);
-            }
-            return;
-        } else {
-            // This expression is for a subfield
-            uassert(16401,
-                    str::stream() << "can't add an expression for a subfield of " << fieldPart
-                                  << " because there is already an expression that applies to"
-                                  << " the whole field",
-                    subObj);
-        }
+Value ExpressionObject::evaluate(const Document& root, Variables* variables) const {
+    MutableDocument outputDoc;
+    for (auto&& pair : _expressions) {
+        outputDoc.addField(pair.first, pair.second->evaluate(root, variables));
     }
-
-    if (fieldPath.getPathLength() == 1) {
-        verify(!haveExpr);  // haveExpr case handled above.
-        expr = pExpression;
-        return;
-    }
-
-    if (!haveExpr)
-        expr = subObj = ExpressionObject::create();
-
-    subObj->addField(fieldPath.tail(), pExpression);
-}
-
-void ExpressionObject::includePath(const string& theFieldPath) {
-    addField(theFieldPath, NULL);
+    return outputDoc.freezeToValue();
 }
 
 Value ExpressionObject::serialize(bool explain) const {
-    MutableDocument valBuilder;
-    if (_excludeId)
-        valBuilder["_id"] = Value(false);
+    MutableDocument outputDoc;
+    for (auto&& pair : _expressions) {
+        outputDoc.addField(pair.first, pair.second->serialize(explain));
+    }
+    return outputDoc.freezeToValue();
+}
 
-    for (vector<string>::const_iterator it(_order.begin()); it != _order.end(); ++it) {
-        string fieldName = *it;
-        verify(_expressions.find(fieldName) != _expressions.end());
-        intrusive_ptr<Expression> expr = _expressions.find(fieldName)->second;
-
-        if (!expr) {
-            // this is inclusion, not an expression
-            valBuilder[fieldName] = Value(true);
-        } else {
-            valBuilder[fieldName] = expr->serialize(explain);
+Expression::ComputedPaths ExpressionObject::getComputedPaths(const std::string& exprFieldPath,
+                                                             Variables::Id renamingVar) const {
+    ComputedPaths outputPaths;
+    for (auto&& pair : _expressions) {
+        auto exprComputedPaths = pair.second->getComputedPaths(pair.first, renamingVar);
+        for (auto&& renames : exprComputedPaths.renames) {
+            auto newPath = FieldPath::getFullyQualifiedPath(exprFieldPath, renames.first);
+            outputPaths.renames[std::move(newPath)] = renames.second;
+        }
+        for (auto&& path : exprComputedPaths.paths) {
+            outputPaths.paths.insert(FieldPath::getFullyQualifiedPath(exprFieldPath, path));
         }
     }
-    return valBuilder.freezeToValue();
+
+    return outputPaths;
 }
 
 /* --------------------- ExpressionFieldPath --------------------------- */
 
 // this is the old deprecated version only used by tests not using variables
-intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::create(const string& fieldPath) {
-    return new ExpressionFieldPath("CURRENT." + fieldPath, Variables::ROOT_ID);
+intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::deprecatedCreate(
+    ExpressionContext* const expCtx, const string& fieldPath) {
+    return new ExpressionFieldPath(expCtx, "CURRENT." + fieldPath, Variables::kRootId);
 }
 
 // this is the new version that supports every syntax
-intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::parse(const string& raw,
+intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::parse(ExpressionContext* const expCtx,
+                                                              const string& raw,
                                                               const VariablesParseState& vps) {
     uassert(16873,
             str::stream() << "FieldPath '" << raw << "' doesn't start with $",
@@ -1473,35 +2186,71 @@ intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::parse(const string& raw,
         const StringData rawSD = raw;
         const StringData fieldPath = rawSD.substr(2);  // strip off $$
         const StringData varName = fieldPath.substr(0, fieldPath.find('.'));
-        Variables::uassertValidNameForUserRead(varName);
-        return new ExpressionFieldPath(fieldPath.toString(), vps.getVariable(varName));
+        variableValidation::validateNameForUserRead(varName);
+        auto varId = vps.getVariable(varName);
+        return new ExpressionFieldPath(expCtx, fieldPath.toString(), varId);
     } else {
-        return new ExpressionFieldPath("CURRENT." + raw.substr(1),  // strip the "$" prefix
+        return new ExpressionFieldPath(expCtx,
+                                       "CURRENT." + raw.substr(1),  // strip the "$" prefix
                                        vps.getVariable("CURRENT"));
     }
 }
 
+intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::createPathFromString(
+    ExpressionContext* const expCtx, const string& raw, const VariablesParseState& vps) {
+    return new ExpressionFieldPath(expCtx, "CURRENT." + raw, vps.getVariable("CURRENT"));
+}
+intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::createVarFromString(
+    ExpressionContext* const expCtx, const string& raw, const VariablesParseState& vps) {
+    const auto rawSD = StringData{raw};
+    const StringData varName = rawSD.substr(0, rawSD.find('.'));
+    auto varId = vps.getVariable(varName);
+    return new ExpressionFieldPath(expCtx, raw, varId);
+}
 
-ExpressionFieldPath::ExpressionFieldPath(const string& theFieldPath, Variables::Id variable)
-    : _fieldPath(theFieldPath), _variable(variable) {}
+ExpressionFieldPath::ExpressionFieldPath(ExpressionContext* const expCtx,
+                                         const string& theFieldPath,
+                                         Variables::Id variable)
+    : Expression(expCtx), _fieldPath(theFieldPath), _variable(variable) {}
 
 intrusive_ptr<Expression> ExpressionFieldPath::optimize() {
-    /* nothing can be done for these */
+    if (_variable == Variables::kRemoveId) {
+        // The REMOVE system variable optimizes to a constant missing value.
+        return ExpressionConstant::create(getExpressionContext(), Value());
+    }
+
+    if (getExpressionContext()->variables.hasConstantValue(_variable)) {
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document(), &(getExpressionContext()->variables)));
+    }
+
     return intrusive_ptr<Expression>(this);
 }
 
-void ExpressionFieldPath::addDependencies(DepsTracker* deps, vector<string>* path) const {
-    if (_variable == Variables::ROOT_ID) {  // includes CURRENT when it is equivalent to ROOT.
+bool ExpressionFieldPath::representsPath(const std::string& dottedPath) const {
+    if (_variable != Variables::kRootId || _fieldPath.getPathLength() == 1) {
+        // This variable refers to the entire document, or refers to a sub-field of something
+        // besides the root document. Either way we can't prove that it represents the path given by
+        // 'dottedPath'.
+        return false;
+    }
+    return _fieldPath.tail().fullPath() == dottedPath;
+}
+
+void ExpressionFieldPath::_doAddDependencies(DepsTracker* deps) const {
+    if (_variable == Variables::kRootId) {  // includes CURRENT when it is equivalent to ROOT.
         if (_fieldPath.getPathLength() == 1) {
             deps->needWholeDocument = true;  // need full doc if just "$$ROOT"
         } else {
-            deps->fields.insert(_fieldPath.tail().getPath(false));
+            deps->fields.insert(_fieldPath.tail().fullPath());
         }
+    } else if (Variables::isUserDefinedVariable(_variable)) {
+        deps->vars.insert(_variable);
     }
 }
 
 Value ExpressionFieldPath::evaluatePathArray(size_t index, const Value& input) const {
-    dassert(input.getType() == Array);
+    dassert(input.isArray());
 
     // Check for remaining path in each element of array
     vector<Value> result;
@@ -1539,16 +2288,16 @@ Value ExpressionFieldPath::evaluatePath(size_t index, const Document& input) con
     }
 }
 
-Value ExpressionFieldPath::evaluateInternal(Variables* vars) const {
+Value ExpressionFieldPath::evaluate(const Document& root, Variables* variables) const {
     if (_fieldPath.getPathLength() == 1)  // get the whole variable
-        return vars->getValue(_variable);
+        return variables->getValue(_variable, root);
 
-    if (_variable == Variables::ROOT_ID) {
+    if (_variable == Variables::kRootId) {
         // ROOT is always a document so use optimized code path
-        return evaluatePath(1, vars->getRoot());
+        return evaluatePath(1, root);
     }
 
-    Value var = vars->getValue(_variable);
+    Value var = variables->getValue(_variable, root);
     switch (var.getType()) {
         case Object:
             return evaluatePath(1, var.getDocument());
@@ -1562,18 +2311,44 @@ Value ExpressionFieldPath::evaluateInternal(Variables* vars) const {
 Value ExpressionFieldPath::serialize(bool explain) const {
     if (_fieldPath.getFieldName(0) == "CURRENT" && _fieldPath.getPathLength() > 1) {
         // use short form for "$$CURRENT.foo" but not just "$$CURRENT"
-        return Value("$" + _fieldPath.tail().getPath(false));
+        return Value("$" + _fieldPath.tail().fullPath());
     } else {
-        return Value("$$" + _fieldPath.getPath(false));
+        return Value("$$" + _fieldPath.fullPath());
     }
+}
+
+Expression::ComputedPaths ExpressionFieldPath::getComputedPaths(const std::string& exprFieldPath,
+                                                                Variables::Id renamingVar) const {
+    // An expression field path is either considered a rename or a computed path. We need to find
+    // out which case we fall into.
+    //
+    // The caller has told us that renames must have 'varId' as the first component. We also check
+    // that there is only one additional component---no dotted field paths are allowed!  This is
+    // because dotted ExpressionFieldPaths can actually reshape the document rather than just
+    // changing the field names. This can happen only if there are arrays along the dotted path.
+    //
+    // For example, suppose you have document {a: [{b: 1}, {b: 2}]}. The projection {"c.d": "$a.b"}
+    // does *not* perform the strict rename to yield document {c: [{d: 1}, {d: 2}]}. Instead, it
+    // results in the document {c: {d: [1, 2]}}. Due to this reshaping, matches expressed over "a.b"
+    // before the $project is applied may not have the same behavior when expressed over "c.d" after
+    // the $project is applied.
+    ComputedPaths outputPaths;
+    if (_variable == renamingVar && _fieldPath.getPathLength() == 2u) {
+        outputPaths.renames[exprFieldPath] = _fieldPath.tail().fullPath();
+    } else {
+        outputPaths.paths.insert(exprFieldPath);
+    }
+
+    return outputPaths;
 }
 
 /* ------------------------- ExpressionFilter ----------------------------- */
 
 REGISTER_EXPRESSION(filter, ExpressionFilter::parse);
-intrusive_ptr<Expression> ExpressionFilter::parse(BSONElement expr,
+intrusive_ptr<Expression> ExpressionFilter::parse(ExpressionContext* const expCtx,
+                                                  BSONElement expr,
                                                   const VariablesParseState& vpsIn) {
-    verify(str::equals(expr.fieldName(), "$filter"));
+    verify(expr.fieldNameStringData() == "$filter");
 
     uassert(28646, "$filter only supports an object as its argument", expr.type() == Object);
 
@@ -1582,11 +2357,11 @@ intrusive_ptr<Expression> ExpressionFilter::parse(BSONElement expr,
     BSONElement asElem;
     BSONElement condElem;
     for (auto elem : expr.Obj()) {
-        if (str::equals(elem.fieldName(), "input")) {
+        if (elem.fieldNameStringData() == "input") {
             inputElem = elem;
-        } else if (str::equals(elem.fieldName(), "as")) {
+        } else if (elem.fieldNameStringData() == "as") {
             asElem = elem;
-        } else if (str::equals(elem.fieldName(), "cond")) {
+        } else if (elem.fieldNameStringData() == "cond") {
             condElem = elem;
         } else {
             uasserted(28647,
@@ -1595,32 +2370,37 @@ intrusive_ptr<Expression> ExpressionFilter::parse(BSONElement expr,
     }
 
     uassert(28648, "Missing 'input' parameter to $filter", !inputElem.eoo());
-    uassert(28649, "Missing 'as' parameter to $filter", !asElem.eoo());
     uassert(28650, "Missing 'cond' parameter to $filter", !condElem.eoo());
 
     // Parse "input", only has outer variables.
-    intrusive_ptr<Expression> input = parseOperand(inputElem, vpsIn);
+    intrusive_ptr<Expression> input = parseOperand(expCtx, inputElem, vpsIn);
 
     // Parse "as".
     VariablesParseState vpsSub(vpsIn);  // vpsSub gets our variable, vpsIn doesn't.
-    string varName = asElem.str();
-    Variables::uassertValidNameForUserWrite(varName);
+
+    // If "as" is not specified, then use "this" by default.
+    auto varName = asElem.eoo() ? "this" : asElem.str();
+
+    variableValidation::validateNameForUserWrite(varName);
     Variables::Id varId = vpsSub.defineVariable(varName);
 
     // Parse "cond", has access to "as" variable.
-    intrusive_ptr<Expression> cond = parseOperand(condElem, vpsSub);
+    intrusive_ptr<Expression> cond = parseOperand(expCtx, condElem, vpsSub);
 
-    return new ExpressionFilter(std::move(varName), varId, std::move(input), std::move(cond));
+    return new ExpressionFilter(
+        expCtx, std::move(varName), varId, std::move(input), std::move(cond));
 }
 
-ExpressionFilter::ExpressionFilter(string varName,
+ExpressionFilter::ExpressionFilter(ExpressionContext* const expCtx,
+                                   string varName,
                                    Variables::Id varId,
                                    intrusive_ptr<Expression> input,
                                    intrusive_ptr<Expression> filter)
-    : _varName(std::move(varName)),
+    : Expression(expCtx, {std::move(input), std::move(filter)}),
+      _varName(std::move(varName)),
       _varId(varId),
-      _input(std::move(input)),
-      _filter(std::move(filter)) {}
+      _input(_children[0]),
+      _filter(_children[1]) {}
 
 intrusive_ptr<Expression> ExpressionFilter::optimize() {
     // TODO handle when _input is constant.
@@ -1634,16 +2414,16 @@ Value ExpressionFilter::serialize(bool explain) const {
                                               << "cond" << _filter->serialize(explain))));
 }
 
-Value ExpressionFilter::evaluateInternal(Variables* vars) const {
+Value ExpressionFilter::evaluate(const Document& root, Variables* variables) const {
     // We are guaranteed at parse time that this isn't using our _varId.
-    const Value inputVal = _input->evaluateInternal(vars);
+    const Value inputVal = _input->evaluate(root, variables);
     if (inputVal.nullish())
         return Value(BSONNULL);
 
     uassert(28651,
-            str::stream() << "input to $filter must be an Array not "
+            str::stream() << "input to $filter must be an array not "
                           << typeName(inputVal.getType()),
-            inputVal.getType() == Array);
+            inputVal.isArray());
 
     const vector<Value>& input = inputVal.getArray();
 
@@ -1652,9 +2432,9 @@ Value ExpressionFilter::evaluateInternal(Variables* vars) const {
 
     vector<Value> output;
     for (const auto& elem : input) {
-        vars->setValue(_varId, elem);
+        variables->setValue(_varId, elem);
 
-        if (_filter->evaluateInternal(vars).coerceToBool()) {
+        if (_filter->evaluate(root, variables).coerceToBool()) {
             output.push_back(std::move(elem));
         }
     }
@@ -1662,7 +2442,7 @@ Value ExpressionFilter::evaluateInternal(Variables* vars) const {
     return Value(std::move(output));
 }
 
-void ExpressionFilter::addDependencies(DepsTracker* deps, vector<string>* path) const {
+void ExpressionFilter::_doAddDependencies(DepsTracker* deps) const {
     _input->addDependencies(deps);
     _filter->addDependencies(deps);
 }
@@ -1671,8 +2451,16 @@ void ExpressionFilter::addDependencies(DepsTracker* deps, vector<string>* path) 
 
 Value ExpressionFloor::evaluateNumericArg(const Value& numericArg) const {
     // There's no point in taking the floor of integers or longs, it will have no effect.
-    return numericArg.getType() == NumberDouble ? Value(std::floor(numericArg.getDouble()))
-                                                : numericArg;
+    switch (numericArg.getType()) {
+        case NumberDouble:
+            return Value(std::floor(numericArg.getDouble()));
+        case NumberDecimal:
+            // Round toward the nearest decimal with a zero exponent in the negative direction.
+            return Value(numericArg.getDecimal().quantize(Decimal128::kNormalizedZero,
+                                                          Decimal128::kRoundTowardNegative));
+        default:
+            return numericArg;
+    }
 }
 
 REGISTER_EXPRESSION(floor, ExpressionFloor::parse);
@@ -1683,8 +2471,10 @@ const char* ExpressionFloor::getOpName() const {
 /* ------------------------- ExpressionLet ----------------------------- */
 
 REGISTER_EXPRESSION(let, ExpressionLet::parse);
-intrusive_ptr<Expression> ExpressionLet::parse(BSONElement expr, const VariablesParseState& vpsIn) {
-    verify(str::equals(expr.fieldName(), "$let"));
+intrusive_ptr<Expression> ExpressionLet::parse(ExpressionContext* const expCtx,
+                                               BSONElement expr,
+                                               const VariablesParseState& vpsIn) {
+    verify(expr.fieldNameStringData() == "$let");
 
     uassert(16874, "$let only supports an object as its argument", expr.type() == Object);
     const BSONObj args = expr.embeddedObject();
@@ -1692,10 +2482,10 @@ intrusive_ptr<Expression> ExpressionLet::parse(BSONElement expr, const Variables
     // varsElem must be parsed before inElem regardless of BSON order.
     BSONElement varsElem;
     BSONElement inElem;
-    BSONForEach(arg, args) {
-        if (str::equals(arg.fieldName(), "vars")) {
+    for (auto&& arg : args) {
+        if (arg.fieldNameStringData() == "vars") {
             varsElem = arg;
-        } else if (str::equals(arg.fieldName(), "in")) {
+        } else if (arg.fieldNameStringData() == "in") {
             inElem = arg;
         } else {
             uasserted(16875,
@@ -1709,22 +2499,42 @@ intrusive_ptr<Expression> ExpressionLet::parse(BSONElement expr, const Variables
     // parse "vars"
     VariablesParseState vpsSub(vpsIn);  // vpsSub gets our vars, vpsIn doesn't.
     VariableMap vars;
-    BSONForEach(varElem, varsElem.embeddedObjectUserCheck()) {
+    std::vector<boost::intrusive_ptr<Expression>> children;
+    auto&& varsObj = varsElem.embeddedObjectUserCheck();
+    for (auto&& varElem : varsObj)
+        children.push_back(parseOperand(expCtx, varElem, vpsIn));
+
+    // Make a place in the vector for "in".
+    auto& inPtr = children.emplace_back(nullptr);
+
+    std::vector<boost::intrusive_ptr<Expression>>::size_type index = 0;
+    std::vector<Variables::Id> orderedVariableIds;
+    for (auto&& varElem : varsObj) {
         const string varName = varElem.fieldName();
-        Variables::uassertValidNameForUserWrite(varName);
+        variableValidation::validateNameForUserWrite(varName);
         Variables::Id id = vpsSub.defineVariable(varName);
 
-        vars[id] = NameAndExpression(varName, parseOperand(varElem, vpsIn));  // only has outer vars
+        orderedVariableIds.push_back(id);
+
+        vars.emplace(id, NameAndExpression{varName, children[index]});  // only has outer vars
+        ++index;
     }
 
     // parse "in"
-    intrusive_ptr<Expression> subExpression = parseOperand(inElem, vpsSub);  // has our vars
+    inPtr = parseOperand(expCtx, inElem, vpsSub);  // has our vars
 
-    return new ExpressionLet(vars, subExpression);
+    return new ExpressionLet(
+        expCtx, std::move(vars), std::move(children), std::move(orderedVariableIds));
 }
 
-ExpressionLet::ExpressionLet(const VariableMap& vars, intrusive_ptr<Expression> subExpression)
-    : _variables(vars), _subExpression(subExpression) {}
+ExpressionLet::ExpressionLet(ExpressionContext* const expCtx,
+                             VariableMap&& vars,
+                             std::vector<boost::intrusive_ptr<Expression>> children,
+                             std::vector<Variables::Id> orderedVariableIds)
+    : Expression(expCtx, std::move(children)),
+      _variables(std::move(vars)),
+      _orderedVariableIds(std::move(orderedVariableIds)),
+      _subExpression(_children.back()) {}
 
 intrusive_ptr<Expression> ExpressionLet::optimize() {
     if (_variables.empty()) {
@@ -1736,7 +2546,6 @@ intrusive_ptr<Expression> ExpressionLet::optimize() {
         it->second.expression = it->second.expression->optimize();
     }
 
-    // TODO be smarter with constant "variables"
     _subExpression = _subExpression->optimize();
 
     return this;
@@ -1753,33 +2562,33 @@ Value ExpressionLet::serialize(bool explain) const {
         DOC("$let" << DOC("vars" << vars.freeze() << "in" << _subExpression->serialize(explain))));
 }
 
-Value ExpressionLet::evaluateInternal(Variables* vars) const {
-    for (VariableMap::const_iterator it = _variables.begin(), end = _variables.end(); it != end;
-         ++it) {
+Value ExpressionLet::evaluate(const Document& root, Variables* variables) const {
+    for (const auto& item : _variables) {
         // It is guaranteed at parse-time that these expressions don't use the variable ids we
         // are setting
-        vars->setValue(it->first, it->second.expression->evaluateInternal(vars));
+        variables->setValue(item.first, item.second.expression->evaluate(root, variables));
     }
 
-    return _subExpression->evaluateInternal(vars);
+    return _subExpression->evaluate(root, variables);
 }
 
-void ExpressionLet::addDependencies(DepsTracker* deps, vector<string>* path) const {
-    for (VariableMap::const_iterator it = _variables.begin(), end = _variables.end(); it != end;
-         ++it) {
-        it->second.expression->addDependencies(deps);
+void ExpressionLet::_doAddDependencies(DepsTracker* deps) const {
+    for (auto&& idToNameExp : _variables) {
+        // Add the external dependencies from the 'vars' statement.
+        idToNameExp.second.expression->addDependencies(deps);
     }
 
-    // TODO be smarter when CURRENT is a bound variable
+    // Add subexpression dependencies, which may contain a mix of local and external variable refs.
     _subExpression->addDependencies(deps);
 }
-
 
 /* ------------------------- ExpressionMap ----------------------------- */
 
 REGISTER_EXPRESSION(map, ExpressionMap::parse);
-intrusive_ptr<Expression> ExpressionMap::parse(BSONElement expr, const VariablesParseState& vpsIn) {
-    verify(str::equals(expr.fieldName(), "$map"));
+intrusive_ptr<Expression> ExpressionMap::parse(ExpressionContext* const expCtx,
+                                               BSONElement expr,
+                                               const VariablesParseState& vpsIn) {
+    verify(expr.fieldNameStringData() == "$map");
 
     uassert(16878, "$map only supports an object as its argument", expr.type() == Object);
 
@@ -1789,11 +2598,11 @@ intrusive_ptr<Expression> ExpressionMap::parse(BSONElement expr, const Variables
     BSONElement inElem;
     const BSONObj args = expr.embeddedObject();
     BSONForEach(arg, args) {
-        if (str::equals(arg.fieldName(), "input")) {
+        if (arg.fieldNameStringData() == "input") {
             inputElem = arg;
-        } else if (str::equals(arg.fieldName(), "as")) {
+        } else if (arg.fieldNameStringData() == "as") {
             asElem = arg;
-        } else if (str::equals(arg.fieldName(), "in")) {
+        } else if (arg.fieldNameStringData() == "in") {
             inElem = arg;
         } else {
             uasserted(16879,
@@ -1802,29 +2611,38 @@ intrusive_ptr<Expression> ExpressionMap::parse(BSONElement expr, const Variables
     }
 
     uassert(16880, "Missing 'input' parameter to $map", !inputElem.eoo());
-    uassert(16881, "Missing 'as' parameter to $map", !asElem.eoo());
     uassert(16882, "Missing 'in' parameter to $map", !inElem.eoo());
 
     // parse "input"
-    intrusive_ptr<Expression> input = parseOperand(inputElem, vpsIn);  // only has outer vars
+    intrusive_ptr<Expression> input =
+        parseOperand(expCtx, inputElem, vpsIn);  // only has outer vars
 
     // parse "as"
     VariablesParseState vpsSub(vpsIn);  // vpsSub gets our vars, vpsIn doesn't.
-    string varName = asElem.str();
-    Variables::uassertValidNameForUserWrite(varName);
+
+    // If "as" is not specified, then use "this" by default.
+    auto varName = asElem.eoo() ? "this" : asElem.str();
+
+    variableValidation::validateNameForUserWrite(varName);
     Variables::Id varId = vpsSub.defineVariable(varName);
 
     // parse "in"
-    intrusive_ptr<Expression> in = parseOperand(inElem, vpsSub);  // has access to map variable
+    intrusive_ptr<Expression> in =
+        parseOperand(expCtx, inElem, vpsSub);  // has access to map variable
 
-    return new ExpressionMap(varName, varId, input, in);
+    return new ExpressionMap(expCtx, varName, varId, input, in);
 }
 
-ExpressionMap::ExpressionMap(const string& varName,
+ExpressionMap::ExpressionMap(ExpressionContext* const expCtx,
+                             const string& varName,
                              Variables::Id varId,
                              intrusive_ptr<Expression> input,
                              intrusive_ptr<Expression> each)
-    : _varName(varName), _varId(varId), _input(input), _each(each) {}
+    : Expression(expCtx, {std::move(input), std::move(each)}),
+      _varName(varName),
+      _varId(varId),
+      _input(_children[0]),
+      _each(_children[1]) {}
 
 intrusive_ptr<Expression> ExpressionMap::optimize() {
     // TODO handle when _input is constant
@@ -1838,15 +2656,15 @@ Value ExpressionMap::serialize(bool explain) const {
                                            << _each->serialize(explain))));
 }
 
-Value ExpressionMap::evaluateInternal(Variables* vars) const {
+Value ExpressionMap::evaluate(const Document& root, Variables* variables) const {
     // guaranteed at parse time that this isn't using our _varId
-    const Value inputVal = _input->evaluateInternal(vars);
+    const Value inputVal = _input->evaluate(root, variables);
     if (inputVal.nullish())
         return Value(BSONNULL);
 
     uassert(16883,
-            str::stream() << "input to $map must be an Array not " << typeName(inputVal.getType()),
-            inputVal.getType() == Array);
+            str::stream() << "input to $map must be an array not " << typeName(inputVal.getType()),
+            inputVal.isArray());
 
     const vector<Value>& input = inputVal.getArray();
 
@@ -1856,9 +2674,9 @@ Value ExpressionMap::evaluateInternal(Variables* vars) const {
     vector<Value> output;
     output.reserve(input.size());
     for (size_t i = 0; i < input.size(); i++) {
-        vars->setValue(_varId, input[i]);
+        variables->setValue(_varId, input[i]);
 
-        Value toInsert = _each->evaluateInternal(vars);
+        Value toInsert = _each->evaluate(root, variables);
         if (toInsert.missing())
             toInsert = Value(BSONNULL);  // can't insert missing values into array
 
@@ -1868,118 +2686,204 @@ Value ExpressionMap::evaluateInternal(Variables* vars) const {
     return Value(std::move(output));
 }
 
-void ExpressionMap::addDependencies(DepsTracker* deps, vector<string>* path) const {
+void ExpressionMap::_doAddDependencies(DepsTracker* deps) const {
     _input->addDependencies(deps);
     _each->addDependencies(deps);
+}
+
+Expression::ComputedPaths ExpressionMap::getComputedPaths(const std::string& exprFieldPath,
+                                                          Variables::Id renamingVar) const {
+    auto inputFieldPath = dynamic_cast<ExpressionFieldPath*>(_input.get());
+    if (!inputFieldPath) {
+        return {{exprFieldPath}, {}};
+    }
+
+    auto inputComputedPaths = inputFieldPath->getComputedPaths("", renamingVar);
+    if (inputComputedPaths.renames.empty()) {
+        return {{exprFieldPath}, {}};
+    }
+    invariant(inputComputedPaths.renames.size() == 1u);
+    auto fieldPathRenameIter = inputComputedPaths.renames.find("");
+    invariant(fieldPathRenameIter != inputComputedPaths.renames.end());
+    const auto& oldArrayName = fieldPathRenameIter->second;
+
+    auto eachComputedPaths = _each->getComputedPaths(exprFieldPath, _varId);
+    if (eachComputedPaths.renames.empty()) {
+        return {{exprFieldPath}, {}};
+    }
+
+    // Append the name of the array to the beginning of the old field path.
+    for (auto&& rename : eachComputedPaths.renames) {
+        eachComputedPaths.renames[rename.first] =
+            FieldPath::getFullyQualifiedPath(oldArrayName, rename.second);
+    }
+    return eachComputedPaths;
 }
 
 /* ------------------------- ExpressionMeta ----------------------------- */
 
 REGISTER_EXPRESSION(meta, ExpressionMeta::parse);
-intrusive_ptr<Expression> ExpressionMeta::parse(BSONElement expr,
+
+namespace {
+const std::string textScoreName = "textScore";
+const std::string randValName = "randVal";
+const std::string searchScoreName = "searchScore";
+const std::string searchHighlightsName = "searchHighlights";
+const std::string geoNearDistanceName = "geoNearDistance";
+const std::string geoNearPointName = "geoNearPoint";
+const std::string recordIdName = "recordId";
+const std::string indexKeyName = "indexKey";
+const std::string sortKeyName = "sortKey";
+const std::string searchScoreDetailsName = "searchScoreDetails";
+
+using MetaType = DocumentMetadataFields::MetaType;
+const StringMap<DocumentMetadataFields::MetaType> kMetaNameToMetaType = {
+    {geoNearDistanceName, MetaType::kGeoNearDist},
+    {geoNearPointName, MetaType::kGeoNearPoint},
+    {indexKeyName, MetaType::kIndexKey},
+    {randValName, MetaType::kRandVal},
+    {recordIdName, MetaType::kRecordId},
+    {searchHighlightsName, MetaType::kSearchHighlights},
+    {searchScoreName, MetaType::kSearchScore},
+    {searchScoreDetailsName, MetaType::kSearchScoreDetails},
+    {sortKeyName, MetaType::kSortKey},
+    {textScoreName, MetaType::kTextScore},
+};
+
+const stdx::unordered_map<DocumentMetadataFields::MetaType, StringData> kMetaTypeToMetaName = {
+    {MetaType::kGeoNearDist, geoNearDistanceName},
+    {MetaType::kGeoNearPoint, geoNearPointName},
+    {MetaType::kIndexKey, indexKeyName},
+    {MetaType::kRandVal, randValName},
+    {MetaType::kRecordId, recordIdName},
+    {MetaType::kSearchHighlights, searchHighlightsName},
+    {MetaType::kSearchScore, searchScoreName},
+    {MetaType::kSearchScoreDetails, searchScoreDetailsName},
+    {MetaType::kSortKey, sortKeyName},
+    {MetaType::kTextScore, textScoreName},
+};
+
+}  // namespace
+
+intrusive_ptr<Expression> ExpressionMeta::parse(ExpressionContext* const expCtx,
+                                                BSONElement expr,
                                                 const VariablesParseState& vpsIn) {
-    uassert(17307, "$meta only supports String arguments", expr.type() == String);
-    if (expr.valueStringData() == "textScore") {
-        return new ExpressionMeta(MetaType::TEXT_SCORE);
-    } else if (expr.valueStringData() == "randVal") {
-        return new ExpressionMeta(MetaType::RAND_VAL);
+    uassert(17307, "$meta only supports string arguments", expr.type() == String);
+
+    const auto iter = kMetaNameToMetaType.find(expr.valueStringData());
+    if (iter != kMetaNameToMetaType.end()) {
+        return new ExpressionMeta(expCtx, iter->second);
     } else {
         uasserted(17308, "Unsupported argument to $meta: " + expr.String());
     }
 }
 
-ExpressionMeta::ExpressionMeta(MetaType metaType) : _metaType(metaType) {}
+ExpressionMeta::ExpressionMeta(ExpressionContext* const expCtx, MetaType metaType)
+    : Expression(expCtx), _metaType(metaType) {}
 
 Value ExpressionMeta::serialize(bool explain) const {
+    const auto nameIter = kMetaTypeToMetaName.find(_metaType);
+    invariant(nameIter != kMetaTypeToMetaName.end());
+    return Value(DOC("$meta" << nameIter->second));
+}
+
+Value ExpressionMeta::evaluate(const Document& root, Variables* variables) const {
+    const auto& metadata = root.metadata();
     switch (_metaType) {
-        case MetaType::TEXT_SCORE:
-            return Value(DOC("$meta"
-                             << "textScore"));
-        case MetaType::RAND_VAL:
-            return Value(DOC("$meta"
-                             << "randVal"));
+        case MetaType::kTextScore:
+            return metadata.hasTextScore() ? Value(metadata.getTextScore()) : Value();
+        case MetaType::kRandVal:
+            return metadata.hasRandVal() ? Value(metadata.getRandVal()) : Value();
+        case MetaType::kSearchScore:
+            return metadata.hasSearchScore() ? Value(metadata.getSearchScore()) : Value();
+        case MetaType::kSearchHighlights:
+            return metadata.hasSearchHighlights() ? Value(metadata.getSearchHighlights()) : Value();
+        case MetaType::kGeoNearDist:
+            return metadata.hasGeoNearDistance() ? Value(metadata.getGeoNearDistance()) : Value();
+        case MetaType::kGeoNearPoint:
+            return metadata.hasGeoNearPoint() ? Value(metadata.getGeoNearPoint()) : Value();
+        case MetaType::kRecordId:
+            // Be sure that a RecordId can be represented by a long long.
+            static_assert(RecordId::kMinRepr >= std::numeric_limits<long long>::min());
+            static_assert(RecordId::kMaxRepr <= std::numeric_limits<long long>::max());
+            if (!metadata.hasRecordId()) {
+                return Value();
+            }
+
+            return metadata.getRecordId().withFormat(
+                [](RecordId::Null n) { return Value(); },
+                [](const int64_t rid) { return Value{static_cast<long long>(rid)}; },
+                [](const OID& oid) { return Value(oid); });
+        case MetaType::kIndexKey:
+            return metadata.hasIndexKey() ? Value(metadata.getIndexKey()) : Value();
+        case MetaType::kSortKey:
+            return metadata.hasSortKey()
+                ? Value(DocumentMetadataFields::serializeSortKey(metadata.isSingleElementKey(),
+                                                                 metadata.getSortKey()))
+                : Value();
+        case MetaType::kSearchScoreDetails:
+            return metadata.hasSearchScoreDetails() ? Value(metadata.getSearchScoreDetails())
+                                                    : Value();
+        default:
+            MONGO_UNREACHABLE;
     }
     MONGO_UNREACHABLE;
 }
 
-Value ExpressionMeta::evaluateInternal(Variables* vars) const {
-    const Document& root = vars->getRoot();
-    switch (_metaType) {
-        case MetaType::TEXT_SCORE:
-            return root.hasTextScore() ? Value(root.getTextScore()) : Value();
-        case MetaType::RAND_VAL:
-            return root.hasRandMetaField() ? Value(root.getRandMetaField()) : Value();
+void ExpressionMeta::_doAddDependencies(DepsTracker* deps) const {
+    if (_metaType == MetaType::kSearchScore || _metaType == MetaType::kSearchHighlights ||
+        _metaType == MetaType::kSearchScoreDetails) {
+        // We do not add the dependencies for searchScore, searchHighlights, or searchScoreDetails
+        // because those values are not stored in the collection (or in mongod at all).
+        return;
     }
-    MONGO_UNREACHABLE;
-}
 
-void ExpressionMeta::addDependencies(DepsTracker* deps, vector<string>* path) const {
-    if (_metaType == MetaType::TEXT_SCORE) {
-        deps->needTextScore = true;
-    }
-}
-
-/* ------------------------- ExpressionMillisecond ----------------------------- */
-
-Value ExpressionMillisecond::evaluateInternal(Variables* vars) const {
-    Value date(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(date.coerceToDate()));
-}
-
-int ExpressionMillisecond::extract(const long long date) {
-    const int ms = date % 1000LL;
-    // adding 1000 since dates before 1970 would have negative ms
-    return ms >= 0 ? ms : 1000 + ms;
-}
-
-REGISTER_EXPRESSION(millisecond, ExpressionMillisecond::parse);
-const char* ExpressionMillisecond::getOpName() const {
-    return "$millisecond";
-}
-
-/* ------------------------- ExpressionMinute -------------------------- */
-
-Value ExpressionMinute::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
-}
-
-REGISTER_EXPRESSION(minute, ExpressionMinute::parse);
-const char* ExpressionMinute::getOpName() const {
-    return "$minute";
+    deps->setNeedsMetadata(_metaType, true);
 }
 
 /* ----------------------- ExpressionMod ---------------------------- */
 
-Value ExpressionMod::evaluateInternal(Variables* vars) const {
-    Value lhs = vpOperand[0]->evaluateInternal(vars);
-    Value rhs = vpOperand[1]->evaluateInternal(vars);
+Value ExpressionMod::evaluate(const Document& root, Variables* variables) const {
+    Value lhs = _children[0]->evaluate(root, variables);
+    Value rhs = _children[1]->evaluate(root, variables);
 
     BSONType leftType = lhs.getType();
     BSONType rightType = rhs.getType();
 
     if (lhs.numeric() && rhs.numeric()) {
+        auto assertNonZero = [](bool isZero) { uassert(16610, "can't $mod by zero", !isZero); };
+
+        // If either side is decimal, perform the operation in decimal.
+        if (leftType == NumberDecimal || rightType == NumberDecimal) {
+            Decimal128 left = lhs.coerceToDecimal();
+            Decimal128 right = rhs.coerceToDecimal();
+            assertNonZero(right.isZero());
+
+            return Value(left.modulo(right));
+        }
+
         // ensure we aren't modding by 0
         double right = rhs.coerceToDouble();
-
-        uassert(16610, "can't $mod by 0", right != 0);
+        assertNonZero(right == 0);
 
         if (leftType == NumberDouble || (rightType == NumberDouble && !rhs.integral())) {
             // Need to do fmod. Integer-valued double case is handled below.
 
             double left = lhs.coerceToDouble();
             return Value(fmod(left, right));
-        } else if (leftType == NumberLong || rightType == NumberLong) {
+        }
+
+        if (leftType == NumberLong || rightType == NumberLong) {
             // if either is long, return long
             long long left = lhs.coerceToLong();
             long long rightLong = rhs.coerceToLong();
-            return Value(left % rightLong);
+            return Value(overflow::safeMod(left, rightLong));
         }
 
         // lastly they must both be ints, return int
         int left = lhs.coerceToInt();
         int rightInt = rhs.coerceToInt();
-        return Value(left % rightInt);
+        return Value(overflow::safeMod(left, rightInt));
     } else if (lhs.nullish() || rhs.nullish()) {
         return Value(BSONNULL);
     } else {
@@ -1994,21 +2898,9 @@ const char* ExpressionMod::getOpName() const {
     return "$mod";
 }
 
-/* ------------------------ ExpressionMonth ----------------------------- */
-
-Value ExpressionMonth::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
-}
-
-REGISTER_EXPRESSION(month, ExpressionMonth::parse);
-const char* ExpressionMonth::getOpName() const {
-    return "$month";
-}
-
 /* ------------------------- ExpressionMultiply ----------------------------- */
 
-Value ExpressionMultiply::evaluateInternal(Variables* vars) const {
+Value ExpressionMultiply::evaluate(const Document& root, Variables* variables) const {
     /*
       We'll try to return the narrowest possible result value.  To do that
       without creating intermediate Values, do the arithmetic for double
@@ -2017,17 +2909,35 @@ Value ExpressionMultiply::evaluateInternal(Variables* vars) const {
      */
     double doubleProduct = 1;
     long long longProduct = 1;
+    Decimal128 decimalProduct;  // This will be initialized on encountering the first decimal.
+
     BSONType productType = NumberInt;
 
-    const size_t n = vpOperand.size();
+    const size_t n = _children.size();
     for (size_t i = 0; i < n; ++i) {
-        Value val = vpOperand[i]->evaluateInternal(vars);
+        Value val = _children[i]->evaluate(root, variables);
 
         if (val.numeric()) {
+            BSONType oldProductType = productType;
             productType = Value::getWidestNumeric(productType, val.getType());
+            if (productType == NumberDecimal) {
+                // On finding the first decimal, convert the partial product to decimal.
+                if (oldProductType != NumberDecimal) {
+                    decimalProduct = oldProductType == NumberDouble
+                        ? Decimal128(doubleProduct, Decimal128::kRoundTo15Digits)
+                        : Decimal128(static_cast<int64_t>(longProduct));
+                }
+                decimalProduct = decimalProduct.multiply(val.coerceToDecimal());
+            } else {
+                doubleProduct *= val.coerceToDouble();
 
-            doubleProduct *= val.coerceToDouble();
-            longProduct *= val.coerceToLong();
+                if (!std::isfinite(val.coerceToDouble()) ||
+                    overflow::mul(longProduct, val.coerceToLong(), &longProduct)) {
+                    // The number is either Infinity or NaN, or the 'longProduct' would have
+                    // overflowed, so we're abandoning it.
+                    productType = NumberDouble;
+                }
+            }
         } else if (val.nullish()) {
             return Value(BSONNULL);
         } else {
@@ -2043,6 +2953,8 @@ Value ExpressionMultiply::evaluateInternal(Variables* vars) const {
         return Value(longProduct);
     else if (productType == NumberInt)
         return Value::createIntOrLong(longProduct);
+    else if (productType == NumberDecimal)
+        return Value(decimalProduct);
     else
         massert(16418, "$multiply resulted in a non-numeric type", false);
 }
@@ -2052,27 +2964,22 @@ const char* ExpressionMultiply::getOpName() const {
     return "$multiply";
 }
 
-/* ------------------------- ExpressionHour ----------------------------- */
-
-Value ExpressionHour::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
-}
-
-REGISTER_EXPRESSION(hour, ExpressionHour::parse);
-const char* ExpressionHour::getOpName() const {
-    return "$hour";
-}
-
 /* ----------------------- ExpressionIfNull ---------------------------- */
 
-Value ExpressionIfNull::evaluateInternal(Variables* vars) const {
-    Value pLeft(vpOperand[0]->evaluateInternal(vars));
-    if (!pLeft.nullish())
-        return pLeft;
+void ExpressionIfNull::validateArguments(const ExpressionVector& args) const {
+    uassert(1257300,
+            str::stream() << "$ifNull needs at least two arguments, had: " << args.size(),
+            args.size() >= 2);
+}
 
-    Value pRight(vpOperand[1]->evaluateInternal(vars));
-    return pRight;
+Value ExpressionIfNull::evaluate(const Document& root, Variables* variables) const {
+    const size_t n = _children.size();
+    for (size_t i = 0; i < n; ++i) {
+        Value pValue(_children[i]->evaluate(root, variables));
+        if (!pValue.nullish() || i == n - 1)
+            return pValue;
+    }
+    return Value();
 }
 
 REGISTER_EXPRESSION(ifNull, ExpressionIfNull::parse);
@@ -2080,9 +2987,334 @@ const char* ExpressionIfNull::getOpName() const {
     return "$ifNull";
 }
 
+/* ----------------------- ExpressionIn ---------------------------- */
+
+Value ExpressionIn::evaluate(const Document& root, Variables* variables) const {
+    Value argument(_children[0]->evaluate(root, variables));
+    Value arrayOfValues(_children[1]->evaluate(root, variables));
+
+    uassert(40081,
+            str::stream() << "$in requires an array as a second argument, found: "
+                          << typeName(arrayOfValues.getType()),
+            arrayOfValues.isArray());
+    for (auto&& value : arrayOfValues.getArray()) {
+        if (getExpressionContext()->getValueComparator().evaluate(argument == value)) {
+            return Value(true);
+        }
+    }
+    return Value(false);
+}
+
+REGISTER_EXPRESSION(in, ExpressionIn::parse);
+const char* ExpressionIn::getOpName() const {
+    return "$in";
+}
+
+/* ----------------------- ExpressionIndexOfArray ------------------ */
+
+namespace {
+
+void uassertIfNotIntegralAndNonNegative(Value val,
+                                        StringData expressionName,
+                                        StringData argumentName) {
+    uassert(40096,
+            str::stream() << expressionName << "requires an integral " << argumentName
+                          << ", found a value of type: " << typeName(val.getType())
+                          << ", with value: " << val.toString(),
+            val.integral());
+    uassert(40097,
+            str::stream() << expressionName << " requires a nonnegative " << argumentName
+                          << ", found: " << val.toString(),
+            val.coerceToInt() >= 0);
+}
+
+}  // namespace
+
+Value ExpressionIndexOfArray::evaluate(const Document& root, Variables* variables) const {
+    Value arrayArg = _children[0]->evaluate(root, variables);
+
+    if (arrayArg.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40090,
+            str::stream() << "$indexOfArray requires an array as a first argument, found: "
+                          << typeName(arrayArg.getType()),
+            arrayArg.isArray());
+
+    std::vector<Value> array = arrayArg.getArray();
+    auto args = evaluateAndValidateArguments(root, _children, array.size(), variables);
+    for (int i = args.startIndex; i < args.endIndex; i++) {
+        if (getExpressionContext()->getValueComparator().evaluate(array[i] ==
+                                                                  args.targetOfSearch)) {
+            return Value(static_cast<int>(i));
+        }
+    }
+
+
+    return Value(-1);
+}
+
+ExpressionIndexOfArray::Arguments ExpressionIndexOfArray::evaluateAndValidateArguments(
+    const Document& root,
+    const ExpressionVector& operands,
+    size_t arrayLength,
+    Variables* variables) const {
+
+    int startIndex = 0;
+    if (operands.size() > 2) {
+        Value startIndexArg = operands[2]->evaluate(root, variables);
+        uassertIfNotIntegralAndNonNegative(startIndexArg, getOpName(), "starting index");
+
+        startIndex = startIndexArg.coerceToInt();
+    }
+
+    int endIndex = arrayLength;
+    if (operands.size() > 3) {
+        Value endIndexArg = operands[3]->evaluate(root, variables);
+        uassertIfNotIntegralAndNonNegative(endIndexArg, getOpName(), "ending index");
+        // Don't let 'endIndex' exceed the length of the array.
+
+        endIndex = std::min(static_cast<int>(arrayLength), endIndexArg.coerceToInt());
+    }
+    return {_children[1]->evaluate(root, variables), startIndex, endIndex};
+}
+
+/**
+ * This class handles the case where IndexOfArray is given an ExpressionConstant
+ * instead of using a vector and searching through it we can use a unordered_map
+ * for O(1) lookup time.
+ */
+class ExpressionIndexOfArray::Optimized : public ExpressionIndexOfArray {
+public:
+    Optimized(ExpressionContext* const expCtx,
+              const ValueUnorderedMap<vector<int>>& indexMap,
+              const ExpressionVector& operands)
+        : ExpressionIndexOfArray(expCtx), _indexMap(std::move(indexMap)) {
+        _children = operands;
+    }
+
+    virtual Value evaluate(const Document& root, Variables* variables) const {
+
+        auto args = evaluateAndValidateArguments(root, _children, _indexMap.size(), variables);
+        auto indexVec = _indexMap.find(args.targetOfSearch);
+
+        if (indexVec == _indexMap.end())
+            return Value(-1);
+
+        // Search through the vector of indecies for first index in our range.
+        for (auto index : indexVec->second) {
+            if (index >= args.startIndex && index < args.endIndex) {
+                return Value(index);
+            }
+        }
+        // The value we are searching for exists but is not in our range.
+        return Value(-1);
+    }
+
+private:
+    // Maps the values in the array to the positions at which they occur. We need to remember the
+    // positions so that we can verify they are in the appropriate range.
+    const ValueUnorderedMap<vector<int>> _indexMap;
+};
+
+intrusive_ptr<Expression> ExpressionIndexOfArray::optimize() {
+    // This will optimize all arguments to this expression.
+    auto optimized = ExpressionNary::optimize();
+    if (optimized.get() != this) {
+        return optimized;
+    }
+    // If the input array is an ExpressionConstant we can optimize using a unordered_map instead of
+    // an
+    // array.
+    if (auto constantArray = dynamic_cast<ExpressionConstant*>(_children[0].get())) {
+        const Value valueArray = constantArray->getValue();
+        if (valueArray.nullish()) {
+            return ExpressionConstant::create(getExpressionContext(), Value(BSONNULL));
+        }
+        uassert(50809,
+                str::stream() << "First operand of $indexOfArray must be an array. First "
+                              << "argument is of type: " << typeName(valueArray.getType()),
+                valueArray.isArray());
+
+        auto arr = valueArray.getArray();
+
+        // To handle the case of duplicate values the values need to map to a vector of indecies.
+        auto indexMap =
+            getExpressionContext()->getValueComparator().makeUnorderedValueMap<vector<int>>();
+
+        for (int i = 0; i < int(arr.size()); i++) {
+            if (indexMap.find(arr[i]) == indexMap.end()) {
+                indexMap.emplace(arr[i], vector<int>());
+            }
+            indexMap[arr[i]].push_back(i);
+        }
+        return new Optimized(getExpressionContext(), indexMap, _children);
+    }
+    return this;
+}
+
+REGISTER_EXPRESSION(indexOfArray, ExpressionIndexOfArray::parse);
+const char* ExpressionIndexOfArray::getOpName() const {
+    return "$indexOfArray";
+}
+
+/* ----------------------- ExpressionIndexOfBytes ------------------ */
+
+namespace {
+
+bool stringHasTokenAtIndex(size_t index, const std::string& input, const std::string& token) {
+    if (token.size() + index > input.size()) {
+        return false;
+    }
+    return input.compare(index, token.size(), token) == 0;
+}
+
+}  // namespace
+
+Value ExpressionIndexOfBytes::evaluate(const Document& root, Variables* variables) const {
+    Value stringArg = _children[0]->evaluate(root, variables);
+
+    if (stringArg.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40091,
+            str::stream() << "$indexOfBytes requires a string as the first argument, found: "
+                          << typeName(stringArg.getType()),
+            stringArg.getType() == String);
+    const std::string& input = stringArg.getString();
+
+    Value tokenArg = _children[1]->evaluate(root, variables);
+    uassert(40092,
+            str::stream() << "$indexOfBytes requires a string as the second argument, found: "
+                          << typeName(tokenArg.getType()),
+            tokenArg.getType() == String);
+    const std::string& token = tokenArg.getString();
+
+    size_t startIndex = 0;
+    if (_children.size() > 2) {
+        Value startIndexArg = _children[2]->evaluate(root, variables);
+        uassertIfNotIntegralAndNonNegative(startIndexArg, getOpName(), "starting index");
+        startIndex = static_cast<size_t>(startIndexArg.coerceToInt());
+    }
+
+    size_t endIndex = input.size();
+    if (_children.size() > 3) {
+        Value endIndexArg = _children[3]->evaluate(root, variables);
+        uassertIfNotIntegralAndNonNegative(endIndexArg, getOpName(), "ending index");
+        // Don't let 'endIndex' exceed the length of the string.
+        endIndex = std::min(input.size(), static_cast<size_t>(endIndexArg.coerceToInt()));
+    }
+
+    if (startIndex > input.length() || endIndex < startIndex) {
+        return Value(-1);
+    }
+
+    size_t position = input.substr(0, endIndex).find(token, startIndex);
+    if (position == std::string::npos) {
+        return Value(-1);
+    }
+
+    return Value(static_cast<int>(position));
+}
+
+REGISTER_EXPRESSION(indexOfBytes, ExpressionIndexOfBytes::parse);
+const char* ExpressionIndexOfBytes::getOpName() const {
+    return "$indexOfBytes";
+}
+
+/* ----------------------- ExpressionIndexOfCP --------------------- */
+
+Value ExpressionIndexOfCP::evaluate(const Document& root, Variables* variables) const {
+    Value stringArg = _children[0]->evaluate(root, variables);
+
+    if (stringArg.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40093,
+            str::stream() << "$indexOfCP requires a string as the first argument, found: "
+                          << typeName(stringArg.getType()),
+            stringArg.getType() == String);
+    const std::string& input = stringArg.getString();
+
+    Value tokenArg = _children[1]->evaluate(root, variables);
+    uassert(40094,
+            str::stream() << "$indexOfCP requires a string as the second argument, found: "
+                          << typeName(tokenArg.getType()),
+            tokenArg.getType() == String);
+    const std::string& token = tokenArg.getString();
+
+    size_t startCodePointIndex = 0;
+    if (_children.size() > 2) {
+        Value startIndexArg = _children[2]->evaluate(root, variables);
+        uassertIfNotIntegralAndNonNegative(startIndexArg, getOpName(), "starting index");
+        startCodePointIndex = static_cast<size_t>(startIndexArg.coerceToInt());
+    }
+
+    // Compute the length (in code points) of the input, and convert 'startCodePointIndex' to a byte
+    // index.
+    size_t codePointLength = 0;
+    size_t startByteIndex = 0;
+    for (size_t byteIx = 0; byteIx < input.size(); ++codePointLength) {
+        if (codePointLength == startCodePointIndex) {
+            // We have determined the byte at which our search will start.
+            startByteIndex = byteIx;
+        }
+
+        uassert(40095,
+                "$indexOfCP found bad UTF-8 in the input",
+                !str::isUTF8ContinuationByte(input[byteIx]));
+        byteIx += str::getCodePointLength(input[byteIx]);
+    }
+
+    size_t endCodePointIndex = codePointLength;
+    if (_children.size() > 3) {
+        Value endIndexArg = _children[3]->evaluate(root, variables);
+        uassertIfNotIntegralAndNonNegative(endIndexArg, getOpName(), "ending index");
+
+        // Don't let 'endCodePointIndex' exceed the number of code points in the string.
+        endCodePointIndex =
+            std::min(codePointLength, static_cast<size_t>(endIndexArg.coerceToInt()));
+    }
+
+    if (startByteIndex == 0 && input.empty() && token.empty()) {
+        // If we are finding the index of "" in the string "", the below loop will not loop, so we
+        // need a special case for this.
+        return Value(0);
+    }
+
+    // We must keep track of which byte, and which code point, we are examining, being careful not
+    // to overflow either the length of the string or the ending code point.
+
+    size_t currentCodePointIndex = startCodePointIndex;
+    for (size_t byteIx = startByteIndex; currentCodePointIndex < endCodePointIndex;
+         ++currentCodePointIndex) {
+        if (stringHasTokenAtIndex(byteIx, input, token)) {
+            return Value(static_cast<int>(currentCodePointIndex));
+        }
+
+        byteIx += str::getCodePointLength(input[byteIx]);
+    }
+
+    return Value(-1);
+}
+
+REGISTER_EXPRESSION(indexOfCP, ExpressionIndexOfCP::parse);
+const char* ExpressionIndexOfCP::getOpName() const {
+    return "$indexOfCP";
+}
+
 /* ----------------------- ExpressionLn ---------------------------- */
 
 Value ExpressionLn::evaluateNumericArg(const Value& numericArg) const {
+    if (numericArg.getType() == NumberDecimal) {
+        Decimal128 argDecimal = numericArg.getDecimal();
+        if (argDecimal.isGreater(Decimal128::kNormalizedZero))
+            return Value(argDecimal.logarithm());
+        // Fall through for error case.
+    }
     double argDouble = numericArg.coerceToDouble();
     uassert(28766,
             str::stream() << "$ln's argument must be a positive number, but is " << argDouble,
@@ -2097,9 +3329,9 @@ const char* ExpressionLn::getOpName() const {
 
 /* ----------------------- ExpressionLog ---------------------------- */
 
-Value ExpressionLog::evaluateInternal(Variables* vars) const {
-    Value argVal = vpOperand[0]->evaluateInternal(vars);
-    Value baseVal = vpOperand[1]->evaluateInternal(vars);
+Value ExpressionLog::evaluate(const Document& root, Variables* variables) const {
+    Value argVal = _children[0]->evaluate(root, variables);
+    Value baseVal = _children[1]->evaluate(root, variables);
     if (argVal.nullish() || baseVal.nullish())
         return Value(BSONNULL);
 
@@ -2109,6 +3341,18 @@ Value ExpressionLog::evaluateInternal(Variables* vars) const {
     uassert(28757,
             str::stream() << "$log's base must be numeric, not " << typeName(baseVal.getType()),
             baseVal.numeric());
+
+    if (argVal.getType() == NumberDecimal || baseVal.getType() == NumberDecimal) {
+        Decimal128 argDecimal = argVal.coerceToDecimal();
+        Decimal128 baseDecimal = baseVal.coerceToDecimal();
+
+        if (argDecimal.isGreater(Decimal128::kNormalizedZero) &&
+            baseDecimal.isNotEqual(Decimal128(1)) &&
+            baseDecimal.isGreater(Decimal128::kNormalizedZero)) {
+            return Value(argDecimal.logarithm(baseDecimal));
+        }
+        // Fall through for error cases.
+    }
 
     double argDouble = argVal.coerceToDouble();
     double baseDouble = baseVal.coerceToDouble();
@@ -2130,6 +3374,13 @@ const char* ExpressionLog::getOpName() const {
 /* ----------------------- ExpressionLog10 ---------------------------- */
 
 Value ExpressionLog10::evaluateNumericArg(const Value& numericArg) const {
+    if (numericArg.getType() == NumberDecimal) {
+        Decimal128 argDecimal = numericArg.getDecimal();
+        if (argDecimal.isGreater(Decimal128::kNormalizedZero))
+            return Value(argDecimal.logarithm(Decimal128(10)));
+        // Fall through for error case.
+    }
+
     double argDouble = numericArg.coerceToDouble();
     uassert(28761,
             str::stream() << "$log10's argument must be a positive number, but is " << argDouble,
@@ -2144,101 +3395,131 @@ const char* ExpressionLog10::getOpName() const {
 
 /* ------------------------ ExpressionNary ----------------------------- */
 
+/**
+ * Optimize a general Nary expression.
+ *
+ * The optimization has the following properties:
+ *   1) Optimize each of the operators.
+ *   2) If the operand is associative, flatten internal operators of the same type. I.e.:
+ *      A+B+(C+D)+E => A+B+C+D+E
+ *   3) If the operand is commutative & associative, group all constant operators. For example:
+ *      c1 + c2 + n1 + c3 + n2 => n1 + n2 + c1 + c2 + c3
+ *   4) If the operand is associative, execute the operation over all the contiguous constant
+ *      operators and replacing them by the result. For example: c1 + c2 + n1 + c3 + c4 + n5 =>
+ *      c5 = c1 + c2, c6 = c3 + c4 => c5 + n1 + c6 + n5
+ *
+ * It returns the optimized expression. It can be exactly the same expression, a modified version
+ * of the same expression or a completely different expression.
+ */
 intrusive_ptr<Expression> ExpressionNary::optimize() {
-    const size_t n = vpOperand.size();
+    uint32_t constOperandCount = 0;
 
-    // optimize sub-expressions and count constants
-    unsigned constCount = 0;
-    for (size_t i = 0; i < n; ++i) {
-        intrusive_ptr<Expression> optimized = vpOperand[i]->optimize();
-
-        // substitute the optimized expression
-        vpOperand[i] = optimized;
-
-        // check to see if the result was a constant
-        if (dynamic_cast<ExpressionConstant*>(optimized.get())) {
-            constCount++;
+    for (auto& operand : _children) {
+        operand = operand->optimize();
+        if (dynamic_cast<ExpressionConstant*>(operand.get())) {
+            ++constOperandCount;
         }
     }
-
-    // If all the operands are constant, we can replace this expression with a constant. Using
-    // an empty Variables since it will never be accessed.
-    if (constCount == n) {
-        Variables emptyVars;
-        Value pResult(evaluateInternal(&emptyVars));
-        intrusive_ptr<Expression> pReplacement(ExpressionConstant::create(pResult));
-        return pReplacement;
+    // If all the operands are constant expressions, collapse the expression into one constant
+    // expression.
+    if (constOperandCount == _children.size()) {
+        return intrusive_ptr<Expression>(ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document(), &(getExpressionContext()->variables))));
     }
 
-    // Remaining optimizations are only for associative and commutative expressions.
-    if (!isAssociativeAndCommutative())
-        return this;
-
-    // Process vpOperand to split it into constant and nonconstant vectors.
-    // This can leave vpOperand in an invalid state that is cleaned up after the loop.
-    ExpressionVector constExprs;
-    ExpressionVector nonConstExprs;
-    for (size_t i = 0; i < vpOperand.size(); ++i) {  // NOTE: vpOperand grows in loop
-        intrusive_ptr<Expression> expr = vpOperand[i];
-        if (dynamic_cast<ExpressionConstant*>(expr.get())) {
-            constExprs.push_back(expr);
-        } else {
-            // If the child operand is the same type as this and is also associative and
-            // commutative, then we can extract its operands and inline them here. We detect
-            // sameness of the child operator by checking for equality of the opNames
-            ExpressionNary* nary = dynamic_cast<ExpressionNary*>(expr.get());
-            if (!nary || !str::equals(nary->getOpName(), getOpName()) ||
-                !nary->isAssociativeAndCommutative()) {
-                nonConstExprs.push_back(expr);
-            } else {
-                // same expression, so flatten by adding to vpOperand which
-                // will be processed later in this loop.
-                vpOperand.insert(vpOperand.end(), nary->vpOperand.begin(), nary->vpOperand.end());
+    // If the expression is associative, we can collapse all the consecutive constant operands into
+    // one by applying the expression to those consecutive constant operands.
+    // If the expression is also commutative we can reorganize all the operands so that all of the
+    // constant ones are together (arbitrarily at the back) and we can collapse all of them into
+    // one.
+    if (isAssociative()) {
+        ExpressionVector constExpressions;
+        ExpressionVector optimizedOperands;
+        for (size_t i = 0; i < _children.size();) {
+            intrusive_ptr<Expression> operand = _children[i];
+            // If the operand is a constant one, add it to the current list of consecutive constant
+            // operands.
+            if (dynamic_cast<ExpressionConstant*>(operand.get())) {
+                constExpressions.push_back(operand);
+                ++i;
+                continue;
             }
+
+            // If the operand is exactly the same type as the one we are currently optimizing and
+            // is also associative, replace the expression for the operands it has.
+            // E.g: sum(a, b, sum(c, d), e) => sum(a, b, c, d, e)
+            ExpressionNary* nary = dynamic_cast<ExpressionNary*>(operand.get());
+            if (nary && !strcmp(nary->getOpName(), getOpName()) && nary->isAssociative()) {
+                invariant(!nary->_children.empty());
+                _children[i] = std::move(nary->_children[0]);
+                _children.insert(
+                    _children.begin() + i + 1, nary->_children.begin() + 1, nary->_children.end());
+                continue;
+            }
+
+            // If the operand is not a constant nor a same-type expression and the expression is
+            // not commutative, evaluate an expression of the same type as the one we are
+            // optimizing on the list of consecutive constant operands and use the resulting value
+            // as a constant expression operand.
+            // If the list of consecutive constant operands has less than 2 operands just place
+            // back the operands.
+            if (!isCommutative()) {
+                if (constExpressions.size() > 1) {
+                    ExpressionVector childrenSave = std::move(_children);
+                    _children = std::move(constExpressions);
+                    optimizedOperands.emplace_back(ExpressionConstant::create(
+                        getExpressionContext(),
+                        evaluate(Document(), &(getExpressionContext()->variables))));
+                    _children = std::move(childrenSave);
+                } else {
+                    optimizedOperands.insert(
+                        optimizedOperands.end(), constExpressions.begin(), constExpressions.end());
+                }
+                constExpressions.clear();
+            }
+            optimizedOperands.push_back(operand);
+            ++i;
         }
-    }
 
-    // collapse all constant expressions (if any)
-    Value constValue;
-    if (!constExprs.empty()) {
-        vpOperand = constExprs;
-        Variables emptyVars;
-        constValue = evaluateInternal(&emptyVars);
-    }
+        if (constExpressions.size() > 1) {
+            _children = std::move(constExpressions);
+            optimizedOperands.emplace_back(ExpressionConstant::create(
+                getExpressionContext(),
+                evaluate(Document(), &(getExpressionContext()->variables))));
+        } else {
+            optimizedOperands.insert(
+                optimizedOperands.end(), constExpressions.begin(), constExpressions.end());
+        }
 
-    // now set the final expression list with constant (if any) at the end
-    vpOperand = nonConstExprs;
-    if (!constExprs.empty()) {
-        vpOperand.push_back(ExpressionConstant::create(constValue));
+        _children = std::move(optimizedOperands);
     }
-
     return this;
 }
 
-void ExpressionNary::addDependencies(DepsTracker* deps, vector<string>* path) const {
-    for (ExpressionVector::const_iterator i(vpOperand.begin()); i != vpOperand.end(); ++i) {
-        (*i)->addDependencies(deps);
+void ExpressionNary::_doAddDependencies(DepsTracker* deps) const {
+    for (auto&& operand : _children) {
+        operand->addDependencies(deps);
     }
 }
 
 void ExpressionNary::addOperand(const intrusive_ptr<Expression>& pExpression) {
-    vpOperand.push_back(pExpression);
+    _children.push_back(pExpression);
 }
 
 Value ExpressionNary::serialize(bool explain) const {
-    const size_t nOperand = vpOperand.size();
+    const size_t nOperand = _children.size();
     vector<Value> array;
     /* build up the array */
     for (size_t i = 0; i < nOperand; i++)
-        array.push_back(vpOperand[i]->serialize(explain));
+        array.push_back(_children[i]->serialize(explain));
 
     return Value(DOC(getOpName() << array));
 }
 
 /* ------------------------- ExpressionNot ----------------------------- */
 
-Value ExpressionNot::evaluateInternal(Variables* vars) const {
-    Value pOp(vpOperand[0]->evaluateInternal(vars));
+Value ExpressionNot::evaluate(const Document& root, Variables* variables) const {
+    Value pOp(_children[0]->evaluate(root, variables));
 
     bool b = pOp.coerceToBool();
     return Value(!b);
@@ -2251,10 +3532,10 @@ const char* ExpressionNot::getOpName() const {
 
 /* -------------------------- ExpressionOr ----------------------------- */
 
-Value ExpressionOr::evaluateInternal(Variables* vars) const {
-    const size_t n = vpOperand.size();
+Value ExpressionOr::evaluate(const Document& root, Variables* variables) const {
+    const size_t n = _children.size();
     for (size_t i = 0; i < n; ++i) {
-        Value pValue(vpOperand[i]->evaluateInternal(vars));
+        Value pValue(_children[i]->evaluate(root, variables));
         if (pValue.coerceToBool())
             return Value(true);
     }
@@ -2276,10 +3557,10 @@ intrusive_ptr<Expression> ExpressionOr::optimize() {
       promised by ExpressionNary::optimize(),) then there's nothing
       we can do.
     */
-    const size_t n = pOr->vpOperand.size();
+    const size_t n = pOr->_children.size();
     // ExpressionNary::optimize() generates an ExpressionConstant for {$or:[]}.
     verify(n > 0);
-    intrusive_ptr<Expression> pLast(pOr->vpOperand[n - 1]);
+    intrusive_ptr<Expression> pLast(pOr->_children[n - 1]);
     const ExpressionConstant* pConst = dynamic_cast<ExpressionConstant*>(pLast.get());
     if (!pConst)
         return pE;
@@ -2290,7 +3571,8 @@ intrusive_ptr<Expression> ExpressionOr::optimize() {
      */
     bool last = pConst->getValue().coerceToBool();
     if (last) {
-        intrusive_ptr<ExpressionConstant> pFinal(ExpressionConstant::create(Value(true)));
+        intrusive_ptr<ExpressionConstant> pFinal(
+            ExpressionConstant::create(getExpressionContext(), Value(true)));
         return pFinal;
     }
 
@@ -2301,14 +3583,15 @@ intrusive_ptr<Expression> ExpressionOr::optimize() {
       the result will be a boolean.
      */
     if (n == 2) {
-        intrusive_ptr<Expression> pFinal(ExpressionCoerceToBool::create(pOr->vpOperand[0]));
+        intrusive_ptr<Expression> pFinal(
+            ExpressionCoerceToBool::create(getExpressionContext(), std::move(pOr->_children[0])));
         return pFinal;
     }
 
     /*
       Remove the final "false" value, and return the new expression.
     */
-    pOr->vpOperand.resize(n - 1);
+    pOr->_children.resize(n - 1);
     return pE;
 }
 
@@ -2317,11 +3600,115 @@ const char* ExpressionOr::getOpName() const {
     return "$or";
 }
 
+namespace {
+/**
+ * Helper for ExpressionPow to determine wither base^exp can be represented in a 64 bit int.
+ *
+ *'base' and 'exp' are both integers. Assumes 'exp' is in the range [0, 63].
+ */
+bool representableAsLong(long long base, long long exp) {
+    invariant(exp <= 63);
+    invariant(exp >= 0);
+    struct MinMax {
+        long long min;
+        long long max;
+    };
+
+    // Array indices correspond to exponents 0 through 63. The values in each index are the min
+    // and max bases, respectively, that can be raised to that exponent without overflowing a
+    // 64-bit int. For max bases, this was computed by solving for b in
+    // b = (2^63-1)^(1/exp) for exp = [0, 63] and truncating b. To calculate min bases, for even
+    // exps the equation  used was b = (2^63-1)^(1/exp), and for odd exps the equation used was
+    // b = (-2^63)^(1/exp). Since the magnitude of long min is greater than long max, the
+    // magnitude of some of the min bases raised to odd exps is greater than the corresponding
+    // max bases raised to the same exponents.
+
+    static const MinMax kBaseLimits[] = {
+        {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},  // 0
+        {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},
+        {-3037000499LL, 3037000499LL},
+        {-2097152, 2097151},
+        {-55108, 55108},
+        {-6208, 6208},
+        {-1448, 1448},
+        {-512, 511},
+        {-234, 234},
+        {-128, 127},
+        {-78, 78},  // 10
+        {-52, 52},
+        {-38, 38},
+        {-28, 28},
+        {-22, 22},
+        {-18, 18},
+        {-15, 15},
+        {-13, 13},
+        {-11, 11},
+        {-9, 9},
+        {-8, 8},  // 20
+        {-8, 7},
+        {-7, 7},
+        {-6, 6},
+        {-6, 6},
+        {-5, 5},
+        {-5, 5},
+        {-5, 5},
+        {-4, 4},
+        {-4, 4},
+        {-4, 4},  // 30
+        {-4, 4},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-2, 2},  // 40
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},  // 50
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},  // 60
+        {-2, 2},
+        {-2, 2},
+        {-2, 1}};
+
+    return base >= kBaseLimits[exp].min && base <= kBaseLimits[exp].max;
+};
+}  // namespace
+
 /* ----------------------- ExpressionPow ---------------------------- */
 
-Value ExpressionPow::evaluateInternal(Variables* vars) const {
-    Value baseVal = vpOperand[0]->evaluateInternal(vars);
-    Value expVal = vpOperand[1]->evaluateInternal(vars);
+intrusive_ptr<Expression> ExpressionPow::create(ExpressionContext* const expCtx,
+                                                Value base,
+                                                Value exp) {
+    intrusive_ptr<ExpressionPow> expr(new ExpressionPow(expCtx));
+    expr->_children.push_back(
+        ExpressionConstant::create(expr->getExpressionContext(), std::move(base)));
+    expr->_children.push_back(
+        ExpressionConstant::create(expr->getExpressionContext(), std::move(exp)));
+    return expr;
+}
+
+Value ExpressionPow::evaluate(const Document& root, Variables* variables) const {
+    Value baseVal = _children[0]->evaluate(root, variables);
+    Value expVal = _children[1]->evaluate(root, variables);
     if (baseVal.nullish() || expVal.nullish())
         return Value(BSONNULL);
 
@@ -2335,132 +3722,99 @@ Value ExpressionPow::evaluateInternal(Variables* vars) const {
             str::stream() << "$pow's exponent must be numeric, not " << typeName(expType),
             expVal.numeric());
 
+    auto checkNonZeroAndNeg = [](bool isZeroAndNeg) {
+        uassert(28764, "$pow cannot take a base of 0 and a negative exponent", !isZeroAndNeg);
+    };
+
+    // If either argument is decimal, return a decimal.
+    if (baseType == NumberDecimal || expType == NumberDecimal) {
+        Decimal128 baseDecimal = baseVal.coerceToDecimal();
+        Decimal128 expDecimal = expVal.coerceToDecimal();
+        checkNonZeroAndNeg(baseDecimal.isZero() && expDecimal.isNegative());
+        return Value(baseDecimal.power(expDecimal));
+    }
+
     // pow() will cast args to doubles.
     double baseDouble = baseVal.coerceToDouble();
     double expDouble = expVal.coerceToDouble();
+    checkNonZeroAndNeg(baseDouble == 0 && expDouble < 0);
 
-    uassert(28764,
-            "$pow cannot take a base of 0 and a negative exponent",
-            !(baseDouble == 0 && expDouble < 0));
-
-    // If either number is a double, return a double.
+    // If either argument is a double, return a double.
     if (baseType == NumberDouble || expType == NumberDouble) {
         return Value(std::pow(baseDouble, expDouble));
     }
 
-    // base and exp are both integers.
-
-    auto representableAsLong = [](long long base, long long exp) {
-        // If exp is greater than 63 and base is not -1, 0, or 1, the result will overflow.
-        // If exp is negative and the base is not -1 or 1, the result will be fractional.
-        if (exp < 0 || exp > 63) {
-            return std::abs(base) == 1 || base == 0;
+    // If either number is a long, return a long. If both numbers are ints, then return an int if
+    // the result fits or a long if it is too big.
+    const auto formatResult = [baseType, expType](long long res) {
+        if (baseType == NumberLong || expType == NumberLong) {
+            return Value(res);
         }
-
-        struct MinMax {
-            long long min;
-            long long max;
-        };
-
-        // Array indices correspond to exponents 0 through 63. The values in each index are the min
-        // and max bases, respectively, that can be raised to that exponent without overflowing a
-        // 64-bit int. For max bases, this was computed by solving for b in
-        // b = (2^63-1)^(1/exp) for exp = [0, 63] and truncating b. To calculate min bases, for even
-        // exps the equation  used was b = (2^63-1)^(1/exp), and for odd exps the equation used was
-        // b = (-2^63)^(1/exp). Since the magnitude of long min is greater than long max, the
-        // magnitude of some of the min bases raised to odd exps is greater than the corresponding
-        // max bases raised to the same exponents.
-
-        static const MinMax kBaseLimits[] = {
-            {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},  // 0
-            {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},
-            {-3037000499LL, 3037000499LL},
-            {-2097152, 2097151},
-            {-55108, 55108},
-            {-6208, 6208},
-            {-1448, 1448},
-            {-512, 511},
-            {-234, 234},
-            {-128, 127},
-            {-78, 78},  // 10
-            {-52, 52},
-            {-38, 38},
-            {-28, 28},
-            {-22, 22},
-            {-18, 18},
-            {-15, 15},
-            {-13, 13},
-            {-11, 11},
-            {-9, 9},
-            {-8, 8},  // 20
-            {-8, 7},
-            {-7, 7},
-            {-6, 6},
-            {-6, 6},
-            {-5, 5},
-            {-5, 5},
-            {-5, 5},
-            {-4, 4},
-            {-4, 4},
-            {-4, 4},  // 30
-            {-4, 4},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-2, 2},  // 40
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},  // 50
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},  // 60
-            {-2, 2},
-            {-2, 2},
-            {-2, 1}};
-
-        return base >= kBaseLimits[exp].min && base <= kBaseLimits[exp].max;
+        return Value::createIntOrLong(res);
     };
 
-    long long baseLong = baseVal.getLong();
-    long long expLong = expVal.getLong();
+    const long long baseLong = baseVal.getLong();
+    const long long expLong = expVal.getLong();
 
-    // If the result cannot be represented as a long, return a double. Otherwise if either number
-    // is a long, return a long. If both numbers are ints, then return an int if the result fits or
-    // a long if it is too big.
-    if (!representableAsLong(baseLong, expLong)) {
+    // Use this when the result cannot be represented as a long.
+    const auto computeDoubleResult = [baseLong, expLong]() {
         return Value(std::pow(baseLong, expLong));
+    };
+
+    // Avoid doing repeated multiplication or using std::pow if the base is -1, 0, or 1.
+    if (baseLong == 0) {
+        if (expLong == 0) {
+            // 0^0 = 1.
+            return formatResult(1);
+        } else if (expLong > 0) {
+            // 0^x where x > 0 is 0.
+            return formatResult(0);
+        }
+
+        // We should have checked earlier that 0 to a negative power is banned.
+        MONGO_UNREACHABLE;
+    } else if (baseLong == 1) {
+        return formatResult(1);
+    } else if (baseLong == -1) {
+        // -1^0 = -1^2 = -1^4 = -1^6 ... = 1
+        // -1^1 = -1^3 = -1^5 = -1^7 ... = -1
+        return formatResult((expLong % 2 == 0) ? 1 : -1);
+    } else if (expLong > 63 || expLong < 0) {
+        // If the base is not 0, 1, or -1 and the exponent is too large, or negative,
+        // the result cannot be represented as a long.
+        return computeDoubleResult();
     }
 
-    long long result = 1;
-    // Use repeated multiplication, since pow() casts args to doubles which could result in loss of
-    // precision if arguments are very large.
-    for (int i = 0; i < expLong; i++) {
-        result *= baseLong;
+    // It's still possible that the result cannot be represented as a long. If that's the case,
+    // return a double.
+    if (!representableAsLong(baseLong, expLong)) {
+        return computeDoubleResult();
     }
 
-    if (baseType == NumberLong || expType == NumberLong) {
-        return Value(result);
-    }
-    return Value::createIntOrLong(result);
+    // Use repeated multiplication, since pow() casts args to doubles which could result in
+    // loss of precision if arguments are very large.
+    const auto computeWithRepeatedMultiplication = [](long long base, long long exp) {
+        long long result = 1;
+
+        while (exp > 1) {
+            if (exp % 2 == 1) {
+                result *= base;
+                exp--;
+            }
+            // 'exp' is now guaranteed to be even.
+            base *= base;
+            exp /= 2;
+        }
+
+        if (exp) {
+            invariant(exp == 1);
+            result *= base;
+        }
+
+        return result;
+    };
+
+    return formatResult(computeWithRepeatedMultiplication(baseLong, expLong));
 }
 
 REGISTER_EXPRESSION(pow, ExpressionPow::parse);
@@ -2468,30 +3822,362 @@ const char* ExpressionPow::getOpName() const {
     return "$pow";
 }
 
-/* ------------------------- ExpressionSecond ----------------------------- */
+/* ------------------------- ExpressionRange ------------------------------ */
 
-Value ExpressionSecond::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
+Value ExpressionRange::evaluate(const Document& root, Variables* variables) const {
+    Value startVal(_children[0]->evaluate(root, variables));
+    Value endVal(_children[1]->evaluate(root, variables));
+
+    uassert(34443,
+            str::stream() << "$range requires a numeric starting value, found value of type: "
+                          << typeName(startVal.getType()),
+            startVal.numeric());
+    uassert(34444,
+            str::stream() << "$range requires a starting value that can be represented as a 32-bit "
+                             "integer, found value: "
+                          << startVal.toString(),
+            startVal.integral());
+    uassert(34445,
+            str::stream() << "$range requires a numeric ending value, found value of type: "
+                          << typeName(endVal.getType()),
+            endVal.numeric());
+    uassert(34446,
+            str::stream() << "$range requires an ending value that can be represented as a 32-bit "
+                             "integer, found value: "
+                          << endVal.toString(),
+            endVal.integral());
+
+    int current = startVal.coerceToInt();
+    int end = endVal.coerceToInt();
+
+    int step = 1;
+    if (_children.size() == 3) {
+        // A step was specified by the user.
+        Value stepVal(_children[2]->evaluate(root, variables));
+
+        uassert(34447,
+                str::stream() << "$range requires a numeric step value, found value of type:"
+                              << typeName(stepVal.getType()),
+                stepVal.numeric());
+        uassert(34448,
+                str::stream() << "$range requires a step value that can be represented as a 32-bit "
+                                 "integer, found value: "
+                              << stepVal.toString(),
+                stepVal.integral());
+        step = stepVal.coerceToInt();
+
+        uassert(34449, "$range requires a non-zero step value", step != 0);
+    }
+
+    std::vector<Value> output;
+
+    while ((step > 0 ? current < end : current > end)) {
+        output.push_back(Value(current));
+        current += step;
+    }
+
+    return Value(output);
 }
 
-REGISTER_EXPRESSION(second, ExpressionSecond::parse);
-const char* ExpressionSecond::getOpName() const {
-    return "$second";
+REGISTER_EXPRESSION(range, ExpressionRange::parse);
+const char* ExpressionRange::getOpName() const {
+    return "$range";
+}
+
+/* ------------------------ ExpressionReduce ------------------------------ */
+
+REGISTER_EXPRESSION(reduce, ExpressionReduce::parse);
+intrusive_ptr<Expression> ExpressionReduce::parse(ExpressionContext* const expCtx,
+                                                  BSONElement expr,
+                                                  const VariablesParseState& vps) {
+    uassert(40075,
+            str::stream() << "$reduce requires an object as an argument, found: "
+                          << typeName(expr.type()),
+            expr.type() == Object);
+
+
+    // vpsSub is used only to parse 'in', which must have access to $$this and $$value.
+    VariablesParseState vpsSub(vps);
+    auto thisVar = vpsSub.defineVariable("this");
+    auto valueVar = vpsSub.defineVariable("value");
+
+    boost::intrusive_ptr<Expression> input;
+    boost::intrusive_ptr<Expression> initial;
+    boost::intrusive_ptr<Expression> in;
+    for (auto&& elem : expr.Obj()) {
+        auto field = elem.fieldNameStringData();
+
+        if (field == "input") {
+            input = parseOperand(expCtx, elem, vps);
+        } else if (field == "initialValue") {
+            initial = parseOperand(expCtx, elem, vps);
+        } else if (field == "in") {
+            in = parseOperand(expCtx, elem, vpsSub);
+        } else {
+            uasserted(40076, str::stream() << "$reduce found an unknown argument: " << field);
+        }
+    }
+
+    uassert(40077, "$reduce requires 'input' to be specified", input);
+    uassert(40078, "$reduce requires 'initialValue' to be specified", initial);
+    uassert(40079, "$reduce requires 'in' to be specified", in);
+
+    return new ExpressionReduce(
+        expCtx, std::move(input), std::move(initial), std::move(in), thisVar, valueVar);
+}
+
+Value ExpressionReduce::evaluate(const Document& root, Variables* variables) const {
+    Value inputVal = _input->evaluate(root, variables);
+
+    if (inputVal.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40080,
+            str::stream() << "$reduce requires that 'input' be an array, found: "
+                          << inputVal.toString(),
+            inputVal.isArray());
+
+    Value accumulatedValue = _initial->evaluate(root, variables);
+
+    for (auto&& elem : inputVal.getArray()) {
+        variables->setValue(_thisVar, elem);
+        variables->setValue(_valueVar, accumulatedValue);
+
+        accumulatedValue = _in->evaluate(root, variables);
+    }
+
+    return accumulatedValue;
+}
+
+intrusive_ptr<Expression> ExpressionReduce::optimize() {
+    _input = _input->optimize();
+    _initial = _initial->optimize();
+    _in = _in->optimize();
+    return this;
+}
+
+void ExpressionReduce::_doAddDependencies(DepsTracker* deps) const {
+    _input->addDependencies(deps);
+    _initial->addDependencies(deps);
+    _in->addDependencies(deps);
+}
+
+Value ExpressionReduce::serialize(bool explain) const {
+    return Value(Document{{"$reduce",
+                           Document{{"input", _input->serialize(explain)},
+                                    {"initialValue", _initial->serialize(explain)},
+                                    {"in", _in->serialize(explain)}}}});
+}
+
+/* ------------------------ ExpressionReplaceBase ------------------------ */
+
+void ExpressionReplaceBase::_doAddDependencies(DepsTracker* deps) const {
+    _input->addDependencies(deps);
+    _find->addDependencies(deps);
+    _replacement->addDependencies(deps);
+}
+
+Value ExpressionReplaceBase::serialize(bool explain) const {
+    return Value(Document{{getOpName(),
+                           Document{{"input", _input->serialize(explain)},
+                                    {"find", _find->serialize(explain)},
+                                    {"replacement", _replacement->serialize(explain)}}}});
 }
 
 namespace {
-ValueSet arrayToSet(const Value& val) {
+std::tuple<intrusive_ptr<Expression>, intrusive_ptr<Expression>, intrusive_ptr<Expression>>
+parseExpressionReplaceBase(const char* opName,
+                           ExpressionContext* const expCtx,
+                           BSONElement expr,
+                           const VariablesParseState& vps) {
+
+    uassert(51751,
+            str::stream() << opName
+                          << " requires an object as an argument, found: " << typeName(expr.type()),
+            expr.type() == Object);
+
+    intrusive_ptr<Expression> input;
+    intrusive_ptr<Expression> find;
+    intrusive_ptr<Expression> replacement;
+    for (auto&& elem : expr.Obj()) {
+        auto field = elem.fieldNameStringData();
+
+        if (field == "input"_sd) {
+            input = Expression::parseOperand(expCtx, elem, vps);
+        } else if (field == "find"_sd) {
+            find = Expression::parseOperand(expCtx, elem, vps);
+        } else if (field == "replacement"_sd) {
+            replacement = Expression::parseOperand(expCtx, elem, vps);
+        } else {
+            uasserted(51750, str::stream() << opName << " found an unknown argument: " << field);
+        }
+    }
+
+    uassert(51749, str::stream() << opName << " requires 'input' to be specified", input);
+    uassert(51748, str::stream() << opName << " requires 'find' to be specified", find);
+    uassert(
+        51747, str::stream() << opName << " requires 'replacement' to be specified", replacement);
+
+    return {input, find, replacement};
+}
+}  // namespace
+
+Value ExpressionReplaceBase::evaluate(const Document& root, Variables* variables) const {
+    Value input = _input->evaluate(root, variables);
+    Value find = _find->evaluate(root, variables);
+    Value replacement = _replacement->evaluate(root, variables);
+
+    // Throw an error if any arg is non-string, non-nullish.
+    uassert(51746,
+            str::stream() << getOpName()
+                          << " requires that 'input' be a string, found: " << input.toString(),
+            input.getType() == BSONType::String || input.nullish());
+    uassert(51745,
+            str::stream() << getOpName()
+                          << " requires that 'find' be a string, found: " << find.toString(),
+            find.getType() == BSONType::String || find.nullish());
+    uassert(51744,
+            str::stream() << getOpName() << " requires that 'replacement' be a string, found: "
+                          << replacement.toString(),
+            replacement.getType() == BSONType::String || replacement.nullish());
+
+    // Return null if any arg is nullish.
+    if (input.nullish())
+        return Value(BSONNULL);
+    if (find.nullish())
+        return Value(BSONNULL);
+    if (replacement.nullish())
+        return Value(BSONNULL);
+
+    return _doEval(input.getStringData(), find.getStringData(), replacement.getStringData());
+}
+
+intrusive_ptr<Expression> ExpressionReplaceBase::optimize() {
+    _input = _input->optimize();
+    _find = _find->optimize();
+    _replacement = _replacement->optimize();
+    return this;
+}
+
+/* ------------------------ ExpressionReplaceOne ------------------------ */
+
+REGISTER_EXPRESSION(replaceOne, ExpressionReplaceOne::parse);
+
+intrusive_ptr<Expression> ExpressionReplaceOne::parse(ExpressionContext* const expCtx,
+                                                      BSONElement expr,
+                                                      const VariablesParseState& vps) {
+    auto [input, find, replacement] = parseExpressionReplaceBase(opName, expCtx, expr, vps);
+    return make_intrusive<ExpressionReplaceOne>(
+        expCtx, std::move(input), std::move(find), std::move(replacement));
+}
+
+Value ExpressionReplaceOne::_doEval(StringData input,
+                                    StringData find,
+                                    StringData replacement) const {
+    size_t startIndex = input.find(find);
+    if (startIndex == std::string::npos) {
+        return Value(StringData(input));
+    }
+
+    // An empty string matches at every position, so replaceOne should insert the replacement text
+    // at position 0. input.find correctly returns position 0 when 'find' is empty, so we don't need
+    // any special case to handle this.
+    size_t endIndex = startIndex + find.size();
+    StringBuilder output;
+    output << input.substr(0, startIndex);
+    output << replacement;
+    output << input.substr(endIndex);
+    return Value(output.stringData());
+}
+
+/* ------------------------ ExpressionReplaceAll ------------------------ */
+
+REGISTER_EXPRESSION(replaceAll, ExpressionReplaceAll::parse);
+
+intrusive_ptr<Expression> ExpressionReplaceAll::parse(ExpressionContext* const expCtx,
+                                                      BSONElement expr,
+                                                      const VariablesParseState& vps) {
+    auto [input, find, replacement] = parseExpressionReplaceBase(opName, expCtx, expr, vps);
+    return make_intrusive<ExpressionReplaceAll>(
+        expCtx, std::move(input), std::move(find), std::move(replacement));
+}
+
+Value ExpressionReplaceAll::_doEval(StringData input,
+                                    StringData find,
+                                    StringData replacement) const {
+    // An empty string matches at every position, so replaceAll should insert 'replacement' at every
+    // position when 'find' is empty. Handling this as a special case lets us assume 'find' is
+    // nonempty in the usual case.
+    if (find.size() == 0) {
+        StringBuilder output;
+        for (char c : input) {
+            output << replacement << c;
+        }
+        output << replacement;
+        return Value(output.stringData());
+    }
+
+    StringBuilder output;
+    for (;;) {
+        size_t startIndex = input.find(find);
+        if (startIndex == std::string::npos) {
+            output << input;
+            break;
+        }
+
+        size_t endIndex = startIndex + find.size();
+        output << input.substr(0, startIndex);
+        output << replacement;
+        // This step assumes 'find' is nonempty. If 'find' were empty then input.find would always
+        // find a match at position 0, and the input would never shrink.
+        input = input.substr(endIndex);
+    }
+    return Value(output.stringData());
+}
+
+/* ------------------------ ExpressionReverseArray ------------------------ */
+
+Value ExpressionReverseArray::evaluate(const Document& root, Variables* variables) const {
+    Value input(_children[0]->evaluate(root, variables));
+
+    if (input.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(34435,
+            str::stream() << "The argument to $reverseArray must be an array, but was of type: "
+                          << typeName(input.getType()),
+            input.isArray());
+
+    if (input.getArrayLength() < 2) {
+        return input;
+    }
+
+    std::vector<Value> array = input.getArray();
+    std::reverse(array.begin(), array.end());
+    return Value(array);
+}
+
+REGISTER_EXPRESSION(reverseArray, ExpressionReverseArray::parse);
+const char* ExpressionReverseArray::getOpName() const {
+    return "$reverseArray";
+}
+
+namespace {
+ValueSet arrayToSet(const Value& val, const ValueComparator& valueComparator) {
     const vector<Value>& array = val.getArray();
-    return ValueSet(array.begin(), array.end());
+    ValueSet valueSet = valueComparator.makeOrderedValueSet();
+    valueSet.insert(array.begin(), array.end());
+    return valueSet;
 }
-}
+}  // namespace
 
 /* ----------------------- ExpressionSetDifference ---------------------------- */
 
-Value ExpressionSetDifference::evaluateInternal(Variables* vars) const {
-    const Value lhs = vpOperand[0]->evaluateInternal(vars);
-    const Value rhs = vpOperand[1]->evaluateInternal(vars);
+Value ExpressionSetDifference::evaluate(const Document& root, Variables* variables) const {
+    const Value lhs = _children[0]->evaluate(root, variables);
+    const Value rhs = _children[1]->evaluate(root, variables);
 
     if (lhs.nullish() || rhs.nullish()) {
         return Value(BSONNULL);
@@ -2500,13 +4186,13 @@ Value ExpressionSetDifference::evaluateInternal(Variables* vars) const {
     uassert(17048,
             str::stream() << "both operands of $setDifference must be arrays. First "
                           << "argument is of type: " << typeName(lhs.getType()),
-            lhs.getType() == Array);
+            lhs.isArray());
     uassert(17049,
             str::stream() << "both operands of $setDifference must be arrays. Second "
                           << "argument is of type: " << typeName(rhs.getType()),
-            rhs.getType() == Array);
+            rhs.isArray());
 
-    ValueSet rhsSet = arrayToSet(rhs);
+    ValueSet rhsSet = arrayToSet(rhs, getExpressionContext()->getValueComparator());
     const vector<Value>& lhsArray = lhs.getArray();
     vector<Value> returnVec;
 
@@ -2533,22 +4219,28 @@ void ExpressionSetEquals::validateArguments(const ExpressionVector& args) const 
             args.size() >= 2);
 }
 
-Value ExpressionSetEquals::evaluateInternal(Variables* vars) const {
-    const size_t n = vpOperand.size();
-    std::set<Value> lhs;
+Value ExpressionSetEquals::evaluate(const Document& root, Variables* variables) const {
+    const size_t n = _children.size();
+    const auto& valueComparator = getExpressionContext()->getValueComparator();
+    ValueSet lhs = valueComparator.makeOrderedValueSet();
 
     for (size_t i = 0; i < n; i++) {
-        const Value nextEntry = vpOperand[i]->evaluateInternal(vars);
+        const Value nextEntry = _children[i]->evaluate(root, variables);
         uassert(17044,
                 str::stream() << "All operands of $setEquals must be arrays. One "
                               << "argument is of type: " << typeName(nextEntry.getType()),
-                nextEntry.getType() == Array);
+                nextEntry.isArray());
 
         if (i == 0) {
             lhs.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
         } else {
-            const std::set<Value> rhs(nextEntry.getArray().begin(), nextEntry.getArray().end());
-            if (lhs != rhs) {
+            ValueSet rhs = valueComparator.makeOrderedValueSet();
+            rhs.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
+            if (lhs.size() != rhs.size()) {
+                return Value(false);
+            }
+
+            if (!std::equal(lhs.begin(), lhs.end(), rhs.begin(), valueComparator.getEqualTo())) {
                 return Value(false);
             }
         }
@@ -2563,23 +4255,24 @@ const char* ExpressionSetEquals::getOpName() const {
 
 /* ----------------------- ExpressionSetIntersection ---------------------------- */
 
-Value ExpressionSetIntersection::evaluateInternal(Variables* vars) const {
-    const size_t n = vpOperand.size();
-    ValueSet currentIntersection;
+Value ExpressionSetIntersection::evaluate(const Document& root, Variables* variables) const {
+    const size_t n = _children.size();
+    const auto& valueComparator = getExpressionContext()->getValueComparator();
+    ValueSet currentIntersection = valueComparator.makeOrderedValueSet();
     for (size_t i = 0; i < n; i++) {
-        const Value nextEntry = vpOperand[i]->evaluateInternal(vars);
+        const Value nextEntry = _children[i]->evaluate(root, variables);
         if (nextEntry.nullish()) {
             return Value(BSONNULL);
         }
         uassert(17047,
                 str::stream() << "All operands of $setIntersection must be arrays. One "
                               << "argument is of type: " << typeName(nextEntry.getType()),
-                nextEntry.getType() == Array);
+                nextEntry.isArray());
 
         if (i == 0) {
             currentIntersection.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
-        } else {
-            ValueSet nextSet = arrayToSet(nextEntry);
+        } else if (!currentIntersection.empty()) {
+            ValueSet nextSet = arrayToSet(nextEntry, valueComparator);
             if (currentIntersection.size() > nextSet.size()) {
                 // to iterate over whichever is the smaller set
                 nextSet.swap(currentIntersection);
@@ -2594,9 +4287,6 @@ Value ExpressionSetIntersection::evaluateInternal(Variables* vars) const {
                     ++it;
                 }
             }
-        }
-        if (currentIntersection.empty()) {
-            break;
         }
     }
     return Value(vector<Value>(currentIntersection.begin(), currentIntersection.end()));
@@ -2620,22 +4310,23 @@ Value setIsSubsetHelper(const vector<Value>& lhs, const ValueSet& rhs) {
     }
     return Value(true);
 }
-}
+}  // namespace
 
-Value ExpressionSetIsSubset::evaluateInternal(Variables* vars) const {
-    const Value lhs = vpOperand[0]->evaluateInternal(vars);
-    const Value rhs = vpOperand[1]->evaluateInternal(vars);
+Value ExpressionSetIsSubset::evaluate(const Document& root, Variables* variables) const {
+    const Value lhs = _children[0]->evaluate(root, variables);
+    const Value rhs = _children[1]->evaluate(root, variables);
 
     uassert(17046,
             str::stream() << "both operands of $setIsSubset must be arrays. First "
                           << "argument is of type: " << typeName(lhs.getType()),
-            lhs.getType() == Array);
+            lhs.isArray());
     uassert(17042,
             str::stream() << "both operands of $setIsSubset must be arrays. Second "
                           << "argument is of type: " << typeName(rhs.getType()),
-            rhs.getType() == Array);
+            rhs.isArray());
 
-    return setIsSubsetHelper(lhs.getArray(), arrayToSet(rhs));
+    return setIsSubsetHelper(lhs.getArray(),
+                             arrayToSet(rhs, getExpressionContext()->getValueComparator()));
 }
 
 /**
@@ -2647,18 +4338,20 @@ Value ExpressionSetIsSubset::evaluateInternal(Variables* vars) const {
  */
 class ExpressionSetIsSubset::Optimized : public ExpressionSetIsSubset {
 public:
-    Optimized(const ValueSet& cachedRhsSet, const ExpressionVector& operands)
-        : _cachedRhsSet(cachedRhsSet) {
-        vpOperand = operands;
+    Optimized(ExpressionContext* const expCtx,
+              const ValueSet& cachedRhsSet,
+              const ExpressionVector& operands)
+        : ExpressionSetIsSubset(expCtx), _cachedRhsSet(cachedRhsSet) {
+        _children = operands;
     }
 
-    virtual Value evaluateInternal(Variables* vars) const {
-        const Value lhs = vpOperand[0]->evaluateInternal(vars);
+    virtual Value evaluate(const Document& root, Variables* variables) const {
+        const Value lhs = _children[0]->evaluate(root, variables);
 
         uassert(17310,
                 str::stream() << "both operands of $setIsSubset must be arrays. First "
                               << "argument is of type: " << typeName(lhs.getType()),
-                lhs.getType() == Array);
+                lhs.isArray());
 
         return setIsSubsetHelper(lhs.getArray(), _cachedRhsSet);
     }
@@ -2675,14 +4368,18 @@ intrusive_ptr<Expression> ExpressionSetIsSubset::optimize() {
     if (optimized.get() != this)
         return optimized;
 
-    if (ExpressionConstant* ec = dynamic_cast<ExpressionConstant*>(vpOperand[1].get())) {
+    if (ExpressionConstant* ec = dynamic_cast<ExpressionConstant*>(_children[1].get())) {
         const Value rhs = ec->getValue();
         uassert(17311,
                 str::stream() << "both operands of $setIsSubset must be arrays. Second "
                               << "argument is of type: " << typeName(rhs.getType()),
-                rhs.getType() == Array);
+                rhs.isArray());
 
-        return new Optimized(arrayToSet(rhs), vpOperand);
+        intrusive_ptr<Expression> optimizedWithConstant(
+            new Optimized(this->getExpressionContext(),
+                          arrayToSet(rhs, getExpressionContext()->getValueComparator()),
+                          _children));
+        return optimizedWithConstant;
     }
     return optimized;
 }
@@ -2694,18 +4391,18 @@ const char* ExpressionSetIsSubset::getOpName() const {
 
 /* ----------------------- ExpressionSetUnion ---------------------------- */
 
-Value ExpressionSetUnion::evaluateInternal(Variables* vars) const {
-    ValueSet unionedSet;
-    const size_t n = vpOperand.size();
+Value ExpressionSetUnion::evaluate(const Document& root, Variables* variables) const {
+    ValueSet unionedSet = getExpressionContext()->getValueComparator().makeOrderedValueSet();
+    const size_t n = _children.size();
     for (size_t i = 0; i < n; i++) {
-        const Value newEntries = vpOperand[i]->evaluateInternal(vars);
+        const Value newEntries = _children[i]->evaluate(root, variables);
         if (newEntries.nullish()) {
             return Value(BSONNULL);
         }
         uassert(17043,
                 str::stream() << "All operands of $setUnion must be arrays. One argument"
                               << " is of type: " << typeName(newEntries.getType()),
-                newEntries.getType() == Array);
+                newEntries.isArray());
 
         unionedSet.insert(newEntries.getArray().begin(), newEntries.getArray().end());
     }
@@ -2719,9 +4416,9 @@ const char* ExpressionSetUnion::getOpName() const {
 
 /* ----------------------- ExpressionIsArray ---------------------------- */
 
-Value ExpressionIsArray::evaluateInternal(Variables* vars) const {
-    Value argument = vpOperand[0]->evaluateInternal(vars);
-    return Value(argument.getType() == Array);
+Value ExpressionIsArray::evaluate(const Document& root, Variables* variables) const {
+    Value argument = _children[0]->evaluate(root, variables);
+    return Value(argument.isArray());
 }
 
 REGISTER_EXPRESSION(isArray, ExpressionIsArray::parse);
@@ -2731,21 +4428,21 @@ const char* ExpressionIsArray::getOpName() const {
 
 /* ----------------------- ExpressionSlice ---------------------------- */
 
-Value ExpressionSlice::evaluateInternal(Variables* vars) const {
-    const size_t n = vpOperand.size();
+Value ExpressionSlice::evaluate(const Document& root, Variables* variables) const {
+    const size_t n = _children.size();
 
-    Value arrayVal = vpOperand[0]->evaluateInternal(vars);
+    Value arrayVal = _children[0]->evaluate(root, variables);
     // Could be either a start index or the length from 0.
-    Value arg2 = vpOperand[1]->evaluateInternal(vars);
+    Value arg2 = _children[1]->evaluate(root, variables);
 
     if (arrayVal.nullish() || arg2.nullish()) {
         return Value(BSONNULL);
     }
 
     uassert(28724,
-            str::stream() << "First argument to $slice must be an Array, but is"
+            str::stream() << "First argument to $slice must be an array, but is"
                           << " of type: " << typeName(arrayVal.getType()),
-            arrayVal.getType() == Array);
+            arrayVal.isArray());
     uassert(28725,
             str::stream() << "Second argument to $slice must be a numeric value,"
                           << " but is of type: " << typeName(arg2.getType()),
@@ -2784,7 +4481,7 @@ Value ExpressionSlice::evaluateInternal(Variables* vars) const {
             start = std::min(array.size(), size_t(startInt));
         }
 
-        Value countVal = vpOperand[2]->evaluateInternal(vars);
+        Value countVal = _children[2]->evaluate(root, variables);
 
         if (countVal.nullish()) {
             return Value(BSONNULL);
@@ -2817,13 +4514,13 @@ const char* ExpressionSlice::getOpName() const {
 
 /* ----------------------- ExpressionSize ---------------------------- */
 
-Value ExpressionSize::evaluateInternal(Variables* vars) const {
-    Value array = vpOperand[0]->evaluateInternal(vars);
+Value ExpressionSize::evaluate(const Document& root, Variables* variables) const {
+    Value array = _children[0]->evaluate(root, variables);
 
     uassert(17124,
-            str::stream() << "The argument to $size must be an Array, but was of type: "
+            str::stream() << "The argument to $size must be an array, but was of type: "
                           << typeName(array.getType()),
-            array.getType() == Array);
+            array.isArray());
     return Value::createIntOrLong(array.getArray().size());
 }
 
@@ -2832,13 +4529,70 @@ const char* ExpressionSize::getOpName() const {
     return "$size";
 }
 
+/* ----------------------- ExpressionSplit --------------------------- */
+
+Value ExpressionSplit::evaluate(const Document& root, Variables* variables) const {
+    Value inputArg = _children[0]->evaluate(root, variables);
+    Value separatorArg = _children[1]->evaluate(root, variables);
+
+    if (inputArg.nullish() || separatorArg.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40085,
+            str::stream() << "$split requires an expression that evaluates to a string as a first "
+                             "argument, found: "
+                          << typeName(inputArg.getType()),
+            inputArg.getType() == BSONType::String);
+    uassert(40086,
+            str::stream() << "$split requires an expression that evaluates to a string as a second "
+                             "argument, found: "
+                          << typeName(separatorArg.getType()),
+            separatorArg.getType() == BSONType::String);
+
+    StringData input = inputArg.getStringData();
+    StringData separator = separatorArg.getStringData();
+
+    uassert(40087, "$split requires a non-empty separator", !separator.empty());
+
+    std::vector<Value> output;
+
+    const char* needle = separator.rawData();
+    const char* const needleEnd = needle + separator.size();
+    const char* remainingHaystack = input.rawData();
+    const char* const haystackEnd = remainingHaystack + input.size();
+
+    const char* it = remainingHaystack;
+    while ((it = std::search(remainingHaystack, haystackEnd, needle, needleEnd)) != haystackEnd) {
+        StringData sd(remainingHaystack, it - remainingHaystack);
+        output.push_back(Value(sd));
+        remainingHaystack = it + separator.size();
+    }
+
+    StringData splitString(remainingHaystack, input.size() - (remainingHaystack - input.rawData()));
+    output.push_back(Value(splitString));
+    return Value(std::move(output));
+}
+
+REGISTER_EXPRESSION(split, ExpressionSplit::parse);
+const char* ExpressionSplit::getOpName() const {
+    return "$split";
+}
+
 /* ----------------------- ExpressionSqrt ---------------------------- */
 
 Value ExpressionSqrt::evaluateNumericArg(const Value& numericArg) const {
+    auto checkArg = [](bool nonNegative) {
+        uassert(28714, "$sqrt's argument must be greater than or equal to 0", nonNegative);
+    };
+
+    if (numericArg.getType() == NumberDecimal) {
+        Decimal128 argDec = numericArg.getDecimal();
+        checkArg(!argDec.isLess(Decimal128::kNormalizedZero));  // NaN returns Nan without error
+        return Value(argDec.squareRoot());
+    }
     double argDouble = numericArg.coerceToDouble();
-    uassert(28714,
-            "$sqrt's argument must be greater than or equal to 0",
-            argDouble >= 0 || std::isnan(argDouble));
+    checkArg(!(argDouble < 0));  // NaN returns Nan without error
     return Value(sqrt(argDouble));
 }
 
@@ -2849,9 +4603,9 @@ const char* ExpressionSqrt::getOpName() const {
 
 /* ----------------------- ExpressionStrcasecmp ---------------------------- */
 
-Value ExpressionStrcasecmp::evaluateInternal(Variables* vars) const {
-    Value pString1(vpOperand[0]->evaluateInternal(vars));
-    Value pString2(vpOperand[1]->evaluateInternal(vars));
+Value ExpressionStrcasecmp::evaluate(const Document& root, Variables* variables) const {
+    Value pString1(_children[0]->evaluate(root, variables));
+    Value pString2(_children[1]->evaluate(root, variables));
 
     /* boost::iequals returns a bool not an int so strings must actually be allocated */
     string str1 = boost::to_upper_copy(pString1.coerceToString());
@@ -2871,35 +4625,42 @@ const char* ExpressionStrcasecmp::getOpName() const {
     return "$strcasecmp";
 }
 
-/* ----------------------- ExpressionSubstr ---------------------------- */
+/* ----------------------- ExpressionSubstrBytes ---------------------------- */
 
-Value ExpressionSubstr::evaluateInternal(Variables* vars) const {
-    Value pString(vpOperand[0]->evaluateInternal(vars));
-    Value pLower(vpOperand[1]->evaluateInternal(vars));
-    Value pLength(vpOperand[2]->evaluateInternal(vars));
+Value ExpressionSubstrBytes::evaluate(const Document& root, Variables* variables) const {
+    Value pString(_children[0]->evaluate(root, variables));
+    Value pLower(_children[1]->evaluate(root, variables));
+    Value pLength(_children[2]->evaluate(root, variables));
 
     string str = pString.coerceToString();
     uassert(16034,
             str::stream() << getOpName()
                           << ":  starting index must be a numeric type (is BSON type "
                           << typeName(pLower.getType()) << ")",
-            (pLower.getType() == NumberInt || pLower.getType() == NumberLong ||
-             pLower.getType() == NumberDouble));
+            pLower.numeric());
     uassert(16035,
             str::stream() << getOpName() << ":  length must be a numeric type (is BSON type "
                           << typeName(pLength.getType()) << ")",
-            (pLength.getType() == NumberInt || pLength.getType() == NumberLong ||
-             pLength.getType() == NumberDouble));
+            pLength.numeric());
 
-    string::size_type lower = static_cast<string::size_type>(pLower.coerceToLong());
-    string::size_type length = static_cast<string::size_type>(pLength.coerceToLong());
+    const long long signedLower = pLower.coerceToLong();
 
-    auto isContinuationByte = [](char c) { return ((c & 0xc0) == 0x80); };
+    uassert(50752,
+            str::stream() << getOpName()
+                          << ":  starting index must be non-negative (got: " << signedLower << ")",
+            signedLower >= 0);
+
+    const string::size_type lower = static_cast<string::size_type>(signedLower);
+
+    // If the passed length is negative, we should return the rest of the string.
+    const long long signedLength = pLength.coerceToLong();
+    const string::size_type length =
+        signedLength < 0 ? str.length() : static_cast<string::size_type>(signedLength);
 
     uassert(28656,
             str::stream() << getOpName()
                           << ":  Invalid range, starting index is a UTF-8 continuation byte.",
-            (lower >= str.length() || !isContinuationByte(str[lower])));
+            (lower >= str.length() || !str::isUTF8ContinuationByte(str[lower])));
 
     // Check the byte after the last character we'd return. If it is a continuation byte, that
     // means we're in the middle of a UTF-8 character.
@@ -2907,37 +4668,201 @@ Value ExpressionSubstr::evaluateInternal(Variables* vars) const {
         28657,
         str::stream() << getOpName()
                       << ":  Invalid range, ending index is in the middle of a UTF-8 character.",
-        (lower + length >= str.length() || !isContinuationByte(str[lower + length])));
+        (lower + length >= str.length() || !str::isUTF8ContinuationByte(str[lower + length])));
 
     if (lower >= str.length()) {
         // If lower > str.length() then string::substr() will throw out_of_range, so return an
         // empty string if lower is not a valid string index.
-        return Value("");
+        return Value(StringData());
     }
     return Value(str.substr(lower, length));
 }
 
-REGISTER_EXPRESSION(substr, ExpressionSubstr::parse);
-const char* ExpressionSubstr::getOpName() const {
-    return "$substr";
+// $substr is deprecated in favor of $substrBytes, but for now will just parse into a $substrBytes.
+REGISTER_EXPRESSION(substrBytes, ExpressionSubstrBytes::parse);
+REGISTER_EXPRESSION(substr, ExpressionSubstrBytes::parse);
+const char* ExpressionSubstrBytes::getOpName() const {
+    return "$substrBytes";
+}
+
+/* ----------------------- ExpressionSubstrCP ---------------------------- */
+
+Value ExpressionSubstrCP::evaluate(const Document& root, Variables* variables) const {
+    Value inputVal(_children[0]->evaluate(root, variables));
+    Value lowerVal(_children[1]->evaluate(root, variables));
+    Value lengthVal(_children[2]->evaluate(root, variables));
+
+    std::string str = inputVal.coerceToString();
+    uassert(34450,
+            str::stream() << getOpName() << ": starting index must be a numeric type (is BSON type "
+                          << typeName(lowerVal.getType()) << ")",
+            lowerVal.numeric());
+    uassert(34451,
+            str::stream() << getOpName()
+                          << ": starting index cannot be represented as a 32-bit integral value: "
+                          << lowerVal.toString(),
+            lowerVal.integral());
+    uassert(34452,
+            str::stream() << getOpName() << ": length must be a numeric type (is BSON type "
+                          << typeName(lengthVal.getType()) << ")",
+            lengthVal.numeric());
+    uassert(34453,
+            str::stream() << getOpName()
+                          << ": length cannot be represented as a 32-bit integral value: "
+                          << lengthVal.toString(),
+            lengthVal.integral());
+
+    int startIndexCodePoints = lowerVal.coerceToInt();
+    int length = lengthVal.coerceToInt();
+
+    uassert(34454,
+            str::stream() << getOpName() << ": length must be a nonnegative integer.",
+            length >= 0);
+
+    uassert(34455,
+            str::stream() << getOpName() << ": the starting index must be nonnegative integer.",
+            startIndexCodePoints >= 0);
+
+    size_t startIndexBytes = 0;
+
+    for (int i = 0; i < startIndexCodePoints; i++) {
+        if (startIndexBytes >= str.size()) {
+            return Value(StringData());
+        }
+        uassert(34456,
+                str::stream() << getOpName() << ": invalid UTF-8 string",
+                !str::isUTF8ContinuationByte(str[startIndexBytes]));
+        size_t codePointLength = str::getCodePointLength(str[startIndexBytes]);
+        uassert(
+            34457, str::stream() << getOpName() << ": invalid UTF-8 string", codePointLength <= 4);
+        startIndexBytes += codePointLength;
+    }
+
+    size_t endIndexBytes = startIndexBytes;
+
+    for (int i = 0; i < length && endIndexBytes < str.size(); i++) {
+        uassert(34458,
+                str::stream() << getOpName() << ": invalid UTF-8 string",
+                !str::isUTF8ContinuationByte(str[endIndexBytes]));
+        size_t codePointLength = str::getCodePointLength(str[endIndexBytes]);
+        uassert(
+            34459, str::stream() << getOpName() << ": invalid UTF-8 string", codePointLength <= 4);
+        endIndexBytes += codePointLength;
+    }
+
+    return Value(std::string(str, startIndexBytes, endIndexBytes - startIndexBytes));
+}
+
+REGISTER_EXPRESSION(substrCP, ExpressionSubstrCP::parse);
+const char* ExpressionSubstrCP::getOpName() const {
+    return "$substrCP";
+}
+
+/* ----------------------- ExpressionStrLenBytes ------------------------- */
+
+namespace {
+Value strLenBytes(StringData str) {
+    size_t strLen = str.size();
+
+    uassert(34470,
+            "string length could not be represented as an int.",
+            strLen <= std::numeric_limits<int>::max());
+    return Value(static_cast<int>(strLen));
+}
+}  // namespace
+
+Value ExpressionStrLenBytes::evaluate(const Document& root, Variables* variables) const {
+    Value str(_children[0]->evaluate(root, variables));
+
+    uassert(34473,
+            str::stream() << "$strLenBytes requires a string argument, found: "
+                          << typeName(str.getType()),
+            str.getType() == BSONType::String);
+
+    return strLenBytes(str.getStringData());
+}
+
+REGISTER_EXPRESSION(strLenBytes, ExpressionStrLenBytes::parse);
+const char* ExpressionStrLenBytes::getOpName() const {
+    return "$strLenBytes";
+}
+
+/* -------------------------- ExpressionBinarySize ------------------------------ */
+
+Value ExpressionBinarySize::evaluate(const Document& root, Variables* variables) const {
+    Value arg = _children[0]->evaluate(root, variables);
+    if (arg.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(51276,
+            str::stream() << "$binarySize requires a string or BinData argument, found: "
+                          << typeName(arg.getType()),
+            arg.getType() == BSONType::BinData || arg.getType() == BSONType::String);
+
+    if (arg.getType() == BSONType::String) {
+        return strLenBytes(arg.getStringData());
+    }
+
+    BSONBinData binData = arg.getBinData();
+    return Value(binData.length);
+}
+
+REGISTER_EXPRESSION(binarySize, ExpressionBinarySize::parse);
+
+const char* ExpressionBinarySize::getOpName() const {
+    return "$binarySize";
+}
+
+/* ----------------------- ExpressionStrLenCP ------------------------- */
+
+Value ExpressionStrLenCP::evaluate(const Document& root, Variables* variables) const {
+    Value val(_children[0]->evaluate(root, variables));
+
+    uassert(34471,
+            str::stream() << "$strLenCP requires a string argument, found: "
+                          << typeName(val.getType()),
+            val.getType() == String);
+
+    std::string stringVal = val.getString();
+    size_t strLen = str::lengthInUTF8CodePoints(stringVal);
+
+    uassert(34472,
+            "string length could not be represented as an int.",
+            strLen <= std::numeric_limits<int>::max());
+
+    return Value(static_cast<int>(strLen));
+}
+
+REGISTER_EXPRESSION(strLenCP, ExpressionStrLenCP::parse);
+const char* ExpressionStrLenCP::getOpName() const {
+    return "$strLenCP";
 }
 
 /* ----------------------- ExpressionSubtract ---------------------------- */
 
-Value ExpressionSubtract::evaluateInternal(Variables* vars) const {
-    Value lhs = vpOperand[0]->evaluateInternal(vars);
-    Value rhs = vpOperand[1]->evaluateInternal(vars);
+Value ExpressionSubtract::evaluate(const Document& root, Variables* variables) const {
+    Value lhs = _children[0]->evaluate(root, variables);
+    Value rhs = _children[1]->evaluate(root, variables);
 
     BSONType diffType = Value::getWidestNumeric(rhs.getType(), lhs.getType());
 
-    if (diffType == NumberDouble) {
+    if (diffType == NumberDecimal) {
+        Decimal128 right = rhs.coerceToDecimal();
+        Decimal128 left = lhs.coerceToDecimal();
+        return Value(left.subtract(right));
+    } else if (diffType == NumberDouble) {
         double right = rhs.coerceToDouble();
         double left = lhs.coerceToDouble();
         return Value(left - right);
     } else if (diffType == NumberLong) {
-        long long right = rhs.coerceToLong();
-        long long left = lhs.coerceToLong();
-        return Value(left - right);
+        long long result;
+
+        // If there is an overflow, convert the values to doubles.
+        if (overflow::sub(lhs.coerceToLong(), rhs.coerceToLong(), &result)) {
+            return Value(lhs.coerceToDouble() - rhs.coerceToDouble());
+        }
+        return Value(result);
     } else if (diffType == NumberInt) {
         long long right = rhs.coerceToLong();
         long long left = lhs.coerceToLong();
@@ -2946,15 +4871,13 @@ Value ExpressionSubtract::evaluateInternal(Variables* vars) const {
         return Value(BSONNULL);
     } else if (lhs.getType() == Date) {
         if (rhs.getType() == Date) {
-            long long timeDelta = lhs.getDate() - rhs.getDate();
-            return Value(timeDelta);
+            return Value(durationCount<Milliseconds>(lhs.getDate() - rhs.getDate()));
         } else if (rhs.numeric()) {
-            long long millisSinceEpoch = lhs.getDate() - rhs.coerceToLong();
-            return Value(Date_t::fromMillisSinceEpoch(millisSinceEpoch));
+            return Value(lhs.getDate() - Milliseconds(rhs.coerceToLong()));
         } else {
             uasserted(16613,
-                      str::stream() << "cant $subtract a " << typeName(rhs.getType())
-                                    << " from a Date");
+                      str::stream()
+                          << "cant $subtract a " << typeName(rhs.getType()) << " from a Date");
         }
     } else {
         uasserted(16556,
@@ -2968,10 +4891,147 @@ const char* ExpressionSubtract::getOpName() const {
     return "$subtract";
 }
 
+/* ------------------------- ExpressionSwitch ------------------------------ */
+
+REGISTER_EXPRESSION(switch, ExpressionSwitch::parse);
+
+Value ExpressionSwitch::evaluate(const Document& root, Variables* variables) const {
+    for (auto&& branch : _branches) {
+        Value caseExpression(branch.first->evaluate(root, variables));
+
+        if (caseExpression.coerceToBool()) {
+            return branch.second->evaluate(root, variables);
+        }
+    }
+
+    uassert(40066,
+            "$switch could not find a matching branch for an input, and no default was specified.",
+            _default);
+
+    return _default->evaluate(root, variables);
+}
+
+boost::intrusive_ptr<Expression> ExpressionSwitch::parse(ExpressionContext* const expCtx,
+                                                         BSONElement expr,
+                                                         const VariablesParseState& vps) {
+    uassert(40060,
+            str::stream() << "$switch requires an object as an argument, found: "
+                          << typeName(expr.type()),
+            expr.type() == Object);
+
+    boost::intrusive_ptr<Expression> expDefault;
+    std::vector<boost::intrusive_ptr<Expression>> children;
+    for (auto&& elem : expr.Obj()) {
+        auto field = elem.fieldNameStringData();
+
+        if (field == "branches") {
+            // Parse each branch separately.
+            uassert(40061,
+                    str::stream() << "$switch expected an array for 'branches', found: "
+                                  << typeName(elem.type()),
+                    elem.type() == Array);
+
+            for (auto&& branch : elem.Array()) {
+                uassert(40062,
+                        str::stream() << "$switch expected each branch to be an object, found: "
+                                      << typeName(branch.type()),
+                        branch.type() == Object);
+
+                boost::intrusive_ptr<Expression> switchCase, switchThen;
+
+                for (auto&& branchElement : branch.Obj()) {
+                    auto branchField = branchElement.fieldNameStringData();
+
+                    if (branchField == "case") {
+                        switchCase = parseOperand(expCtx, branchElement, vps);
+                    } else if (branchField == "then") {
+                        switchThen = parseOperand(expCtx, branchElement, vps);
+                    } else {
+                        uasserted(40063,
+                                  str::stream() << "$switch found an unknown argument to a branch: "
+                                                << branchField);
+                    }
+                }
+
+                uassert(40064, "$switch requires each branch have a 'case' expression", switchCase);
+                uassert(
+                    40065, "$switch requires each branch have a 'then' expression.", switchThen);
+
+                children.push_back(std::move(switchCase));
+                children.push_back(std::move(switchThen));
+            }
+        } else if (field == "default") {
+            // Optional, arbitrary expression.
+            expDefault = parseOperand(expCtx, elem, vps);
+        } else {
+            uasserted(40067, str::stream() << "$switch found an unknown argument: " << field);
+        }
+    }
+    children.push_back(std::move(expDefault));
+    // Obtain references to the case and branch expressions two-by-two from the children vector,
+    // ignore the last.
+    std::vector<ExpressionPair> branches;
+    boost::optional<boost::intrusive_ptr<Expression>&> first;
+    for (auto&& child : children) {
+        if (first) {
+            branches.emplace_back(*first, child);
+            first = boost::none;
+        } else {
+            first = child;
+        }
+    }
+
+    uassert(40068, "$switch requires at least one branch.", !branches.empty());
+
+    return new ExpressionSwitch(expCtx, std::move(children), std::move(branches));
+}
+
+void ExpressionSwitch::_doAddDependencies(DepsTracker* deps) const {
+    for (auto&& branch : _branches) {
+        branch.first->addDependencies(deps);
+        branch.second->addDependencies(deps);
+    }
+
+    if (_default) {
+        _default->addDependencies(deps);
+    }
+}
+
+boost::intrusive_ptr<Expression> ExpressionSwitch::optimize() {
+    if (_default) {
+        _default = _default->optimize();
+    }
+
+    for (auto&& [switchCase, switchThen] : _branches) {
+        switchCase = switchCase->optimize();
+        switchThen = switchThen->optimize();
+    }
+
+    return this;
+}
+
+Value ExpressionSwitch::serialize(bool explain) const {
+    std::vector<Value> serializedBranches;
+    serializedBranches.reserve(_branches.size());
+
+    for (auto&& branch : _branches) {
+        serializedBranches.push_back(Value(Document{{"case", branch.first->serialize(explain)},
+                                                    {"then", branch.second->serialize(explain)}}));
+    }
+
+    if (_default) {
+        return Value(Document{{"$switch",
+                               Document{{"branches", Value(serializedBranches)},
+                                        {"default", _default->serialize(explain)}}}});
+    }
+
+    return Value(Document{{"$switch", Document{{"branches", Value(serializedBranches)}}}});
+}
+
 /* ------------------------- ExpressionToLower ----------------------------- */
 
-Value ExpressionToLower::evaluateInternal(Variables* vars) const {
-    Value pString(vpOperand[0]->evaluateInternal(vars));
+Value ExpressionToLower::evaluate(const Document& root, Variables* variables) const {
+    Value pString(_children[0]->evaluate(root, variables));
     string str = pString.coerceToString();
     boost::to_lower(str);
     return Value(str);
@@ -2984,8 +5044,8 @@ const char* ExpressionToLower::getOpName() const {
 
 /* ------------------------- ExpressionToUpper -------------------------- */
 
-Value ExpressionToUpper::evaluateInternal(Variables* vars) const {
-    Value pString(vpOperand[0]->evaluateInternal(vars));
+Value ExpressionToUpper::evaluate(const Document& root, Variables* variables) const {
+    Value pString(_children[0]->evaluate(root, variables));
     string str(pString.coerceToString());
     boost::to_upper(str);
     return Value(str);
@@ -2996,12 +5056,334 @@ const char* ExpressionToUpper::getOpName() const {
     return "$toUpper";
 }
 
-/* ------------------------- ExpressionTrunc -------------------------- */
+/* -------------------------- ExpressionTrim ------------------------------ */
 
-Value ExpressionTrunc::evaluateNumericArg(const Value& numericArg) const {
-    // There's no point in truncating integers or longs, it will have no effect.
-    return numericArg.getType() == NumberDouble ? Value(std::trunc(numericArg.getDouble()))
-                                                : numericArg;
+REGISTER_EXPRESSION(trim, ExpressionTrim::parse);
+REGISTER_EXPRESSION(ltrim, ExpressionTrim::parse);
+REGISTER_EXPRESSION(rtrim, ExpressionTrim::parse);
+
+intrusive_ptr<Expression> ExpressionTrim::parse(ExpressionContext* const expCtx,
+                                                BSONElement expr,
+                                                const VariablesParseState& vps) {
+    const auto name = expr.fieldNameStringData();
+    TrimType trimType = TrimType::kBoth;
+    if (name == "$ltrim"_sd) {
+        trimType = TrimType::kLeft;
+    } else if (name == "$rtrim"_sd) {
+        trimType = TrimType::kRight;
+    } else {
+        invariant(name == "$trim"_sd);
+    }
+    uassert(50696,
+            str::stream() << name << " only supports an object as an argument, found "
+                          << typeName(expr.type()),
+            expr.type() == Object);
+
+    boost::intrusive_ptr<Expression> input;
+    boost::intrusive_ptr<Expression> characters;
+    for (auto&& elem : expr.Obj()) {
+        const auto field = elem.fieldNameStringData();
+        if (field == "input"_sd) {
+            input = parseOperand(expCtx, elem, vps);
+        } else if (field == "chars"_sd) {
+            characters = parseOperand(expCtx, elem, vps);
+        } else {
+            uasserted(50694,
+                      str::stream() << name << " found an unknown argument: " << elem.fieldName());
+        }
+    }
+    uassert(50695, str::stream() << name << " requires an 'input' field", input);
+
+    return new ExpressionTrim(expCtx, trimType, name, input, characters);
+}
+
+namespace {
+const std::vector<StringData> kDefaultTrimWhitespaceChars = {
+    "\0"_sd,      // Null character. Avoid using "\u0000" syntax to work around a gcc bug:
+                  // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53690.
+    "\u0020"_sd,  // Space
+    "\u0009"_sd,  // Horizontal tab
+    "\u000A"_sd,  // Line feed/new line
+    "\u000B"_sd,  // Vertical tab
+    "\u000C"_sd,  // Form feed
+    "\u000D"_sd,  // Horizontal tab
+    "\u00A0"_sd,  // Non-breaking space
+    "\u1680"_sd,  // Ogham space mark
+    "\u2000"_sd,  // En quad
+    "\u2001"_sd,  // Em quad
+    "\u2002"_sd,  // En space
+    "\u2003"_sd,  // Em space
+    "\u2004"_sd,  // Three-per-em space
+    "\u2005"_sd,  // Four-per-em space
+    "\u2006"_sd,  // Six-per-em space
+    "\u2007"_sd,  // Figure space
+    "\u2008"_sd,  // Punctuation space
+    "\u2009"_sd,  // Thin space
+    "\u200A"_sd   // Hair space
+};
+
+/**
+ * Assuming 'charByte' is the beginning of a UTF-8 code point, returns the number of bytes that
+ * should be used to represent the code point. Said another way, computes how many continuation
+ * bytes are expected to be present after 'charByte' in a UTF-8 encoded string.
+ */
+inline size_t numberOfBytesForCodePoint(char charByte) {
+    if ((charByte & 0b11111000) == 0b11110000) {
+        return 4;
+    } else if ((charByte & 0b11110000) == 0b11100000) {
+        return 3;
+    } else if ((charByte & 0b11100000) == 0b11000000) {
+        return 2;
+    } else {
+        return 1;
+    }
+}
+
+/**
+ * Returns a vector with one entry per code point to trim, or throws an exception if 'utf8String'
+ * contains invalid UTF-8.
+ */
+std::vector<StringData> extractCodePointsFromChars(StringData utf8String,
+                                                   StringData expressionName) {
+    std::vector<StringData> codePoints;
+    std::size_t i = 0;
+    while (i < utf8String.size()) {
+        uassert(50698,
+                str::stream() << "Failed to parse \"chars\" argument to " << expressionName
+                              << ": Detected invalid UTF-8. Got continuation byte when expecting "
+                                 "the start of a new code point.",
+                !str::isUTF8ContinuationByte(utf8String[i]));
+        codePoints.push_back(utf8String.substr(i, numberOfBytesForCodePoint(utf8String[i])));
+        i += numberOfBytesForCodePoint(utf8String[i]);
+    }
+    uassert(50697,
+            str::stream()
+                << "Failed to parse \"chars\" argument to " << expressionName
+                << ": Detected invalid UTF-8. Missing expected continuation byte at end of string.",
+            i <= utf8String.size());
+    return codePoints;
+}
+}  // namespace
+
+Value ExpressionTrim::evaluate(const Document& root, Variables* variables) const {
+    auto unvalidatedInput = _input->evaluate(root, variables);
+    if (unvalidatedInput.nullish()) {
+        return Value(BSONNULL);
+    }
+    uassert(50699,
+            str::stream() << _name << " requires its input to be a string, got "
+                          << unvalidatedInput.toString() << " (of type "
+                          << typeName(unvalidatedInput.getType()) << ") instead.",
+            unvalidatedInput.getType() == BSONType::String);
+    const StringData input(unvalidatedInput.getStringData());
+
+    if (!_characters) {
+        return Value(doTrim(input, kDefaultTrimWhitespaceChars));
+    }
+    auto unvalidatedUserChars = _characters->evaluate(root, variables);
+    if (unvalidatedUserChars.nullish()) {
+        return Value(BSONNULL);
+    }
+    uassert(50700,
+            str::stream() << _name << " requires 'chars' to be a string, got "
+                          << unvalidatedUserChars.toString() << " (of type "
+                          << typeName(unvalidatedUserChars.getType()) << ") instead.",
+            unvalidatedUserChars.getType() == BSONType::String);
+
+    return Value(
+        doTrim(input, extractCodePointsFromChars(unvalidatedUserChars.getStringData(), _name)));
+}
+
+bool ExpressionTrim::codePointMatchesAtIndex(const StringData& input,
+                                             std::size_t indexOfInput,
+                                             const StringData& testCP) {
+    for (size_t i = 0; i < testCP.size(); ++i) {
+        if (indexOfInput + i >= input.size() || input[indexOfInput + i] != testCP[i]) {
+            return false;
+        }
+    }
+    return true;
+};
+
+StringData ExpressionTrim::trimFromLeft(StringData input, const std::vector<StringData>& trimCPs) {
+    std::size_t bytesTrimmedFromLeft = 0u;
+    while (bytesTrimmedFromLeft < input.size()) {
+        // Look for any matching code point to trim.
+        auto matchingCP = std::find_if(trimCPs.begin(), trimCPs.end(), [&](auto& testCP) {
+            return codePointMatchesAtIndex(input, bytesTrimmedFromLeft, testCP);
+        });
+        if (matchingCP == trimCPs.end()) {
+            // Nothing to trim, stop here.
+            break;
+        }
+        bytesTrimmedFromLeft += matchingCP->size();
+    }
+    return input.substr(bytesTrimmedFromLeft);
+}
+
+StringData ExpressionTrim::trimFromRight(StringData input, const std::vector<StringData>& trimCPs) {
+    std::size_t bytesTrimmedFromRight = 0u;
+    while (bytesTrimmedFromRight < input.size()) {
+        std::size_t indexToTrimFrom = input.size() - bytesTrimmedFromRight;
+        auto matchingCP = std::find_if(trimCPs.begin(), trimCPs.end(), [&](auto& testCP) {
+            if (indexToTrimFrom < testCP.size()) {
+                // We've gone off the left of the string.
+                return false;
+            }
+            return codePointMatchesAtIndex(input, indexToTrimFrom - testCP.size(), testCP);
+        });
+        if (matchingCP == trimCPs.end()) {
+            // Nothing to trim, stop here.
+            break;
+        }
+        bytesTrimmedFromRight += matchingCP->size();
+    }
+    return input.substr(0, input.size() - bytesTrimmedFromRight);
+}
+
+StringData ExpressionTrim::doTrim(StringData input, const std::vector<StringData>& trimCPs) const {
+    if (_trimType == TrimType::kBoth || _trimType == TrimType::kLeft) {
+        input = trimFromLeft(input, trimCPs);
+    }
+    if (_trimType == TrimType::kBoth || _trimType == TrimType::kRight) {
+        input = trimFromRight(input, trimCPs);
+    }
+    return input;
+}
+
+boost::intrusive_ptr<Expression> ExpressionTrim::optimize() {
+    _input = _input->optimize();
+    if (_characters) {
+        _characters = _characters->optimize();
+    }
+    if (ExpressionConstant::allNullOrConstant({_input, _characters})) {
+        return ExpressionConstant::create(
+            getExpressionContext(),
+            this->evaluate(Document(), &(getExpressionContext()->variables)));
+    }
+    return this;
+}
+
+Value ExpressionTrim::serialize(bool explain) const {
+    return Value(
+        Document{{_name,
+                  Document{{"input", _input->serialize(explain)},
+                           {"chars", _characters ? _characters->serialize(explain) : Value()}}}});
+}
+
+void ExpressionTrim::_doAddDependencies(DepsTracker* deps) const {
+    _input->addDependencies(deps);
+    if (_characters) {
+        _characters->addDependencies(deps);
+    }
+}
+
+/* ------------------------- ExpressionRound and ExpressionTrunc -------------------------- */
+
+void assertFlagsValid(uint32_t flags,
+                      const std::string& opName,
+                      long long numericValue,
+                      long long precisionValue) {
+    uassert(51080,
+            str::stream() << "invalid conversion from Decimal128 result in " << opName
+                          << " resulting from arguments: [" << numericValue << ", "
+                          << precisionValue << "]",
+            !Decimal128::hasFlag(flags, Decimal128::kInvalid));
+}
+
+static Value evaluateRoundOrTrunc(const Document& root,
+                                  const std::vector<boost::intrusive_ptr<Expression>>& children,
+                                  const std::string& opName,
+                                  Decimal128::RoundingMode roundingMode,
+                                  double (*doubleOp)(double),
+                                  Variables* variables) {
+    constexpr auto maxPrecision = 100LL;
+    constexpr auto minPrecision = -20LL;
+    auto numericArg = Value(children[0]->evaluate(root, variables));
+    if (numericArg.nullish()) {
+        return Value(BSONNULL);
+    }
+    uassert(51081,
+            str::stream() << opName << " only supports numeric types, not "
+                          << typeName(numericArg.getType()),
+            numericArg.numeric());
+
+    long long precisionValue = 0;
+    if (children.size() > 1) {
+        auto precisionArg = Value(children[1]->evaluate(root, variables));
+        if (precisionArg.nullish()) {
+            return Value(BSONNULL);
+        }
+        precisionValue = precisionArg.coerceToLong();
+        uassert(51082,
+                str::stream() << "precision argument to  " << opName << " must be a integral value",
+                precisionArg.integral());
+        uassert(51083,
+                str::stream() << "cannot apply " << opName << " with precision value "
+                              << precisionValue << " value must be in [-20, 100]",
+                minPrecision <= precisionValue && precisionValue <= maxPrecision);
+    }
+
+    // Construct 10^-precisionValue, which will be used as the quantize reference.
+    auto quantum = Decimal128(0LL, Decimal128::kExponentBias - precisionValue, 0LL, 1LL);
+    switch (numericArg.getType()) {
+        case BSONType::NumberDecimal: {
+            if (numericArg.getDecimal().isInfinite()) {
+                return numericArg;
+            }
+            auto out = numericArg.getDecimal().quantize(quantum, roundingMode);
+            return Value(out);
+        }
+        case BSONType::NumberDouble: {
+            auto dec = Decimal128(numericArg.getDouble(), Decimal128::kRoundTo34Digits);
+            if (dec.isInfinite()) {
+                return numericArg;
+            }
+            auto out = dec.quantize(quantum, roundingMode);
+            return Value(out.toDouble());
+        }
+        case BSONType::NumberInt:
+        case BSONType::NumberLong: {
+            if (precisionValue >= 0) {
+                return numericArg;
+            }
+            auto numericArgll = numericArg.getLong();
+            auto out =
+                Decimal128(static_cast<int64_t>(numericArgll)).quantize(quantum, roundingMode);
+            uint32_t flags = 0;
+            auto outll = out.toLong(&flags);
+            assertFlagsValid(flags, opName, numericArgll, precisionValue);
+            if (numericArg.getType() == BSONType::NumberLong ||
+                outll > std::numeric_limits<int>::max()) {
+                // Even if the original was an int to begin with - it has to be a long now.
+                return Value(static_cast<long long>(outll));
+            }
+            return Value(static_cast<int>(outll));
+        }
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+Value ExpressionRound::evaluate(const Document& root, Variables* variables) const {
+    return evaluateRoundOrTrunc(
+        root, _children, getOpName(), Decimal128::kRoundTiesToEven, &std::round, variables);
+}
+
+REGISTER_EXPRESSION(round, ExpressionRound::parse);
+const char* ExpressionRound::getOpName() const {
+    return "$round";
+}
+
+Value ExpressionTrunc::evaluate(const Document& root, Variables* variables) const {
+    return evaluateRoundOrTrunc(
+        root, _children, getOpName(), Decimal128::kRoundTowardZero, &std::trunc, variables);
+}
+
+intrusive_ptr<Expression> ExpressionTrunc::parse(ExpressionContext* const expCtx,
+                                                 BSONElement elem,
+                                                 const VariablesParseState& vps) {
+    return ExpressionRangedArity<ExpressionTrunc, 1, 2>::parse(expCtx, elem, vps);
 }
 
 REGISTER_EXPRESSION(trunc, ExpressionTrunc::parse);
@@ -3009,47 +5391,1503 @@ const char* ExpressionTrunc::getOpName() const {
     return "$trunc";
 }
 
-/* ------------------------- ExpressionWeek ----------------------------- */
+/* ------------------------- ExpressionType ----------------------------- */
 
-Value ExpressionWeek::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
+Value ExpressionType::evaluate(const Document& root, Variables* variables) const {
+    Value val(_children[0]->evaluate(root, variables));
+    return Value(StringData(typeName(val.getType())));
 }
 
-int ExpressionWeek::extract(const tm& tm) {
-    int dayOfWeek = tm.tm_wday;
-    int dayOfYear = tm.tm_yday;
-    int prevSundayDayOfYear = dayOfYear - dayOfWeek;    // may be negative
-    int nextSundayDayOfYear = prevSundayDayOfYear + 7;  // must be positive
+REGISTER_EXPRESSION(type, ExpressionType::parse);
+const char* ExpressionType::getOpName() const {
+    return "$type";
+}
 
-    // Return the zero based index of the week of the next sunday, equal to the one based index
-    // of the week of the previous sunday, which is to be returned.
-    int nextSundayWeek = nextSundayDayOfYear / 7;
+/* ------------------------ ExpressionIsNumber --------------------------- */
 
-    // Verify that the week calculation is consistent with strftime "%U".
-    DEV {
-        char buf[3];
-        verify(strftime(buf, 3, "%U", &tm));
-        verify(int(str::toUnsigned(buf)) == nextSundayWeek);
+Value ExpressionIsNumber::evaluate(const Document& root, Variables* variables) const {
+    Value val(_children[0]->evaluate(root, variables));
+    return Value(val.numeric());
+}
+
+REGISTER_EXPRESSION(isNumber, ExpressionIsNumber::parse);
+
+const char* ExpressionIsNumber::getOpName() const {
+    return "$isNumber";
+}
+
+/* -------------------------- ExpressionZip ------------------------------ */
+
+REGISTER_EXPRESSION(zip, ExpressionZip::parse);
+intrusive_ptr<Expression> ExpressionZip::parse(ExpressionContext* const expCtx,
+                                               BSONElement expr,
+                                               const VariablesParseState& vps) {
+    uassert(34460,
+            str::stream() << "$zip only supports an object as an argument, found "
+                          << typeName(expr.type()),
+            expr.type() == Object);
+
+    auto useLongestLength = false;
+    std::vector<boost::intrusive_ptr<Expression>> children;
+    // We need to ensure defaults appear after inputs so we build them seperately and then
+    // concatenate them.
+    std::vector<boost::intrusive_ptr<Expression>> tempDefaultChildren;
+
+    for (auto&& elem : expr.Obj()) {
+        const auto field = elem.fieldNameStringData();
+        if (field == "inputs") {
+            uassert(34461,
+                    str::stream() << "inputs must be an array of expressions, found "
+                                  << typeName(elem.type()),
+                    elem.type() == Array);
+            for (auto&& subExpr : elem.Array()) {
+                children.push_back(parseOperand(expCtx, subExpr, vps));
+            }
+        } else if (field == "defaults") {
+            uassert(34462,
+                    str::stream() << "defaults must be an array of expressions, found "
+                                  << typeName(elem.type()),
+                    elem.type() == Array);
+            for (auto&& subExpr : elem.Array()) {
+                tempDefaultChildren.push_back(parseOperand(expCtx, subExpr, vps));
+            }
+        } else if (field == "useLongestLength") {
+            uassert(34463,
+                    str::stream() << "useLongestLength must be a bool, found "
+                                  << typeName(expr.type()),
+                    elem.type() == Bool);
+            useLongestLength = elem.Bool();
+        } else {
+            uasserted(34464,
+                      str::stream() << "$zip found an unknown argument: " << elem.fieldName());
+        }
     }
 
-    return nextSundayWeek;
+    auto numInputs = children.size();
+    std::move(tempDefaultChildren.begin(), tempDefaultChildren.end(), std::back_inserter(children));
+
+    std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>> inputs;
+    std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>> defaults;
+    for (auto&& child : children) {
+        if (numInputs == 0) {
+            defaults.push_back(child);
+        } else {
+            inputs.push_back(child);
+            numInputs--;
+        }
+    }
+
+    uassert(34465, "$zip requires at least one input array", !inputs.empty());
+    uassert(34466,
+            "cannot specify defaults unless useLongestLength is true",
+            (useLongestLength || defaults.empty()));
+    uassert(34467,
+            "defaults and inputs must have the same length",
+            (defaults.empty() || defaults.size() == inputs.size()));
+
+    return new ExpressionZip(
+        expCtx, useLongestLength, std::move(children), std::move(inputs), std::move(defaults));
 }
 
-REGISTER_EXPRESSION(week, ExpressionWeek::parse);
-const char* ExpressionWeek::getOpName() const {
-    return "$week";
+Value ExpressionZip::evaluate(const Document& root, Variables* variables) const {
+    // Evaluate input values.
+    vector<vector<Value>> inputValues;
+    inputValues.reserve(_inputs.size());
+
+    size_t minArraySize = 0;
+    size_t maxArraySize = 0;
+    for (size_t i = 0; i < _inputs.size(); i++) {
+        Value evalExpr = _inputs[i].get()->evaluate(root, variables);
+        if (evalExpr.nullish()) {
+            return Value(BSONNULL);
+        }
+
+        uassert(34468,
+                str::stream() << "$zip found a non-array expression in input: "
+                              << evalExpr.toString(),
+                evalExpr.isArray());
+
+        inputValues.push_back(evalExpr.getArray());
+
+        size_t arraySize = evalExpr.getArrayLength();
+
+        if (i == 0) {
+            minArraySize = arraySize;
+            maxArraySize = arraySize;
+        } else {
+            auto arraySizes = std::minmax({minArraySize, arraySize, maxArraySize});
+            minArraySize = arraySizes.first;
+            maxArraySize = arraySizes.second;
+        }
+    }
+
+    vector<Value> evaluatedDefaults(_inputs.size(), Value(BSONNULL));
+
+    // If we need default values, evaluate each expression.
+    if (minArraySize != maxArraySize) {
+        for (size_t i = 0; i < _defaults.size(); i++) {
+            evaluatedDefaults[i] = _defaults[i].get()->evaluate(root, variables);
+        }
+    }
+
+    size_t outputLength = _useLongestLength ? maxArraySize : minArraySize;
+
+    // The final output array, e.g. [[1, 2, 3], [2, 3, 4]].
+    vector<Value> output;
+
+    // Used to construct each array in the output, e.g. [1, 2, 3].
+    vector<Value> outputChild;
+
+    output.reserve(outputLength);
+    outputChild.reserve(_inputs.size());
+
+    for (size_t row = 0; row < outputLength; row++) {
+        outputChild.clear();
+        for (size_t col = 0; col < _inputs.size(); col++) {
+            if (inputValues[col].size() > row) {
+                // Add the value from the appropriate input array.
+                outputChild.push_back(inputValues[col][row]);
+            } else {
+                // Add the corresponding default value.
+                outputChild.push_back(evaluatedDefaults[col]);
+            }
+        }
+        output.push_back(Value(outputChild));
+    }
+
+    return Value(output);
 }
 
-/* ------------------------- ExpressionYear ----------------------------- */
-
-Value ExpressionYear::evaluateInternal(Variables* vars) const {
-    Value pDate(vpOperand[0]->evaluateInternal(vars));
-    return Value(extract(pDate.coerceToTm()));
+boost::intrusive_ptr<Expression> ExpressionZip::optimize() {
+    for (auto&& input : _inputs)
+        input.get() = input.get()->optimize();
+    for (auto&& zipDefault : _defaults)
+        zipDefault.get() = zipDefault.get()->optimize();
+    return this;
 }
 
-REGISTER_EXPRESSION(year, ExpressionYear::parse);
-const char* ExpressionYear::getOpName() const {
-    return "$year";
+Value ExpressionZip::serialize(bool explain) const {
+    vector<Value> serializedInput;
+    vector<Value> serializedDefaults;
+    Value serializedUseLongestLength = Value(_useLongestLength);
+
+    for (auto&& expr : _inputs) {
+        serializedInput.push_back(expr.get()->serialize(explain));
+    }
+
+    for (auto&& expr : _defaults) {
+        serializedDefaults.push_back(expr.get()->serialize(explain));
+    }
+
+    return Value(DOC("$zip" << DOC("inputs" << Value(serializedInput) << "defaults"
+                                            << Value(serializedDefaults) << "useLongestLength"
+                                            << serializedUseLongestLength)));
 }
+
+void ExpressionZip::_doAddDependencies(DepsTracker* deps) const {
+    std::for_each(
+        _inputs.begin(), _inputs.end(), [&deps](intrusive_ptr<Expression> inputExpression) -> void {
+            inputExpression->addDependencies(deps);
+        });
+    std::for_each(_defaults.begin(),
+                  _defaults.end(),
+                  [&deps](intrusive_ptr<Expression> defaultExpression) -> void {
+                      defaultExpression->addDependencies(deps);
+                  });
 }
+
+/* -------------------------- ExpressionConvert ------------------------------ */
+
+namespace {
+
+/**
+ * $convert supports a big grab bag of conversions, so ConversionTable maintains a collection of
+ * conversion functions, as well as a table to organize them by inputType and targetType.
+ */
+class ConversionTable {
+public:
+    using ConversionFunc = std::function<Value(ExpressionContext* const, Value)>;
+
+    ConversionTable() {
+        //
+        // Conversions from NumberDouble
+        //
+        table[BSONType::NumberDouble][BSONType::NumberDouble] = &performIdentityConversion;
+        table[BSONType::NumberDouble][BSONType::String] = &performFormatDouble;
+        table[BSONType::NumberDouble][BSONType::Bool] = [](ExpressionContext* const expCtx,
+                                                           Value inputValue) {
+            return Value(inputValue.coerceToBool());
+        };
+        table[BSONType::NumberDouble][BSONType::Date] = &performCastNumberToDate;
+        table[BSONType::NumberDouble][BSONType::NumberInt] = &performCastDoubleToInt;
+        table[BSONType::NumberDouble][BSONType::NumberLong] = &performCastDoubleToLong;
+        table[BSONType::NumberDouble][BSONType::NumberDecimal] = [](ExpressionContext* const expCtx,
+                                                                    Value inputValue) {
+            return Value(inputValue.coerceToDecimal());
+        };
+
+        //
+        // Conversions from String
+        //
+        table[BSONType::String][BSONType::NumberDouble] = &parseStringToNumber<double, 0>;
+        table[BSONType::String][BSONType::String] = &performIdentityConversion;
+        table[BSONType::String][BSONType::jstOID] = &parseStringToOID;
+        table[BSONType::String][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::String][BSONType::Date] = [](ExpressionContext* const expCtx,
+                                                     Value inputValue) {
+            return Value(expCtx->timeZoneDatabase->fromString(inputValue.getStringData(),
+                                                              mongo::TimeZoneDatabase::utcZone()));
+        };
+        table[BSONType::String][BSONType::NumberInt] = &parseStringToNumber<int, 10>;
+        table[BSONType::String][BSONType::NumberLong] = &parseStringToNumber<long long, 10>;
+        table[BSONType::String][BSONType::NumberDecimal] = &parseStringToNumber<Decimal128, 0>;
+
+        //
+        // Conversions from jstOID
+        //
+        table[BSONType::jstOID][BSONType::String] = [](ExpressionContext* const expCtx,
+                                                       Value inputValue) {
+            return Value(inputValue.getOid().toString());
+        };
+        table[BSONType::jstOID][BSONType::jstOID] = &performIdentityConversion;
+        table[BSONType::jstOID][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::jstOID][BSONType::Date] = [](ExpressionContext* const expCtx,
+                                                     Value inputValue) {
+            return Value(inputValue.getOid().asDateT());
+        };
+
+        //
+        // Conversions from Bool
+        //
+        table[BSONType::Bool][BSONType::NumberDouble] = [](ExpressionContext* const expCtx,
+                                                           Value inputValue) {
+            return inputValue.getBool() ? Value(1.0) : Value(0.0);
+        };
+        table[BSONType::Bool][BSONType::String] = [](ExpressionContext* const expCtx,
+                                                     Value inputValue) {
+            return inputValue.getBool() ? Value("true"_sd) : Value("false"_sd);
+        };
+        table[BSONType::Bool][BSONType::Bool] = &performIdentityConversion;
+        table[BSONType::Bool][BSONType::NumberInt] = [](ExpressionContext* const expCtx,
+                                                        Value inputValue) {
+            return inputValue.getBool() ? Value(int{1}) : Value(int{0});
+        };
+        table[BSONType::Bool][BSONType::NumberLong] = [](ExpressionContext* const expCtx,
+                                                         Value inputValue) {
+            return inputValue.getBool() ? Value(1LL) : Value(0LL);
+        };
+        table[BSONType::Bool][BSONType::NumberDecimal] = [](ExpressionContext* const expCtx,
+                                                            Value inputValue) {
+            return inputValue.getBool() ? Value(Decimal128(1)) : Value(Decimal128(0));
+        };
+
+        //
+        // Conversions from Date
+        //
+        table[BSONType::Date][BSONType::NumberDouble] = [](ExpressionContext* const expCtx,
+                                                           Value inputValue) {
+            return Value(static_cast<double>(inputValue.getDate().toMillisSinceEpoch()));
+        };
+        table[BSONType::Date][BSONType::String] = [](ExpressionContext* const expCtx,
+                                                     Value inputValue) {
+            auto dateString = uassertStatusOK(
+                TimeZoneDatabase::utcZone().formatDate(kISOFormatString, inputValue.getDate()));
+            return Value(dateString);
+        };
+        table[BSONType::Date][BSONType::Bool] = [](ExpressionContext* const expCtx,
+                                                   Value inputValue) {
+            return Value(inputValue.coerceToBool());
+        };
+        table[BSONType::Date][BSONType::Date] = &performIdentityConversion;
+        table[BSONType::Date][BSONType::NumberLong] = [](ExpressionContext* const expCtx,
+                                                         Value inputValue) {
+            return Value(inputValue.getDate().toMillisSinceEpoch());
+        };
+        table[BSONType::Date][BSONType::NumberDecimal] = [](ExpressionContext* const expCtx,
+                                                            Value inputValue) {
+            return Value(
+                Decimal128(static_cast<int64_t>(inputValue.getDate().toMillisSinceEpoch())));
+        };
+
+        //
+        // Conversions from NumberInt
+        //
+        table[BSONType::NumberInt][BSONType::NumberDouble] = [](ExpressionContext* const expCtx,
+                                                                Value inputValue) {
+            return Value(inputValue.coerceToDouble());
+        };
+        table[BSONType::NumberInt][BSONType::String] = [](ExpressionContext* const expCtx,
+                                                          Value inputValue) {
+            return Value(static_cast<std::string>(str::stream() << inputValue.getInt()));
+        };
+        table[BSONType::NumberInt][BSONType::Bool] = [](ExpressionContext* const expCtx,
+                                                        Value inputValue) {
+            return Value(inputValue.coerceToBool());
+        };
+        table[BSONType::NumberInt][BSONType::NumberInt] = &performIdentityConversion;
+        table[BSONType::NumberInt][BSONType::NumberLong] = [](ExpressionContext* const expCtx,
+                                                              Value inputValue) {
+            return Value(static_cast<long long>(inputValue.getInt()));
+        };
+        table[BSONType::NumberInt][BSONType::NumberDecimal] = [](ExpressionContext* const expCtx,
+                                                                 Value inputValue) {
+            return Value(inputValue.coerceToDecimal());
+        };
+
+        //
+        // Conversions from NumberLong
+        //
+        table[BSONType::NumberLong][BSONType::NumberDouble] = [](ExpressionContext* const expCtx,
+                                                                 Value inputValue) {
+            return Value(inputValue.coerceToDouble());
+        };
+        table[BSONType::NumberLong][BSONType::String] = [](ExpressionContext* const expCtx,
+                                                           Value inputValue) {
+            return Value(static_cast<std::string>(str::stream() << inputValue.getLong()));
+        };
+        table[BSONType::NumberLong][BSONType::Bool] = [](ExpressionContext* const expCtx,
+                                                         Value inputValue) {
+            return Value(inputValue.coerceToBool());
+        };
+        table[BSONType::NumberLong][BSONType::Date] = &performCastNumberToDate;
+        table[BSONType::NumberLong][BSONType::NumberInt] = &performCastLongToInt;
+        table[BSONType::NumberLong][BSONType::NumberLong] = &performIdentityConversion;
+        table[BSONType::NumberLong][BSONType::NumberDecimal] = [](ExpressionContext* const expCtx,
+                                                                  Value inputValue) {
+            return Value(inputValue.coerceToDecimal());
+        };
+
+        //
+        // Conversions from NumberDecimal
+        //
+        table[BSONType::NumberDecimal][BSONType::NumberDouble] = &performCastDecimalToDouble;
+        table[BSONType::NumberDecimal][BSONType::String] = [](ExpressionContext* const expCtx,
+                                                              Value inputValue) {
+            return Value(inputValue.getDecimal().toString());
+        };
+        table[BSONType::NumberDecimal][BSONType::Bool] = [](ExpressionContext* const expCtx,
+                                                            Value inputValue) {
+            return Value(inputValue.coerceToBool());
+        };
+        table[BSONType::NumberDecimal][BSONType::Date] = &performCastNumberToDate;
+        table[BSONType::NumberDecimal][BSONType::NumberInt] = [](ExpressionContext* const expCtx,
+                                                                 Value inputValue) {
+            return performCastDecimalToInt(BSONType::NumberInt, inputValue);
+        };
+        table[BSONType::NumberDecimal][BSONType::NumberLong] = [](ExpressionContext* const expCtx,
+                                                                  Value inputValue) {
+            return performCastDecimalToInt(BSONType::NumberLong, inputValue);
+        };
+        table[BSONType::NumberDecimal][BSONType::NumberDecimal] = &performIdentityConversion;
+
+        //
+        // Miscellaneous conversions to Bool
+        //
+        table[BSONType::Object][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::Array][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::BinData][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::RegEx][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::DBRef][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::Code][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::Symbol][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::CodeWScope][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::bsonTimestamp][BSONType::Bool] = &performConvertToTrue;
+    }
+
+    ConversionFunc findConversionFunc(BSONType inputType, BSONType targetType) const {
+        ConversionFunc foundFunction;
+
+        // Note: We can't use BSONType::MinKey (-1) or BSONType::MaxKey (127) as table indexes,
+        // so we have to treat them as special cases.
+        if (inputType != BSONType::MinKey && inputType != BSONType::MaxKey &&
+            targetType != BSONType::MinKey && targetType != BSONType::MaxKey) {
+            invariant(inputType >= 0 && inputType <= JSTypeMax);
+            invariant(targetType >= 0 && targetType <= JSTypeMax);
+            foundFunction = table[inputType][targetType];
+        } else if (targetType == BSONType::Bool) {
+            // This is a conversion from MinKey or MaxKey to Bool, which is allowed (and always
+            // returns true).
+            foundFunction = &performConvertToTrue;
+        } else {
+            // Any other conversions involving MinKey or MaxKey (either as the target or input) are
+            // illegal.
+        }
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Unsupported conversion from " << typeName(inputType) << " to "
+                              << typeName(targetType) << " in $convert with no onError value",
+                foundFunction);
+        return foundFunction;
+    }
+
+private:
+    ConversionFunc table[JSTypeMax + 1][JSTypeMax + 1];
+
+    static void validateDoubleValueIsFinite(double inputDouble) {
+        uassert(ErrorCodes::ConversionFailure,
+                "Attempt to convert NaN value to integer type in $convert with no onError value",
+                !std::isnan(inputDouble));
+        uassert(
+            ErrorCodes::ConversionFailure,
+            "Attempt to convert infinity value to integer type in $convert with no onError value",
+            std::isfinite(inputDouble));
+    }
+
+    static Value performCastDoubleToInt(ExpressionContext* const expCtx, Value inputValue) {
+        double inputDouble = inputValue.getDouble();
+        validateDoubleValueIsFinite(inputDouble);
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: "
+                    << inputDouble,
+                inputDouble >= std::numeric_limits<int>::lowest() &&
+                    inputDouble <= std::numeric_limits<int>::max());
+
+        return Value(static_cast<int>(inputDouble));
+    }
+
+    static Value performCastDoubleToLong(ExpressionContext* const expCtx, Value inputValue) {
+        double inputDouble = inputValue.getDouble();
+        validateDoubleValueIsFinite(inputDouble);
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: "
+                    << inputDouble,
+                inputDouble >= std::numeric_limits<long long>::lowest() &&
+                    inputDouble < BSONElement::kLongLongMaxPlusOneAsDouble);
+
+        return Value(static_cast<long long>(inputDouble));
+    }
+
+    static Value performCastDecimalToInt(BSONType targetType, Value inputValue) {
+        invariant(targetType == BSONType::NumberInt || targetType == BSONType::NumberLong);
+        Decimal128 inputDecimal = inputValue.getDecimal();
+
+        // Performing these checks up front allows us to provide more specific error messages than
+        // if we just gave the same error for any 'kInvalid' conversion.
+        uassert(ErrorCodes::ConversionFailure,
+                "Attempt to convert NaN value to integer type in $convert with no onError value",
+                !inputDecimal.isNaN());
+        uassert(
+            ErrorCodes::ConversionFailure,
+            "Attempt to convert infinity value to integer type in $convert with no onError value",
+            !inputDecimal.isInfinite());
+
+        std::uint32_t signalingFlags = Decimal128::SignalingFlag::kNoFlag;
+        Value result;
+        if (targetType == BSONType::NumberInt) {
+            int intVal =
+                inputDecimal.toInt(&signalingFlags, Decimal128::RoundingMode::kRoundTowardZero);
+            result = Value(intVal);
+        } else if (targetType == BSONType::NumberLong) {
+            long long longVal =
+                inputDecimal.toLong(&signalingFlags, Decimal128::RoundingMode::kRoundTowardZero);
+            result = Value(longVal);
+        } else {
+            MONGO_UNREACHABLE;
+        }
+
+        // NB: Decimal128::SignalingFlag has a values specifically for overflow, but it is used for
+        // arithmetic with Decimal128 operands, _not_ for conversions of this style. Overflowing
+        // conversions only trigger a 'kInvalid' flag.
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: "
+                    << inputDecimal.toString(),
+                (signalingFlags & Decimal128::SignalingFlag::kInvalid) == 0);
+        invariant(signalingFlags == Decimal128::SignalingFlag::kNoFlag);
+
+        return result;
+    }
+
+    static Value performCastDecimalToDouble(ExpressionContext* const expCtx, Value inputValue) {
+        Decimal128 inputDecimal = inputValue.getDecimal();
+
+        std::uint32_t signalingFlags = Decimal128::SignalingFlag::kNoFlag;
+        double result =
+            inputDecimal.toDouble(&signalingFlags, Decimal128::RoundingMode::kRoundTiesToEven);
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: "
+                    << inputDecimal.toString(),
+                signalingFlags == Decimal128::SignalingFlag::kNoFlag ||
+                    signalingFlags == Decimal128::SignalingFlag::kInexact);
+
+        return Value(result);
+    }
+
+    static Value performCastLongToInt(ExpressionContext* const expCtx, Value inputValue) {
+        long long longValue = inputValue.getLong();
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: ",
+                longValue >= std::numeric_limits<int>::min() &&
+                    longValue <= std::numeric_limits<int>::max());
+
+        return Value(static_cast<int>(longValue));
+    }
+
+    static Value performCastNumberToDate(ExpressionContext* const expCtx, Value inputValue) {
+        long long millisSinceEpoch;
+
+        switch (inputValue.getType()) {
+            case BSONType::NumberLong:
+                millisSinceEpoch = inputValue.getLong();
+                break;
+            case BSONType::NumberDouble:
+                millisSinceEpoch = performCastDoubleToLong(expCtx, inputValue).getLong();
+                break;
+            case BSONType::NumberDecimal:
+                millisSinceEpoch =
+                    performCastDecimalToInt(BSONType::NumberLong, inputValue).getLong();
+                break;
+            default:
+                MONGO_UNREACHABLE;
+        }
+
+        return Value(Date_t::fromMillisSinceEpoch(millisSinceEpoch));
+    }
+
+    static Value performFormatDouble(ExpressionContext* const expCtx, Value inputValue) {
+        double doubleValue = inputValue.getDouble();
+
+        if (std::isinf(doubleValue)) {
+            return Value(std::signbit(doubleValue) ? "-Infinity"_sd : "Infinity"_sd);
+        } else if (std::isnan(doubleValue)) {
+            return Value("NaN"_sd);
+        } else if (doubleValue == 0.0 && std::signbit(doubleValue)) {
+            return Value("-0"_sd);
+        } else {
+            return Value(static_cast<std::string>(str::stream() << doubleValue));
+        }
+    }
+
+    template <class targetType, int base>
+    static Value parseStringToNumber(ExpressionContext* const expCtx, Value inputValue) {
+        auto stringValue = inputValue.getStringData();
+        targetType result;
+
+        // Reject any strings in hex format. This check is needed because the
+        // NumberParser::parse call below allows an input hex string prefixed by '0x' when
+        // parsing to a double.
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Illegal hexadecimal input in $convert with no onError value: "
+                              << stringValue,
+                !stringValue.startsWith("0x"));
+
+        Status parseStatus = NumberParser().base(base)(stringValue, &result);
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Failed to parse number '" << stringValue
+                              << "' in $convert with no onError value: " << parseStatus.reason(),
+                parseStatus.isOK());
+
+        return Value(result);
+    }
+
+    static Value parseStringToOID(ExpressionContext* const expCtx, Value inputValue) {
+        try {
+            return Value(OID::createFromString(inputValue.getStringData()));
+        } catch (const DBException& ex) {
+            // Rethrow any caught exception as a conversion failure such that 'onError' is evaluated
+            // and returned.
+            uasserted(ErrorCodes::ConversionFailure,
+                      str::stream() << "Failed to parse objectId '" << inputValue.getString()
+                                    << "' in $convert with no onError value: " << ex.reason());
+        }
+    }
+
+    static Value performConvertToTrue(ExpressionContext* const expCtx, Value inputValue) {
+        return Value(true);
+    }
+
+    static Value performIdentityConversion(ExpressionContext* const expCtx, Value inputValue) {
+        return inputValue;
+    }
+};
+
+Expression::Parser makeConversionAlias(const StringData shortcutName, BSONType toType) {
+    return [=](ExpressionContext* const expCtx,
+               BSONElement elem,
+               const VariablesParseState& vps) -> intrusive_ptr<Expression> {
+        // Use parseArguments to allow for a singleton array, or the unwrapped version.
+        auto operands = ExpressionNary::parseArguments(expCtx, elem, vps);
+
+        uassert(50723,
+                str::stream() << shortcutName << " requires a single argument, got "
+                              << operands.size(),
+                operands.size() == 1);
+        return ExpressionConvert::create(expCtx, std::move(operands[0]), toType);
+    };
+}
+
+}  // namespace
+
+REGISTER_EXPRESSION(convert, ExpressionConvert::parse);
+
+// Also register shortcut expressions like $toInt, $toString, etc. which can be used as a shortcut
+// for $convert without an 'onNull' or 'onError'.
+REGISTER_EXPRESSION(toString, makeConversionAlias("$toString"_sd, BSONType::String));
+REGISTER_EXPRESSION(toObjectId, makeConversionAlias("$toObjectId"_sd, BSONType::jstOID));
+REGISTER_EXPRESSION(toDate, makeConversionAlias("$toDate"_sd, BSONType::Date));
+REGISTER_EXPRESSION(toDouble, makeConversionAlias("$toDouble"_sd, BSONType::NumberDouble));
+REGISTER_EXPRESSION(toInt, makeConversionAlias("$toInt"_sd, BSONType::NumberInt));
+REGISTER_EXPRESSION(toLong, makeConversionAlias("$toLong"_sd, BSONType::NumberLong));
+REGISTER_EXPRESSION(toDecimal, makeConversionAlias("$toDecimal"_sd, BSONType::NumberDecimal));
+REGISTER_EXPRESSION(toBool, makeConversionAlias("$toBool"_sd, BSONType::Bool));
+
+boost::intrusive_ptr<Expression> ExpressionConvert::create(ExpressionContext* const expCtx,
+                                                           boost::intrusive_ptr<Expression> input,
+                                                           BSONType toType) {
+    return new ExpressionConvert(
+        expCtx,
+        std::move(input),
+        ExpressionConstant::create(expCtx, Value(StringData(typeName(toType)))),
+        nullptr,
+        nullptr);
+}
+
+ExpressionConvert::ExpressionConvert(ExpressionContext* const expCtx,
+                                     boost::intrusive_ptr<Expression> input,
+                                     boost::intrusive_ptr<Expression> to,
+                                     boost::intrusive_ptr<Expression> onError,
+                                     boost::intrusive_ptr<Expression> onNull)
+    : Expression(expCtx, {std::move(input), std::move(to), std::move(onError), std::move(onNull)}),
+      _input(_children[0]),
+      _to(_children[1]),
+      _onError(_children[2]),
+      _onNull(_children[3]) {}
+
+intrusive_ptr<Expression> ExpressionConvert::parse(ExpressionContext* const expCtx,
+                                                   BSONElement expr,
+                                                   const VariablesParseState& vps) {
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "$convert expects an object of named arguments but found: "
+                          << typeName(expr.type()),
+            expr.type() == BSONType::Object);
+
+    boost::intrusive_ptr<Expression> input;
+    boost::intrusive_ptr<Expression> to;
+    boost::intrusive_ptr<Expression> onError;
+    boost::intrusive_ptr<Expression> onNull;
+    for (auto&& elem : expr.embeddedObject()) {
+        const auto field = elem.fieldNameStringData();
+        if (field == "input"_sd) {
+            input = parseOperand(expCtx, elem, vps);
+        } else if (field == "to"_sd) {
+            to = parseOperand(expCtx, elem, vps);
+        } else if (field == "onError"_sd) {
+            onError = parseOperand(expCtx, elem, vps);
+        } else if (field == "onNull"_sd) {
+            onNull = parseOperand(expCtx, elem, vps);
+        } else {
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "$convert found an unknown argument: " << elem.fieldNameStringData());
+        }
+    }
+
+    uassert(ErrorCodes::FailedToParse, "Missing 'input' parameter to $convert", input);
+    uassert(ErrorCodes::FailedToParse, "Missing 'to' parameter to $convert", to);
+
+    return new ExpressionConvert(
+        expCtx, std::move(input), std::move(to), std::move(onError), std::move(onNull));
+}
+
+Value ExpressionConvert::evaluate(const Document& root, Variables* variables) const {
+    auto toValue = _to->evaluate(root, variables);
+    Value inputValue = _input->evaluate(root, variables);
+    boost::optional<BSONType> targetType;
+    if (!toValue.nullish()) {
+        targetType = computeTargetType(toValue);
+    }
+
+    if (inputValue.nullish()) {
+        return _onNull ? _onNull->evaluate(root, variables) : Value(BSONNULL);
+    } else if (!targetType) {
+        // "to" evaluated to a nullish value.
+        return Value(BSONNULL);
+    }
+
+    try {
+        return performConversion(*targetType, inputValue);
+    } catch (const ExceptionFor<ErrorCodes::ConversionFailure>&) {
+        if (_onError) {
+            return _onError->evaluate(root, variables);
+        } else {
+            throw;
+        }
+    }
+}
+
+boost::intrusive_ptr<Expression> ExpressionConvert::optimize() {
+    _input = _input->optimize();
+    _to = _to->optimize();
+    if (_onError) {
+        _onError = _onError->optimize();
+    }
+    if (_onNull) {
+        _onNull = _onNull->optimize();
+    }
+
+    // Perform constant folding if possible. This does not support folding for $convert operations
+    // that have constant _to and _input values but non-constant _onError and _onNull values.
+    // Because _onError and _onNull are evaluated lazily, conversions that do not used the _onError
+    // and _onNull values could still be legally folded if those values are not needed. Support for
+    // that case would add more complexity than it's worth, though.
+    if (ExpressionConstant::allNullOrConstant({_input, _to, _onError, _onNull})) {
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document{}, &(getExpressionContext()->variables)));
+    }
+
+    return this;
+}
+
+Value ExpressionConvert::serialize(bool explain) const {
+    return Value(Document{{"$convert",
+                           Document{{"input", _input->serialize(explain)},
+                                    {"to", _to->serialize(explain)},
+                                    {"onError", _onError ? _onError->serialize(explain) : Value()},
+                                    {"onNull", _onNull ? _onNull->serialize(explain) : Value()}}}});
+}
+
+void ExpressionConvert::_doAddDependencies(DepsTracker* deps) const {
+    _input->addDependencies(deps);
+    _to->addDependencies(deps);
+    if (_onError) {
+        _onError->addDependencies(deps);
+    }
+    if (_onNull) {
+        _onNull->addDependencies(deps);
+    }
+}
+
+BSONType ExpressionConvert::computeTargetType(Value targetTypeName) const {
+    BSONType targetType;
+    if (targetTypeName.getType() == BSONType::String) {
+        // typeFromName() does not consider "missing" to be a valid type, but we want to accept it,
+        // because it is a possible result of the $type aggregation operator.
+        if (targetTypeName.getStringData() == "missing"_sd) {
+            return BSONType::EOO;
+        }
+
+        // This will throw if the type name is invalid.
+        targetType = typeFromName(targetTypeName.getString());
+    } else if (targetTypeName.numeric()) {
+        uassert(ErrorCodes::FailedToParse,
+                "In $convert, numeric 'to' argument is not an integer",
+                targetTypeName.integral());
+
+        int typeCode = targetTypeName.coerceToInt();
+        uassert(ErrorCodes::FailedToParse,
+                str::stream()
+                    << "In $convert, numeric value for 'to' does not correspond to a BSON type: "
+                    << typeCode,
+                isValidBSONType(typeCode));
+        targetType = static_cast<BSONType>(typeCode);
+    } else {
+        uasserted(ErrorCodes::FailedToParse,
+                  str::stream() << "$convert's 'to' argument must be a string or number, but is "
+                                << typeName(targetTypeName.getType()));
+    }
+
+    return targetType;
+}
+
+Value ExpressionConvert::performConversion(BSONType targetType, Value inputValue) const {
+    invariant(!inputValue.nullish());
+
+    static const ConversionTable table;
+    BSONType inputType = inputValue.getType();
+    return table.findConversionFunc(inputType, targetType)(getExpressionContext(), inputValue);
+}
+
+namespace {
+
+auto CommonRegexParse(ExpressionContext* const expCtx,
+                      BSONElement expr,
+                      const VariablesParseState& vpsIn,
+                      StringData opName) {
+    uassert(51103,
+            str::stream() << opName
+                          << " expects an object of named arguments but found: " << expr.type(),
+            expr.type() == BSONType::Object);
+
+    struct {
+        boost::intrusive_ptr<Expression> input;
+        boost::intrusive_ptr<Expression> regex;
+        boost::intrusive_ptr<Expression> options;
+    } parsed;
+    for (auto&& elem : expr.embeddedObject()) {
+        const auto field = elem.fieldNameStringData();
+        if (field == "input"_sd) {
+            parsed.input = Expression::parseOperand(expCtx, elem, vpsIn);
+        } else if (field == "regex"_sd) {
+            parsed.regex = Expression::parseOperand(expCtx, elem, vpsIn);
+        } else if (field == "options"_sd) {
+            parsed.options = Expression::parseOperand(expCtx, elem, vpsIn);
+        } else {
+            uasserted(31024,
+                      str::stream() << opName << " found an unknown argument: "
+                                    << elem.fieldNameStringData());
+        }
+    }
+    uassert(31022, str::stream() << opName << " requires 'input' parameter", parsed.input);
+    uassert(31023, str::stream() << opName << " requires 'regex' parameter", parsed.regex);
+
+    return parsed;
+}
+
+}  // namespace
+
+/* -------------------------- ExpressionRegex ------------------------------ */
+
+ExpressionRegex::RegexExecutionState ExpressionRegex::buildInitialState(
+    const Document& root, Variables* variables) const {
+    Value textInput = _input->evaluate(root, variables);
+    Value regexPattern = _regex->evaluate(root, variables);
+    Value regexOptions = _options ? _options->evaluate(root, variables) : Value(BSONNULL);
+
+    auto executionState = _initialExecStateForConstantRegex.value_or(RegexExecutionState());
+
+    // The 'input' parameter can be a variable and needs to be extracted from the expression
+    // document even when '_preExecutionState' is present.
+    _extractInputField(&executionState, textInput);
+
+    // If we have a prebuilt execution state, then the 'regex' and 'options' fields are constant
+    // values, and we do not need to re-compile them.
+    if (!hasConstantRegex()) {
+        _extractRegexAndOptions(&executionState, regexPattern, regexOptions);
+        _compile(&executionState);
+    }
+
+    return executionState;
+}
+
+int ExpressionRegex::execute(RegexExecutionState* regexState) const {
+    invariant(regexState);
+    invariant(!regexState->nullish());
+    invariant(regexState->pcrePtr);
+
+    int execResult = pcre_exec(regexState->pcrePtr.get(),
+                               nullptr,
+                               regexState->input->c_str(),
+                               regexState->input->size(),
+                               regexState->startBytePos,
+                               0,  // No need to overwrite the options set during pcre_compile.
+                               &(regexState->capturesBuffer.front()),
+                               regexState->capturesBuffer.size());
+    // The 'execResult' will be -1 if there is no match, 0 < execResult <= (numCaptures + 1)
+    // depending on how many capture groups match, negative (other than -1) if there is an error
+    // during execution, and zero if capturesBuffer's capacity is not sufficient to hold all the
+    // results. The latter scenario should never occur.
+    uassert(51156,
+            str::stream() << "Error occurred while executing the regular expression in " << _opName
+                          << ". Result code: " << execResult,
+            execResult == -1 || (execResult > 0 && execResult <= (regexState->numCaptures + 1)));
+    return execResult;
+}
+
+Value ExpressionRegex::nextMatch(RegexExecutionState* regexState) const {
+    int execResult = execute(regexState);
+
+    // No match.
+    if (execResult < 0) {
+        return Value(BSONNULL);
+    }
+
+    // Use 'input' as StringData throughout the function to avoid copying the string on 'substr'
+    // calls.
+    StringData input = *(regexState->input);
+
+    auto verifyBounds = [&input, this](auto startPos, auto limitPos, auto isCapture) {
+        // If a capture group was not matched, then the 'startPos' and 'limitPos' will both be -1.
+        // These bounds cannot occur for a match on the full string.
+        if (startPos == -1 || limitPos == -1) {
+            massert(31304,
+                    str::stream() << "Unexpected error occurred while executing " << _opName
+                                  << ". startPos: " << startPos << ", limitPos: " << limitPos,
+                    isCapture && startPos == -1 && limitPos == -1);
+            return;
+        }
+
+        massert(31305,
+                str::stream() << "Unexpected error occurred while executing " << _opName
+                              << ". startPos: " << startPos,
+                (startPos >= 0 && static_cast<size_t>(startPos) <= input.size()));
+        massert(31306,
+                str::stream() << "Unexpected error occurred while executing " << _opName
+                              << ". limitPos: " << limitPos,
+                (limitPos >= 0 && static_cast<size_t>(limitPos) <= input.size()));
+        massert(31307,
+                str::stream() << "Unexpected error occurred while executing " << _opName
+                              << ". startPos: " << startPos << ", limitPos: " << limitPos,
+                startPos <= limitPos);
+    };
+
+    // The first and second entries of the 'capturesBuffer' will have the start and (end+1) indices
+    // of the matched string, as byte offsets. '(limit - startIndex)' would be the length of the
+    // captured string.
+    verifyBounds(regexState->capturesBuffer[0], regexState->capturesBuffer[1], false);
+    const int matchStartByteIndex = regexState->capturesBuffer[0];
+    StringData matchedStr =
+        input.substr(matchStartByteIndex, regexState->capturesBuffer[1] - matchStartByteIndex);
+
+    // We iterate through the input string's contents preceding the match index, in order to convert
+    // the byte offset to a code point offset.
+    for (int byteIx = regexState->startBytePos; byteIx < matchStartByteIndex;
+         ++(regexState->startCodePointPos)) {
+        byteIx += str::getCodePointLength(input[byteIx]);
+    }
+
+    // Set the start index for match to the new one.
+    regexState->startBytePos = matchStartByteIndex;
+
+    std::vector<Value> captures;
+    captures.reserve(regexState->numCaptures);
+
+    // The next '2 * numCaptures' entries (after the first two entries) of 'capturesBuffer' will
+    // hold the start index and limit pairs, for each of the capture groups. We skip the first two
+    // elements and start iteration from 3rd element so that we only construct the strings for
+    // capture groups.
+    for (int i = 0; i < regexState->numCaptures; ++i) {
+        const int start = regexState->capturesBuffer[2 * (i + 1)];
+        const int limit = regexState->capturesBuffer[2 * (i + 1) + 1];
+        verifyBounds(start, limit, true);
+
+        // The 'start' and 'limit' will be set to -1, if the 'input' didn't match the current
+        // capture group. In this case we put a 'null' placeholder in place of the capture group.
+        captures.push_back(start == -1 && limit == -1 ? Value(BSONNULL)
+                                                      : Value(input.substr(start, limit - start)));
+    }
+
+    MutableDocument match;
+    match.addField("match", Value(matchedStr));
+    match.addField("idx", Value(regexState->startCodePointPos));
+    match.addField("captures", Value(captures));
+    return match.freezeToValue();
+}
+
+boost::intrusive_ptr<Expression> ExpressionRegex::optimize() {
+    _input = _input->optimize();
+    _regex = _regex->optimize();
+    if (_options) {
+        _options = _options->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant({_regex, _options})) {
+        _initialExecStateForConstantRegex.emplace();
+        _extractRegexAndOptions(
+            _initialExecStateForConstantRegex.get_ptr(),
+            static_cast<ExpressionConstant*>(_regex.get())->getValue(),
+            _options ? static_cast<ExpressionConstant*>(_options.get())->getValue() : Value());
+        _compile(_initialExecStateForConstantRegex.get_ptr());
+    }
+    return this;
+}
+
+void ExpressionRegex::_compile(RegexExecutionState* executionState) const {
+
+    const auto pcreOptions =
+        regex_util::flagsToPcreOptions(executionState->options.value_or(""), false, _opName)
+            .all_options();
+
+    if (!executionState->pattern) {
+        return;
+    }
+
+    const char* compile_error;
+    int eoffset;
+
+    // The C++ interface pcreccp.h doesn't have a way to capture the matched string (or the index of
+    // the match). So we are using the C interface. First we compile all the regex options to
+    // generate pcre object, which will later be used to match against the input string.
+    executionState->pcrePtr = std::shared_ptr<pcre>(
+        pcre_compile(
+            executionState->pattern->c_str(), pcreOptions, &compile_error, &eoffset, nullptr),
+        pcre_free);
+    uassert(51111,
+            str::stream() << "Invalid Regex in " << _opName << ": " << compile_error,
+            executionState->pcrePtr);
+
+    // Calculate the number of capture groups present in 'pattern' and store in 'numCaptures'.
+    const int pcre_retval = pcre_fullinfo(executionState->pcrePtr.get(),
+                                          nullptr,
+                                          PCRE_INFO_CAPTURECOUNT,
+                                          &executionState->numCaptures);
+    invariant(pcre_retval == 0);
+
+    // The first two-thirds of the vector is used to pass back captured substrings' start and
+    // (end+1) indexes. The remaining third of the vector is used as workspace by pcre_exec() while
+    // matching capturing subpatterns, and is not available for passing back information.
+    // pcre_compile will error if there are too many capture groups in the pattern. As long as this
+    // memory is allocated after compile, the amount of memory allocated will not be too high.
+    executionState->capturesBuffer.resize((1 + executionState->numCaptures) * 3);
+}
+
+Value ExpressionRegex::serialize(bool explain) const {
+    return Value(
+        Document{{_opName,
+                  Document{{"input", _input->serialize(explain)},
+                           {"regex", _regex->serialize(explain)},
+                           {"options", _options ? _options->serialize(explain) : Value()}}}});
+}
+
+void ExpressionRegex::_extractInputField(RegexExecutionState* executionState,
+                                         const Value& textInput) const {
+    uassert(51104,
+            str::stream() << _opName << " needs 'input' to be of type string",
+            textInput.nullish() || textInput.getType() == BSONType::String);
+    if (textInput.getType() == BSONType::String) {
+        executionState->input = textInput.getString();
+    }
+}
+
+void ExpressionRegex::_extractRegexAndOptions(RegexExecutionState* executionState,
+                                              const Value& regexPattern,
+                                              const Value& regexOptions) const {
+    uassert(51105,
+            str::stream() << _opName << " needs 'regex' to be of type string or regex",
+            regexPattern.nullish() || regexPattern.getType() == BSONType::String ||
+                regexPattern.getType() == BSONType::RegEx);
+    uassert(51106,
+            str::stream() << _opName << " needs 'options' to be of type string",
+            regexOptions.nullish() || regexOptions.getType() == BSONType::String);
+
+    // The 'regex' field can be a RegEx object and may have its own options...
+    if (regexPattern.getType() == BSONType::RegEx) {
+        StringData regexFlags = regexPattern.getRegexFlags();
+        executionState->pattern = regexPattern.getRegex();
+        uassert(51107,
+                str::stream()
+                    << _opName
+                    << ": found regex option(s) specified in both 'regex' and 'option' fields",
+                regexOptions.nullish() || regexFlags.empty());
+        if (!regexFlags.empty()) {
+            executionState->options = regexFlags.toString();
+        }
+    } else if (regexPattern.getType() == BSONType::String) {
+        // ...or it can be a string field with options specified separately.
+        executionState->pattern = regexPattern.getString();
+    }
+
+    // If 'options' is non-null, we must validate its contents even if 'regexPattern' is nullish.
+    if (!regexOptions.nullish()) {
+        executionState->options = regexOptions.getString();
+    }
+    uassert(51109,
+            str::stream() << _opName << ": regular expression cannot contain an embedded null byte",
+            !executionState->pattern ||
+                executionState->pattern->find('\0', 0) == std::string::npos);
+
+    uassert(51110,
+            str::stream() << _opName
+                          << ": regular expression options cannot contain an embedded null byte",
+            !executionState->options ||
+                executionState->options->find('\0', 0) == std::string::npos);
+}
+
+void ExpressionRegex::_doAddDependencies(DepsTracker* deps) const {
+    _input->addDependencies(deps);
+    _regex->addDependencies(deps);
+    if (_options) {
+        _options->addDependencies(deps);
+    }
+}
+
+std::pair<boost::optional<std::string>, std::string> ExpressionRegex::getConstantPatternAndOptions()
+    const {
+    if (!ExpressionConstant::isNullOrConstant(_regex) ||
+        !ExpressionConstant::isNullOrConstant(_options)) {
+        return {boost::none, ""};
+    }
+    auto patternValue = static_cast<ExpressionConstant*>(_regex.get())->getValue();
+    uassert(5073405,
+            str::stream() << _opName << " needs 'regex' to be of type string or regex",
+            patternValue.nullish() || patternValue.getType() == BSONType::RegEx ||
+                patternValue.getType() == BSONType::String);
+    auto patternStr = [&]() -> boost::optional<std::string> {
+        if (patternValue.getType() == BSONType::RegEx) {
+            StringData flags = patternValue.getRegexFlags();
+            uassert(5073406,
+                    str::stream()
+                        << _opName
+                        << ": found regex options specified in both 'regex' and 'options' fields",
+                    _options.get() == nullptr || flags.empty());
+            return std::string(patternValue.getRegex());
+        } else if (patternValue.getType() == BSONType::String) {
+            return patternValue.getString();
+        } else {
+            return boost::none;
+        }
+    }();
+
+    auto optionsStr = [&]() -> std::string {
+        if (_options.get() != nullptr) {
+            auto optValue = static_cast<ExpressionConstant*>(_options.get())->getValue();
+            if (optValue.getType() == BSONType::String) {
+                return optValue.getString();
+            }
+        }
+        if (patternValue.getType() == BSONType::RegEx) {
+            StringData flags = patternValue.getRegexFlags();
+            if (!flags.empty()) {
+                return flags.toString();
+            }
+        }
+        return {};
+    }();
+
+    uassert(5073407,
+            str::stream() << _opName << ": regular expression cannot contain an embedded null byte",
+            patternStr->find('\0', 0) == std::string::npos);
+
+    uassert(5073408,
+            str::stream() << _opName
+                          << ": regular expression options cannot contain an embedded null byte",
+            optionsStr.find('\0', 0) == std::string::npos);
+
+    return {patternStr, optionsStr};
+}
+
+/* -------------------------- ExpressionRegexFind ------------------------------ */
+
+REGISTER_EXPRESSION(regexFind, ExpressionRegexFind::parse);
+boost::intrusive_ptr<Expression> ExpressionRegexFind::parse(ExpressionContext* const expCtx,
+                                                            BSONElement expr,
+                                                            const VariablesParseState& vpsIn) {
+    auto opName = "$regexFind"_sd;
+    auto [input, regex, options] = CommonRegexParse(expCtx, expr, vpsIn, opName);
+    return new ExpressionRegexFind(
+        expCtx, std::move(input), std::move(regex), std::move(options), opName);
+}
+
+Value ExpressionRegexFind::evaluate(const Document& root, Variables* variables) const {
+    auto executionState = buildInitialState(root, variables);
+    if (executionState.nullish()) {
+        return Value(BSONNULL);
+    }
+    return nextMatch(&executionState);
+}
+
+/* -------------------------- ExpressionRegexFindAll ------------------------------ */
+
+REGISTER_EXPRESSION(regexFindAll, ExpressionRegexFindAll::parse);
+boost::intrusive_ptr<Expression> ExpressionRegexFindAll::parse(ExpressionContext* const expCtx,
+                                                               BSONElement expr,
+                                                               const VariablesParseState& vpsIn) {
+    auto opName = "$regexFindAll"_sd;
+    auto [input, regex, options] = CommonRegexParse(expCtx, expr, vpsIn, opName);
+    return new ExpressionRegexFindAll(
+        expCtx, std::move(input), std::move(regex), std::move(options), opName);
+}
+
+Value ExpressionRegexFindAll::evaluate(const Document& root, Variables* variables) const {
+    std::vector<Value> output;
+    auto executionState = buildInitialState(root, variables);
+    if (executionState.nullish()) {
+        return Value(output);
+    }
+    StringData input = *(executionState.input);
+    size_t totalDocSize = 0;
+
+    // Using do...while loop because, when input is an empty string, we still want to see if there
+    // is a match.
+    do {
+        auto matchObj = nextMatch(&executionState);
+        if (matchObj.getType() == BSONType::jstNULL) {
+            break;
+        }
+        totalDocSize += matchObj.getApproximateSize();
+        uassert(51151,
+                str::stream() << getOpName()
+                              << ": the size of buffer to store output exceeded the 64MB limit",
+                totalDocSize <= mongo::BufferMaxSize);
+
+        output.push_back(matchObj);
+        std::string matchStr = matchObj.getDocument().getField("match").getString();
+        if (matchStr.empty()) {
+            // This would only happen if the regex matched an empty string. In this case, even if
+            // the character at startByteIndex matches the regex, we cannot return it since we are
+            // already returing an empty string starting at this index. So we move on to the next
+            // byte index.
+            executionState.startBytePos +=
+                str::getCodePointLength(input[executionState.startBytePos]);
+            ++executionState.startCodePointPos;
+            continue;
+        }
+
+        // We don't want any overlapping sub-strings. So we move 'startBytePos' to point to the
+        // byte after 'matchStr'. We move the code point index also correspondingly.
+        executionState.startBytePos += matchStr.size();
+        for (size_t byteIx = 0; byteIx < matchStr.size(); ++executionState.startCodePointPos) {
+            byteIx += str::getCodePointLength(matchStr[byteIx]);
+        }
+
+        invariant(executionState.startBytePos > 0);
+        invariant(executionState.startCodePointPos > 0);
+        invariant(executionState.startCodePointPos <= executionState.startBytePos);
+    } while (static_cast<size_t>(executionState.startBytePos) < input.size());
+    return Value(output);
+}
+
+/* -------------------------- ExpressionRegexMatch ------------------------------ */
+
+REGISTER_EXPRESSION(regexMatch, ExpressionRegexMatch::parse);
+boost::intrusive_ptr<Expression> ExpressionRegexMatch::parse(ExpressionContext* const expCtx,
+                                                             BSONElement expr,
+                                                             const VariablesParseState& vpsIn) {
+    auto opName = "$regexMatch"_sd;
+    auto [input, regex, options] = CommonRegexParse(expCtx, expr, vpsIn, opName);
+    return new ExpressionRegexMatch(
+        expCtx, std::move(input), std::move(regex), std::move(options), opName);
+}
+
+Value ExpressionRegexMatch::evaluate(const Document& root, Variables* variables) const {
+    auto executionState = buildInitialState(root, variables);
+    // Return output of execute only if regex is not nullish.
+    return executionState.nullish() ? Value(false) : Value(execute(&executionState) > 0);
+}
+
+/* -------------------------- ExpressionRandom ------------------------------ */
+REGISTER_EXPRESSION(rand, ExpressionRandom::parse);
+
+static thread_local PseudoRandom threadLocalRNG(SecureRandom().nextInt64());
+
+ExpressionRandom::ExpressionRandom(ExpressionContext* const expCtx) : Expression(expCtx) {}
+
+intrusive_ptr<Expression> ExpressionRandom::parse(ExpressionContext* const expCtx,
+                                                  BSONElement exprElement,
+                                                  const VariablesParseState& vps) {
+    uassert(3040500,
+            "$rand not allowed inside collection validators",
+            !expCtx->isParsingCollectionValidator);
+
+    uassert(3040501, "$rand does not currently accept arguments", exprElement.Obj().isEmpty());
+
+    return new ExpressionRandom(expCtx);
+}
+
+const char* ExpressionRandom::getOpName() const {
+    return "$rand";
+}
+
+double ExpressionRandom::getRandomValue() const {
+    return kMinValue + (kMaxValue - kMinValue) * threadLocalRNG.nextCanonicalDouble();
+}
+
+Value ExpressionRandom::evaluate(const Document& root, Variables* variables) const {
+    return Value(getRandomValue());
+}
+
+intrusive_ptr<Expression> ExpressionRandom::optimize() {
+    return intrusive_ptr<Expression>(this);
+}
+
+void ExpressionRandom::_doAddDependencies(DepsTracker* deps) const {
+    deps->needRandomGenerator = true;
+}
+
+Value ExpressionRandom::serialize(const bool explain) const {
+    return Value(DOC(getOpName() << Document()));
+}
+
+/* ------------------------- ExpressionToHashedIndexKey -------------------------- */
+REGISTER_EXPRESSION(toHashedIndexKey, ExpressionToHashedIndexKey::parse);
+
+boost::intrusive_ptr<Expression> ExpressionToHashedIndexKey::parse(ExpressionContext* const expCtx,
+                                                                   BSONElement expr,
+                                                                   const VariablesParseState& vps) {
+    return make_intrusive<ExpressionToHashedIndexKey>(expCtx, parseOperand(expCtx, expr, vps));
+}
+
+Value ExpressionToHashedIndexKey::evaluate(const Document& root, Variables* variables) const {
+    Value inpVal(_children[0]->evaluate(root, variables));
+    if (inpVal.missing()) {
+        inpVal = Value(BSONNULL);
+    }
+
+    return Value(BSONElementHasher::hash64(BSON("" << inpVal).firstElement(),
+                                           BSONElementHasher::DEFAULT_HASH_SEED));
+}
+
+Value ExpressionToHashedIndexKey::serialize(bool explain) const {
+    return Value(DOC("$toHashedIndexKey" << _children[0]->serialize(explain)));
+}
+
+void ExpressionToHashedIndexKey::_doAddDependencies(DepsTracker* deps) const {
+    // Nothing to do
+}
+
+/* ------------------------- ExpressionDateArithmetics -------------------------- */
+namespace {
+auto commonDateArithmeticsParse(ExpressionContext* const expCtx,
+                                BSONElement expr,
+                                const VariablesParseState& vps,
+                                StringData opName) {
+    uassert(5166400,
+            str::stream() << opName << " expects an object as its argument",
+            expr.type() == BSONType::Object);
+
+    struct {
+        boost::intrusive_ptr<Expression> startDate;
+        boost::intrusive_ptr<Expression> unit;
+        boost::intrusive_ptr<Expression> amount;
+        boost::intrusive_ptr<Expression> timezone;
+    } parsedArgs;
+
+    const BSONObj args = expr.embeddedObject();
+    for (auto&& arg : args) {
+        auto field = arg.fieldNameStringData();
+
+        if (field == "startDate"_sd) {
+            parsedArgs.startDate = Expression::parseOperand(expCtx, arg, vps);
+        } else if (field == "unit"_sd) {
+            parsedArgs.unit = Expression::parseOperand(expCtx, arg, vps);
+        } else if (field == "amount"_sd) {
+            parsedArgs.amount = Expression::parseOperand(expCtx, arg, vps);
+        } else if (field == "timezone"_sd) {
+            parsedArgs.timezone = Expression::parseOperand(expCtx, arg, vps);
+        } else {
+            uasserted(5166401,
+                      str::stream()
+                          << "Unrecognized argument to " << opName << ": " << arg.fieldName()
+                          << ". Expected arguments are startDate, unit, amount, and optionally "
+                             "timezone.");
+        }
+    }
+    uassert(5166402,
+            str::stream() << opName << " requires startDate, unit, and amount to be present",
+            parsedArgs.startDate && parsedArgs.unit && parsedArgs.amount);
+
+    return parsedArgs;
+}
+}  // namespace
+
+void ExpressionDateArithmetics::_doAddDependencies(DepsTracker* deps) const {
+    _startDate->addDependencies(deps);
+    _unit->addDependencies(deps);
+    _amount->addDependencies(deps);
+    if (_timeZone) {
+        _timeZone->addDependencies(deps);
+    }
+}
+
+boost::intrusive_ptr<Expression> ExpressionDateArithmetics::optimize() {
+    _startDate = _startDate->optimize();
+    _unit = _unit->optimize();
+    _amount = _amount->optimize();
+    if (_timeZone) {
+        _timeZone = _timeZone->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant({_startDate, _unit, _amount, _timeZone})) {
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document{}, &(getExpressionContext()->variables)));
+    }
+    return intrusive_ptr<Expression>(this);
+}
+
+Value ExpressionDateArithmetics::serialize(bool explain) const {
+    return Value(
+        Document{{_opName,
+                  Document{{"startDate", _startDate->serialize(explain)},
+                           {"unit", _unit->serialize(explain)},
+                           {"amount", _amount->serialize(explain)},
+                           {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()}}}});
+}
+
+Value ExpressionDateArithmetics::evaluate(const Document& root, Variables* variables) const {
+    const Value startDate = _startDate->evaluate(root, variables);
+    if (startDate.nullish()) {
+        return Value(BSONNULL);
+    }
+    auto unitVal = _unit->evaluate(root, variables);
+    if (unitVal.nullish()) {
+        return Value(BSONNULL);
+    }
+    auto amount = _amount->evaluate(root, variables);
+    if (amount.nullish()) {
+        return Value(BSONNULL);
+    }
+    // Get the TimeZone object for the timezone parameter, if it is specified, or UTC otherwise.
+    auto timezone =
+        makeTimeZone(getExpressionContext()->timeZoneDatabase, root, _timeZone.get(), variables);
+    if (!timezone) {
+        return Value(BSONNULL);
+    }
+
+    uassert(5166403,
+            str::stream() << _opName << " requires startDate to be convertible to a date",
+            startDate.coercibleToDate());
+    uassert(5166404,
+            str::stream() << _opName << " expects string defining the time unit",
+            unitVal.getType() == BSONType::String);
+    auto unit = parseTimeUnit(unitVal.getString());
+    uassert(5166405,
+            str::stream() << _opName << " expects integer amount of time units",
+            amount.integral64Bit());
+
+    return evaluateDateArithmetics(
+        startDate.coerceToDate(), unit, amount.coerceToLong(), timezone.get());
+}
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(dateAdd,
+                                     ExpressionDateAdd::parse,
+                                     ServerGlobalParams::FeatureCompatibility::Version::kVersion49);
+
+boost::intrusive_ptr<Expression> ExpressionDateAdd::parse(ExpressionContext* const expCtx,
+                                                          BSONElement expr,
+                                                          const VariablesParseState& vps) {
+    constexpr auto opName = "$dateAdd"_sd;
+    auto [startDate, unit, amount, timezone] =
+        commonDateArithmeticsParse(expCtx, expr, vps, opName);
+    return make_intrusive<ExpressionDateAdd>(expCtx,
+                                             std::move(startDate),
+                                             std::move(unit),
+                                             std::move(amount),
+                                             std::move(timezone),
+                                             opName);
+}
+
+Value ExpressionDateAdd::evaluateDateArithmetics(Date_t date,
+                                                 TimeUnit unit,
+                                                 long long amount,
+                                                 const TimeZone& timezone) const {
+    return Value(dateAdd(date, unit, amount, timezone));
+}
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(dateSubtract,
+                                     ExpressionDateSubtract::parse,
+                                     ServerGlobalParams::FeatureCompatibility::Version::kVersion49);
+
+boost::intrusive_ptr<Expression> ExpressionDateSubtract::parse(ExpressionContext* const expCtx,
+                                                               BSONElement expr,
+                                                               const VariablesParseState& vps) {
+    constexpr auto opName = "$dateSubtract"_sd;
+    auto [startDate, unit, amount, timezone] =
+        commonDateArithmeticsParse(expCtx, expr, vps, opName);
+    return make_intrusive<ExpressionDateSubtract>(expCtx,
+                                                  std::move(startDate),
+                                                  std::move(unit),
+                                                  std::move(amount),
+                                                  std::move(timezone),
+                                                  opName);
+}
+
+Value ExpressionDateSubtract::evaluateDateArithmetics(Date_t date,
+                                                      TimeUnit unit,
+                                                      long long amount,
+                                                      const TimeZone& timezone) const {
+    return Value(dateAdd(date, unit, -amount, timezone));
+}
+
+MONGO_INITIALIZER(expressionParserMap)(InitializerContext*) {
+    // Nothing to do. This initializer exists to tie together all the individual initializers
+    // defined by REGISTER_EXPRESSION / REGISTER_EXPRESSION_WITH_MIN_VERSION.
+}
+
+}  // namespace mongo

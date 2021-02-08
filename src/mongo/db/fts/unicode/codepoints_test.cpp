@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,6 +33,8 @@
 namespace mongo {
 namespace unicode {
 
+const char32_t maxCP = 0x1FFFFF;  // Highest valid codepoint.
+
 /**
  * Above most of the arrays in this class are the UTF-32 character literals that correspond to the
  * codepoints in the array.
@@ -39,14 +42,19 @@ namespace unicode {
 
 TEST(UnicodeCodepoints, Diacritics) {
     // There are no character literals for combining marks.
-    const char32_t marks[] = {0x0301, 0x0339, 0x1AB4, 0x1DC5, 0xA69D};
+    const char32_t marks[] = {'^', '`', 0x0301, 0x0339, 0x1AB4, 0x1DC5, 0xA69D};
 
     // const char32_t not_marks[] = {U'-', U'.', U'\'', U'*', U'm'};
     const char32_t not_marks[] = {0x2D, 0x2E, 0x27, 0x2A, 0x6D};
 
-    for (auto i = 0; i < 5; ++i) {
-        ASSERT(codepointIsDiacritic(marks[i]));
-        ASSERT_FALSE(codepointIsDiacritic(not_marks[i]));
+    for (auto cp : marks) {
+        ASSERT(codepointIsDiacritic(cp));
+        ASSERT_EQ(codepointRemoveDiacritics(cp), char32_t(0));
+    }
+
+    for (auto cp : not_marks) {
+        ASSERT(!codepointIsDiacritic(cp));
+        ASSERT_NE(codepointRemoveDiacritics(cp), char32_t(0));
     }
 }
 
@@ -77,6 +85,10 @@ TEST(UnicodeCodepoints, RemoveDiacritics) {
     for (auto i = 0; i < 5; ++i) {
         ASSERT_EQUALS(clean[i], codepointRemoveDiacritics(originals[i]));
     }
+
+    for (char32_t cp = 0; cp <= maxCP; cp++) {
+        ASSERT_EQ(codepointRemoveDiacritics(cp) == 0, cp == 0 || codepointIsDiacritic(cp));
+    }
 }
 
 TEST(UnicodeCodepoints, ToLower) {
@@ -87,6 +99,19 @@ TEST(UnicodeCodepoints, ToLower) {
 
     for (auto i = 0; i < 5; ++i) {
         ASSERT_EQUALS(lower[i], codepointToLower(upper[i]));
+    }
+}
+
+TEST(UnicodeCodepoints, ToLowerIsFixedPoint) {
+    for (char32_t cp = 0; cp <= maxCP; cp++) {
+        ASSERT_EQ(codepointToLower(cp), codepointToLower(codepointToLower(cp)));
+    }
+}
+
+TEST(UnicodeCodepoints, RemoveDiacriticsIsFixedPoint) {
+    for (char32_t cp = 0; cp <= maxCP; cp++) {
+        ASSERT_EQ(codepointRemoveDiacritics(cp),
+                  codepointRemoveDiacritics(codepointRemoveDiacritics(cp)));
     }
 }
 

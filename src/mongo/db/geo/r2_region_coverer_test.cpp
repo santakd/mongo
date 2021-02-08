@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,23 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kGeo
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <chrono>
+#include <memory>
 #include <random>
 
 #include "mongo/db/geo/r2_region_coverer.h"
 
 #include "mongo/base/init.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/platform/random.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/db/geo/geometry_container.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/random.h"
+#include "mongo/unittest/unittest.h"
 
 namespace {
 
-using std::auto_ptr;
 using namespace mongo;
 using mongo::Polygon;  // "windows.h" has another Polygon for Windows GDI.
 
@@ -57,8 +58,7 @@ MONGO_INITIALIZER(R2CellUnion_Test)(InitializerContext* context) {
         }
     }
     generator.seed(seed);
-    log() << "R2CellUnion Test - Random Number Generator Seed: " << seed;
-    return Status::OK();
+    LOGV2(20640, "R2CellUnion Test - Random Number Generator Seed: {seed}", "seed"_attr = seed);
 }
 
 // Returns an integral number in [lower, upper]
@@ -178,8 +178,10 @@ private:
 };
 
 TEST(R2RegionCoverer, RandomCells) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(1);
     // Test random cell ids at all levels.
     for (int i = 0; i < 10000; ++i) {
@@ -187,7 +189,7 @@ TEST(R2RegionCoverer, RandomCells) {
             random(std::numeric_limits<long long>::lowest(), std::numeric_limits<long long>::max()),
             random(0U, GeoHash::kMaxBits));
         vector<GeoHash> covering;
-        Box box = converter.unhashToBoxCovering(id);
+        Box box = coverer.getHashConverter().unhashToBoxCovering(id);
         // Since the unhashed box is expanded by the error 8Mu, we need to shrink it.
         box.fudge(-GeoHashConverter::kMachinePrecision * MAXBOUND * 20);
         HashBoxRegion region(box);
@@ -225,8 +227,8 @@ void checkCellIdCovering(const GeoHashConverter& converter,
 
     // The covering doesn't contain this cell, so the region shouldn't contain this cell.
     if (region.fastContains(cell)) {
-        log() << "covering " << covering.toString();
-        log() << "cellId " << cellId;
+        LOGV2(20641, "covering {covering}", "covering"_attr = covering.toString());
+        LOGV2(20642, "cellId {cellId}", "cellId"_attr = cellId);
     }
     ASSERT_FALSE(region.fastContains(cell));
 
@@ -275,17 +277,22 @@ GeometryContainer* getRandomCircle(double radius) {
 
     // Format: { $center : [ [-74, 40.74], 10 ] }
     GeometryContainer* container = new GeometryContainer();
-    container->parseFromQuery(
-        BSON("$center" << BSON_ARRAY(BSON_ARRAY(randDouble(radius, MAXBOUND - radius)
-                                                << randDouble(radius, MAXBOUND - radius))
-                                     << radius)).firstElement());
+    container
+        ->parseFromQuery(
+            BSON("$center" << BSON_ARRAY(BSON_ARRAY(randDouble(radius, MAXBOUND - radius)
+                                                    << randDouble(radius, MAXBOUND - radius))
+                                         << radius))
+                .firstElement())
+        .transitional_ignore();
     return container;
 }
 
 // Test the covering for arbitrary random circle.
 TEST(R2RegionCoverer, RandomCircles) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(8);
 
     for (int i = 0; i < 1000; i++) {
@@ -296,19 +303,21 @@ TEST(R2RegionCoverer, RandomCircles) {
         coverer.setMaxLevel(coverer.minLevel() + 4);
 
         double radius = randDouble(0.0, MAXBOUND / 2);
-        auto_ptr<GeometryContainer> geometry(getRandomCircle(radius));
+        std::unique_ptr<GeometryContainer> geometry(getRandomCircle(radius));
         const R2Region& region = geometry->getR2Region();
 
         vector<GeoHash> covering;
         coverer.getCovering(region, &covering);
-        checkCovering(converter, region, coverer, covering);
+        checkCovering(coverer.getHashConverter(), region, coverer, covering);
     }
 }
 
 // Test the covering for very small circles, since the above test doesn't cover finest cells.
 TEST(R2RegionCoverer, RandomTinyCircles) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(random(1, 20));  // [1, 20]
 
     for (int i = 0; i < 10000; i++) {
@@ -319,12 +328,12 @@ TEST(R2RegionCoverer, RandomTinyCircles) {
 
         // 100 * 2 ^ -32 ~= 2.3E-8 (cell edge length)
         double radius = randDouble(1E-15, ldexp(100.0, -32) * 10);
-        auto_ptr<GeometryContainer> geometry(getRandomCircle(radius));
+        std::unique_ptr<GeometryContainer> geometry(getRandomCircle(radius));
         const R2Region& region = geometry->getR2Region();
 
         vector<GeoHash> covering;
         coverer.getCovering(region, &covering);
-        checkCovering(converter, region, coverer, covering);
+        checkCovering(coverer.getHashConverter(), region, coverer, covering);
     }
 }
 
@@ -722,8 +731,12 @@ TEST(R2CellUnion, Normalize) {
             ASSERT_EQUALS(expected[i], cellUnion.cellIds()[i]);
         }
     }
-    log() << "Average Unnormalized Size: " << unnormalizedSum * 1.0 / kIters;
-    log() << "Average Normalized Size: " << normalizedSum * 1.0 / kIters;
+    LOGV2(20643,
+          "Average Unnormalized Size: {unnormalizedSum_1_0_kIters}",
+          "unnormalizedSum_1_0_kIters"_attr = unnormalizedSum * 1.0 / kIters);
+    LOGV2(20644,
+          "Average Normalized Size: {normalizedSum_1_0_kIters}",
+          "normalizedSum_1_0_kIters"_attr = normalizedSum * 1.0 / kIters);
 }
 
 void testContains(const R2CellUnion& cellUnion, GeoHash id, int num) {
